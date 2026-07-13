@@ -1,14 +1,14 @@
 # club-dev1060-cherry — Wave-3 custom vLLM build branch
 
-Date: 2026-07-13
+Date: 2026-07-13 (wave 2 picks added same day)
 Branch: `club-dev1060-cherry`
-Last code commit: `80792e9a4f7617ce43ee96eaba9c153fb58ff249` (branch head is this
-notes commit on top)
+Last code commit: `78cbdbddfc` (#48363 warmup; branch head is this notes commit
+on top)
 Base: `9e57de7197f234f9d9187715d96e07e007048c0f` (validated pin, main @ 2026-07-13,
 "[CPU] Create Proper Numa topology for s390x (#40714)")
 
-Diffstat 9e57de71..HEAD: 17 files changed, 1672 insertions(+), 40 deletions(-).
-One commit per PR pick. Not pushed anywhere.
+Diffstat 9e57de71..HEAD (code only): 20 files changed, 1868 insertions(+),
+41 deletions(-). One commit per PR pick. Not pushed anywhere.
 
 ## PRs applied (in pick order)
 
@@ -20,6 +20,46 @@ One commit per PR pick. Not pushed anywhere.
 | 4 | #46461 TurboQuant continuation guard in attention fast-path | `4b77f3b93` | `d729d7448` (3 commits, squashed) | clean as squashed net diff (per-commit picks conflicted on intermediate states) |
 | 5 | #43650 MTP + prefix caching + mamba accuracy fix | — | `3812af4ed` | **SKIPPED — subsumed by #48361** (see below) |
 | 6 | #47574 zero new KV blocks for quantized + block-dropping hybrid | `80792e9a4` | `a7f997abe` | clean cherry-pick |
+| 7 | #48483 lower memory for capturing large cudagraph sizes (merged 07-13) | `5775b787c` | `1be6e937b` (upstream main) | clean cherry-pick |
+| 8 | #48363 warm hybrid Mamba2 Triton kernels (JIT monitor) — **OPEN PR** | `78cbdbddf` | `c65ba6aa8` | clean cherry-pick (auto-merge) |
+| 9 | #48393 warm spec-decode helper kernel specializations — **OPEN PR** | — | `04c0a98ab` | **SKIPPED — inseparable from unreviewed parent #41481** (see below) |
+
+## Wave-2 picks (2026-07-13, second pass)
+
+### #48483 (pick 7) — merged upstream
+
+`vllm/v1/worker/gpu_model_runner.py` +5/-1: minimal-KV-cache allocation during
+cudagraph capture now needs `min(max_num_reqs, max_cudagraph_capture_size)`
+blocks instead of `max_cudagraph_capture_size` — one block per *sequence*, not
+per capture size. Clean pick from origin/main, compiled OK.
+
+### #48363 (pick 8) — OPEN, unmerged, adopted deliberately
+
+Targets exactly our hybrid-GDN first-request JIT stalls. Adds
+`vllm/model_executor/warmup/hybrid_mamba_warmup.py` (+183) and wires
+`hybrid_mamba_triton_warmup` into `kernel_warmup.py` (+8). Warms
+`_causal_conv1d_fwd_kernel` (all 8 pointer-alignment JIT-key combos, dummy
+token routed to NULL_BLOCK_ID so no real cache line is written),
+`_zero_kv_blocks_kernel`, and `_compute_slot_mapping_kernel`
+(`block_table_stride == 1` specialization). No-op without MambaMixer2 layers.
+
+Cherry-pick auto-merged (PR merge-base `429f4057` is 3 days older than our
+pin). Symbol cross-check against our base: all 5 imports from
+`qwen_triton_warmup` exist; `is_conv_state_dim_first`, `NULL_BLOCK_ID`,
+`causal_conv1d_fn(..., block_size_to_align=, metadata=)` signature,
+`MambaMixer2.conv_weights` (registered buffer) and `.cache_config` all
+resolve. py_compile OK.
+
+### #48393 (pick 9) — SKIPPED
+
+Stacked on #41481, which is NOT in our base (`git log --grep '#41481'
+9e57de71` empty; `dry_run_helper_kernels` / `_warmup_spec_decode_helpers`
+absent from the tree). The PR's first commit `e34bedea1` is an explicit
+"Import PR #41481" (+575 lines: `llm_base_proposer.py`, `dflash.py`,
+`eagle.py`, `gpu_worker.py` wiring, +256-line test). #48393's own two commits
+(`20c99b418` +19, `04c0a98ab` +82) patch *inside* the parent's
+`dry_run_helper_kernels` method — zero standalone applicability. Taking them
+would mean adopting the whole unreviewed parent PR; skipped per policy.
 
 ## Conflicts resolved (#48361)
 
@@ -81,6 +121,8 @@ shorten mamba hits by one extra block for no correctness gain.
 ## Verification performed
 
 - `python3 -m py_compile` + `ast.parse` on all 15 touched `.py` files: OK.
+- Wave 2: py_compile on `gpu_model_runner.py`, `hybrid_mamba_warmup.py`,
+  `kernel_warmup.py`: OK. No conflict markers.
 - No conflict markers anywhere in the tree.
 - `marlin.cu` (#45660): eyeballed both hunks — `zero_(c)` inside the existing
   `use_atomic_add` allocation branch, `zero_(c_tmp)` inside the existing
@@ -95,6 +137,17 @@ shorten mamba hits by one extra block for no correctness gain.
   `tests/v1/core/test_mamba_align_chunk_split.py`,
   `tests/kernels/quantization/test_marlin_gemm.py -k zero`,
   `tests/kernels/test_fused_sigmoid_gating_delta_rule.py`.
+
+⚠ **#48363 is an OPEN unmerged PR adopted deliberately** (#48393 was skipped).
+Wheel validation MUST additionally cover:
+- first-request warmup behavior on the hybrid-GDN model: JIT monitor should
+  report zero Triton compiles on the first request
+  (`_causal_conv1d_fwd_kernel`, `_zero_kv_blocks_kernel`,
+  `_compute_slot_mapping_kernel`), and first-request latency should drop vs
+  the previous wheel;
+- startup time delta: the new warmup runs at server start — measure
+  boot-to-ready before/after and confirm the added warmup cost is acceptable;
+- watch upstream #48363 for review changes before any rebase.
 
 ## Semantic caveat (#46461)
 
