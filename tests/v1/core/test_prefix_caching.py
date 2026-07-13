@@ -1029,6 +1029,51 @@ def test_prefill_hybrid_model_mamba_align():
     manager.free(req0)
 
 
+def test_hybrid_mamba_eagle_does_not_reuse_lookahead_state():
+    """With EAGLE/MTP, full attention matches one block past the hit and
+    drops it, so the usable hit for a 71-token replay is 48 tokens. The
+    Mamba group must not peek at its 64-token boundary snapshot (one block
+    ahead of the verified prefix): resuming at 48 while loading the state
+    of 64 tokens corrupts every request that hits the block (#43559)."""
+    block_size = 16
+    manager = make_kv_cache_manager(
+        _make_hybrid_kv_cache_config(block_size, 100, ["full", "mamba_align"]),
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=block_size,
+        use_eagle=True,
+    )
+
+    token_ids = [i for i in range(4) for _ in range(block_size)] + [4] * 7
+
+    req0 = make_request("0", token_ids, block_size, sha256)
+    computed_blocks, num_computed_tokens = manager.get_computed_blocks(req0)
+    assert num_computed_tokens == 0
+    # Prefill in aligned chunks so align-mode boundary snapshots exist at 48
+    # (the eagle-pruned last_cache_position of _mamba_block_aligned_split)
+    # and at 64 (as written by a decode step crossing the block boundary).
+    # A single 71-token chunk would snapshot only the mid-block final state,
+    # which is never hashed.
+    for chunk_end in (3 * block_size, 4 * block_size, len(token_ids)):
+        blocks = manager.allocate_slots(
+            req0,
+            chunk_end - req0.num_computed_tokens,
+            num_computed_tokens,
+            computed_blocks if req0.num_computed_tokens == 0 else None,
+        )
+        assert blocks is not None
+        req0.num_computed_tokens = chunk_end
+    manager.free(req0)
+
+    req1 = make_request("1", token_ids, block_size, sha256)
+    computed_blocks, num_computed_tokens = manager.get_computed_blocks(req1)
+
+    # Full attention: 4 matched blocks, eagle-drop -> 48 tokens. Mamba must
+    # serve its 48-token snapshot, not the 64-token lookahead state.
+    assert num_computed_tokens == 3 * block_size
+    assert [len(blocks) for blocks in computed_blocks.blocks] == [3, 3]
+
+
 def test_hybrid_cache_mamba_align_shared_prefix_detection():
     """Test shared prefix detection heuristic for mamba align cache mode
 
@@ -4065,3 +4110,46 @@ def test_mamba_reachable_block_mask_sparsifies_retention():
     assert retained(64) == {3, 7, 11, 14, 15}
     # interval 0 -> only the latest replay boundary (block 14).
     assert retained(0) == {14}
+
+
+def test_mamba_reachable_block_mask_retention_eagle_shift():
+    """Sparse Mamba retention must retain the EAGLE-reachable replay
+    boundary. With EAGLE/MTP the full-attention lookup pops its last
+    matched block and re-aligns downward, so an exact prompt replay can
+    verify at most ``latest - alignment_tokens``; if retention keeps only
+    the block ending at ``latest``, the mamba group can never hit, and the
+    hybrid min() hit clamp pins every replay hit to 0 — a silently
+    disabled prefix cache (#43559 follow-up class)."""
+    from vllm.v1.core.single_type_kv_cache_manager import MambaManager
+
+    block_size = 16
+    spec = MambaSpec(
+        block_size=block_size,
+        shapes=(1, 1),
+        dtypes=(torch.float32,),
+        mamba_cache_mode="align",
+    )
+
+    def retained(retention_interval, use_eagle, num_prompt_tokens=256):
+        m = MambaManager.reachable_block_mask(
+            start_block=0,
+            end_block=16,
+            alignment_tokens=block_size,
+            kv_cache_spec=spec,
+            use_eagle=use_eagle,
+            retention_interval=retention_interval,
+            num_prompt_tokens=num_prompt_tokens,
+        )
+        return None if m is None else {i for i, v in enumerate(m) if v}
+
+    # Dense default stays dense regardless of eagle.
+    assert retained(None, use_eagle=True) is None
+    # interval 0: latest replay boundary is block 14 (state@240); eagle can
+    # verify only up to 224, whose state lives in block 13 — keep both.
+    assert retained(0, use_eagle=False) == {14}
+    assert retained(0, use_eagle=True) == {13, 14}
+    # interval > 0: eagle adds the shifted replay boundary to segment tails.
+    assert retained(64, use_eagle=False) == {3, 7, 11, 14, 15}
+    assert retained(64, use_eagle=True) == {3, 7, 11, 13, 14, 15}
+    # Short prompt: latest = 0, no boundary block exists; no negative index.
+    assert retained(0, use_eagle=True, num_prompt_tokens=block_size) == set()
