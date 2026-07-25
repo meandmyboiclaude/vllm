@@ -33,6 +33,10 @@ class DPSyncState:
     # Whether the ranks agreed to run eager. A dispatch reusing this must run
     # eager too; no shape was agreed, so picking a graph per rank would diverge.
     eager: bool
+    # Whether EVERY rank asked to skip draft-token work this step (#48244).
+    # Agreed via the collective, so it is identical on every rank. A sync
+    # taken from a dispatch that did not pass `want_skip_drafts` holds False.
+    skip_drafts: bool = False
 
 
 def sync_cudagraph_and_dp_padding(
@@ -45,25 +49,30 @@ def sync_cudagraph_and_dp_padding(
     dp_rank: int,
     max_query_len: int | None = None,
     num_active_loras: int = 0,
+    want_skip_drafts: bool = False,
 ) -> tuple[BatchExecutionDescriptor, DPSyncState | None]:
     """
-    Coordinates the batch descriptor and DP padding across all ranks.
+    Coordinates the batch descriptor, DP padding and draft-skipping across all
+    ranks.
 
     Returns (synced_batch_desc, sync). `sync` is None when no rank has work.
     """
     assert dp_size > 1, "DP size must be greater than 1"
     group = get_dp_group().cpu_group
-    tensor = torch.zeros(4, dp_size, dtype=torch.int32, device="cpu")
+    tensor = torch.zeros(5, dp_size, dtype=torch.int32, device="cpu")
     tensor[0][dp_rank] = num_tokens
     tensor[1][dp_rank] = desired_batch_desc.cg_mode.value
     tensor[2][dp_rank] = uniform_token_count or 0  # (0 means None)
     tensor[3][dp_rank] = max_query_len or -1  # (-1 means None)
+    tensor[4][dp_rank] = int(want_skip_drafts)
     dist.all_reduce(tensor, group=group)
 
     num_tokens_across_dp = tensor[0]
     cg_mode_across_dp = tensor[1]
     uniform_token_counts_across_dp = tensor[2]
     max_query_lens_across_dp = tensor[3]
+    # Skip draft work only when EVERY rank asked to (min over the 0/1 row).
+    skip_drafts = bool(int(tensor[4].min().item()) == 1)
 
     # If ranks disagree on the uniform token count, or its 0 (means None) set to None
     synced_uniform_token_count: int | None = int(uniform_token_counts_across_dp[0])
@@ -93,6 +102,7 @@ def sync_cudagraph_and_dp_padding(
                 num_tokens_across_dp=num_tokens_across_dp,
                 uniform_token_count=synced_uniform_token_count,
                 eager=True,
+                skip_drafts=skip_drafts,
             ),
         )
 
@@ -126,6 +136,7 @@ def sync_cudagraph_and_dp_padding(
         num_tokens_across_dp=num_tokens_across_dp,
         uniform_token_count=synced_uniform_token_count,
         eager=False,
+        skip_drafts=skip_drafts,
     )
 
 
@@ -140,7 +151,8 @@ def dispatch_cg_and_sync_dp(
     need_eager: bool = False,
     num_active_loras: int = 0,
     dp_sync: DPSyncState | None = None,
-) -> tuple[BatchExecutionDescriptor, DPSyncState | None]:
+    want_skip_drafts: bool = False,
+) -> tuple[BatchExecutionDescriptor, DPSyncState | None, bool]:
     """Pick a cudagraph descriptor for this batch, agreeing it across DP ranks.
 
     Runs a collective when dp_size > 1 so every rank dispatches to the same
@@ -170,8 +182,13 @@ def dispatch_cg_and_sync_dp(
             error and trips an assert.
 
     Returns:
-        (batch_desc, sync), where `sync` is this batch's agreement for a later
-        dispatch to reuse. It is None when `dp_size` is 1 or no rank has work.
+        (batch_desc, sync, skip_drafts). `sync` is this batch's agreement for a
+        later dispatch to reuse; it is None when `dp_size` is 1 or no rank has
+        work. `skip_drafts` (#48244) is True only when every rank passed
+        `want_skip_drafts`: on dp_size == 1 it is the local value; with a real
+        collective it is the agreed minimum; on the `dp_sync` reuse path no
+        collective runs, so it is conservatively False (not skipping is always
+        safe).
     """
     reuse_eager = dp_sync is not None and dp_sync.eager
 
@@ -196,7 +213,7 @@ def dispatch_cg_and_sync_dp(
         )
 
     if dp_size == 1:
-        return batch_desc, None
+        return batch_desc, None, want_skip_drafts
 
     if dp_sync is not None:
         assert dp_sync.num_tokens_across_dp[dp_rank] == num_tokens, (
@@ -215,9 +232,12 @@ def dispatch_cg_and_sync_dp(
                     dp_sync.num_tokens_across_dp, batch_desc.num_tokens
                 ),
             )
-        return batch_desc, dp_sync
+        # No collective runs on the reuse path, so there is no channel to
+        # agree `want_skip_drafts` across ranks; report False (safe: drafts
+        # are simply computed as before).
+        return batch_desc, dp_sync, False
 
-    return sync_cudagraph_and_dp_padding(
+    synced_desc, sync = sync_cudagraph_and_dp_padding(
         cudagraph_manager,
         batch_desc,
         num_tokens,
@@ -227,4 +247,6 @@ def dispatch_cg_and_sync_dp(
         dp_rank,
         max_query_len=max_query_len,
         num_active_loras=num_active_loras,
+        want_skip_drafts=want_skip_drafts,
     )
+    return synced_desc, sync, (sync.skip_drafts if sync is not None else False)
