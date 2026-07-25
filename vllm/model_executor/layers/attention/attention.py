@@ -644,6 +644,33 @@ class Attention(nn.Module, AttentionLayerBase):
                 sliding_window=self.sliding_window,
                 page_size_padded=shared_page,
             )
+        elif self.kv_cache_dtype.startswith("turboquant_"):
+            from vllm.model_executor.layers.quantization.turboquant.config import (
+                TurboQuantConfig,
+                resolve_tq_layer_preset,
+            )
+            from vllm.model_executor.models.utils import extract_layer_index
+            from vllm.v1.kv_cache_interface import TQFullAttentionSpec
+
+            # KVQ-4: per-layer bit allocation. Resolve this layer's preset from
+            # the optional VLLM_TQ_LAYER_BITS map; falls back to the model-level
+            # preset (uniform, no behavior change) when unset.
+            layer_idx = extract_layer_index(self.layer_name)
+            layer_dtype = resolve_tq_layer_preset(layer_idx, self.kv_cache_dtype)
+            tq_config = TurboQuantConfig.from_cache_dtype(
+                layer_dtype, self.head_size
+            )
+            return TQFullAttentionSpec(
+                block_size=block_size,
+                num_kv_heads=self.num_kv_heads,
+                head_size=self.head_size,
+                head_size_v=self.head_size,
+                dtype=self.kv_cache_torch_dtype,
+                kv_quant_mode=quant_mode,
+                tq_slot_size=tq_config.slot_size_aligned,
+                tq_sink_tokens=tq_config.sink_tokens,
+                tq_sink_kv_bytes=tq_config.sink_kv_bytes_per_token,
+            )
         else:
             return FullAttentionSpec(
                 block_size=block_size,

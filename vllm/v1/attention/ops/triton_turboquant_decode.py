@@ -51,6 +51,7 @@ def _tq_decode_stage1(
     Seq_lens_ptr,  # [B] int32
     # TQ parameters
     Centroids_ptr,  # [n_centroids] float32
+    Val_centroids_ptr,  # [n_val_centroids] float32 (used only when VALUE_NUQ)
     # Output (intermediate for stage2)
     Mid_o_ptr,  # [B, Hq, NUM_KV_SPLITS, D+1] float32
     # Strides
@@ -83,6 +84,9 @@ def _tq_decode_stage1(
     KEY_FP8: tl.constexpr,  # 1 if K is stored as FP8
     NORM_CORRECTION: tl.constexpr = 0,  # 1 = re-normalize centroids
     FP8_E4B15: tl.constexpr = 0,  # 1 = use e4b15 (Ampere/Ada), 0 = e4nv (Hopper+)
+    VALUE_NUQ: tl.constexpr = 0,  # 1 = non-uniform (Lloyd-Max) value codebook
+    N_VAL_CENTROIDS: tl.constexpr = 8,
+    N_OUTLIERS: tl.constexpr = 0,  # KVQ-3: exact value outliers per vector
 ):
     bid = tl.program_id(0)  # batch index
     hid = tl.program_id(1)  # q_head index
@@ -248,7 +252,7 @@ def _tq_decode_stage1(
                 other=0,
             ).to(tl.int32)
             raw16 = val_raw0 | (val_raw1 << 8)
-            v_idx = ((raw16 >> val_bit_shift[None, :]) & 0x7).to(tl.float32)
+            v_idx_int = (raw16 >> val_bit_shift[None, :]) & 0x7
 
             sc_bases = val_bases + VAL_DATA_BYTES
             sc_lo = tl.load(KV_cache_ptr + sc_bases, mask=kv_mask, other=0).to(
@@ -267,7 +271,17 @@ def _tq_decode_stage1(
                 tl.uint16
             )
             v_zeros = (zr_lo | (zr_hi << 8)).to(tl.float16, bitcast=True).to(tl.float32)
-            values = v_idx * v_scales[:, None] + v_zeros[:, None]
+            if VALUE_NUQ:
+                # Non-uniform: index -> Lloyd-Max centroid, then de-compand
+                # by the stored per-vector (std, mean) held in (scale, zero).
+                v_cent = tl.load(
+                    Val_centroids_ptr + v_idx_int,
+                    mask=kv_mask[:, None] & d_mask[None, :],
+                    other=0.0,
+                )
+                values = v_cent * v_scales[:, None] + v_zeros[:, None]
+            else:
+                values = v_idx_int.to(tl.float32) * v_scales[:, None] + v_zeros[:, None]
         else:  # VQB == 4
             vb_idx = d_offs // 2
             vb_shift = (d_offs % 2) * 4
@@ -299,6 +313,33 @@ def _tq_decode_stage1(
             values = v_idx * v_scales[:, None] + v_zeros[:, None]
 
         # ============================================================
+        # OUTLIER SCATTER-GATHER (KVQ-3): overwrite the top-|v| elements
+        # with their exact fp16 values from the inline side-channel.
+        # ============================================================
+        if N_OUTLIERS > 0:
+            out_off = val_bases + VAL_DATA_BYTES + 4  # [BLOCK_KV]
+            for _j in range(N_OUTLIERS):
+                o_idx = tl.load(
+                    KV_cache_ptr + out_off + _j, mask=kv_mask, other=0
+                ).to(tl.int32)
+                ov_lo = tl.load(
+                    KV_cache_ptr + out_off + N_OUTLIERS + 2 * _j,
+                    mask=kv_mask,
+                    other=0,
+                ).to(tl.uint16)
+                ov_hi = tl.load(
+                    KV_cache_ptr + out_off + N_OUTLIERS + 2 * _j + 1,
+                    mask=kv_mask,
+                    other=0,
+                ).to(tl.uint16)
+                o_val = (
+                    (ov_lo | (ov_hi << 8)).to(tl.float16, bitcast=True).to(tl.float32)
+                )
+                values = tl.where(
+                    d_offs[None, :] == o_idx[:, None], o_val[:, None], values
+                )
+
+        # ============================================================
         # WEIGHTED VALUE ACCUMULATION
         # ============================================================
         acc = acc * re_scale + tl.sum(p[:, None] * values, 0)
@@ -323,6 +364,7 @@ def _tq_full_dequant_kv(
     KV_cache_ptr,
     Block_table_ptr,
     Centroids_ptr,
+    Val_centroids_ptr,  # [n_val_centroids] float32 (used only when VALUE_NUQ)
     K_out_ptr,  # [B, Hk, max_seq, D] float16
     V_out_ptr,  # [B, Hk, max_seq, D] float16
     stride_ko_b,
@@ -347,6 +389,9 @@ def _tq_full_dequant_kv(
     BLOCK_D: tl.constexpr,
     NORM_CORRECTION: tl.constexpr = 0,
     FP8_E4B15: tl.constexpr = 0,  # 1 = use e4b15 (Ampere/Ada), 0 = e4nv (Hopper+)
+    VALUE_NUQ: tl.constexpr = 0,  # 1 = non-uniform (Lloyd-Max) value codebook
+    N_VAL_CENTROIDS: tl.constexpr = 8,
+    N_OUTLIERS: tl.constexpr = 0,  # KVQ-3: exact value outliers per vector
 ):
     """Full dequant: reconstruct K (MSE centroids * norm or FP8) and V to fp16."""
     pos = tl.program_id(0)
@@ -438,7 +483,7 @@ def _tq_full_dequant_kv(
             KV_cache_ptr + val_base + val_byte_idx + 1, mask=d_mask, other=0
         ).to(tl.int32)
         raw16_val = val_raw0 | (val_raw1 << 8)
-        v_idx = ((raw16_val >> val_bit_shift) & 0x7).to(tl.float32)
+        v_idx_int = (raw16_val >> val_bit_shift) & 0x7
 
         sc_base = val_base + VAL_DATA_BYTES
         sc_lo = tl.load(KV_cache_ptr + sc_base).to(tl.uint16)
@@ -447,9 +492,25 @@ def _tq_full_dequant_kv(
         zr_lo = tl.load(KV_cache_ptr + sc_base + 2).to(tl.uint16)
         zr_hi = tl.load(KV_cache_ptr + sc_base + 3).to(tl.uint16)
         v_zero = (zr_lo | (zr_hi << 8)).to(tl.float16, bitcast=True).to(tl.float32)
-        v_vals = v_idx * v_scale + v_zero
+        if VALUE_NUQ:
+            v_cent = tl.load(Val_centroids_ptr + v_idx_int, mask=d_mask, other=0.0)
+            v_vals = v_cent * v_scale + v_zero
+        else:
+            v_vals = v_idx_int.to(tl.float32) * v_scale + v_zero
     else:
         v_vals = tl.zeros([BLOCK_D], dtype=tl.float32)
+
+    # Outlier scatter-gather (KVQ-3): overwrite exact top-|v| elements.
+    if N_OUTLIERS > 0 and VQB != 0:
+        out_off = val_base + VAL_DATA_BYTES + 4
+        for _j in range(N_OUTLIERS):
+            o_idx = tl.load(KV_cache_ptr + out_off + _j).to(tl.int32)
+            ov_lo = tl.load(KV_cache_ptr + out_off + N_OUTLIERS + 2 * _j).to(tl.uint16)
+            ov_hi = tl.load(
+                KV_cache_ptr + out_off + N_OUTLIERS + 2 * _j + 1
+            ).to(tl.uint16)
+            o_val = (ov_lo | (ov_hi << 8)).to(tl.float16, bitcast=True).to(tl.float32)
+            v_vals = tl.where(d_offs == o_idx, o_val, v_vals)
 
     vo_base = bid * stride_vo_b + hid * stride_vo_h + pos * stride_vo_s
     tl.store(V_out_ptr + vo_base + d_offs, v_vals.to(tl.float16), mask=d_mask)
@@ -497,6 +558,9 @@ def triton_turboquant_decode_attention(
     key_fp8: bool = False,
     norm_correction: bool = False,
     PiT: torch.Tensor | None = None,  # [D, D] pre-computed Pi.T contiguous
+    value_nuq: bool = False,
+    val_centroids: torch.Tensor | None = None,  # [n_val_centroids] float32
+    value_outliers: int = 0,  # KVQ-3: exact value outliers per vector (0 = off)
     # Pre-allocated buffers (optional, avoids per-call allocation)
     mid_o_buf: torch.Tensor | None = None,
     output_buf: torch.Tensor | None = None,
@@ -529,6 +593,13 @@ def triton_turboquant_decode_attention(
 
     NUM_KV_SPLITS = max_num_kv_splits
 
+    # Value codebook (KVQ-1). Only dereferenced when value_nuq; pass the key
+    # centroids as a harmless placeholder otherwise so the arg is always valid.
+    n_val_centroids = 2**value_quant_bits
+    val_cent = val_centroids if val_centroids is not None else centroids
+    value_nuq_flag = 1 if value_nuq else 0
+    n_outliers = int(value_outliers)
+
     if (
         mid_o_buf is not None
         and mid_o_buf.shape[0] >= B
@@ -557,6 +628,7 @@ def triton_turboquant_decode_attention(
         block_table,
         seq_lens,
         centroids,
+        val_cent,
         mid_o,
         q_rot.stride(0),
         q_rot.stride(1),
@@ -583,6 +655,9 @@ def triton_turboquant_decode_attention(
         KEY_FP8=1 if key_fp8 else 0,
         NORM_CORRECTION=1 if norm_correction else 0,
         FP8_E4B15=fp8_e4b15,
+        VALUE_NUQ=value_nuq_flag,
+        N_VAL_CENTROIDS=n_val_centroids,
+        N_OUTLIERS=n_outliers,
         num_warps=1,
         num_stages=1,
     )
