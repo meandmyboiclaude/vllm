@@ -84,3 +84,22 @@ def get_centroids(d: int, bits: int) -> torch.Tensor:
     """Get precomputed Lloyd-Max centroids (cached)."""
     centroids, _ = solve_lloyd_max(d, bits)
     return centroids
+
+
+@lru_cache(maxsize=32)
+def get_value_codebook(bits: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Lloyd-Max codebook for non-uniform value quantization (KVQ-1).
+
+    Values are companded per-vector by their mean/std and encoded against a
+    standard-normal N(0,1) Lloyd-Max codebook (``d=1`` gives variance 1).
+    This mirrors the key path (rotated coordinates ~ N(0,1/d)) but for the
+    already-normalized value distribution.
+
+    Args:
+        bits: Bits per value element (codebook size = 2^bits).
+
+    Returns:
+        centroids: Sorted tensor of 2^bits optimal reconstruction levels.
+        midpoints: Sorted tensor of 2^bits - 1 decision boundaries.
+    """
+    return solve_lloyd_max(1, bits)

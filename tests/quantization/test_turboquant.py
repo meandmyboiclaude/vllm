@@ -73,6 +73,41 @@ PRESET_EXPECTED = {
         key_packed_size=50, value_packed_size=52,
         slot_size=102, slot_size_aligned=102,
     ),
+    # KVQ-1: nuqv keeps identical layout to 3bit_nc (value bits/side bytes same).
+    "turboquant_3bit_nuqv": dict(
+        key_fp8=False, key_quant_bits=3,
+        key_mse_bits=3, value_quant_bits=3,
+        mse_bits=3, n_centroids=8, centroid_bits=3,
+        norm_correction=True,
+        key_packed_size=50, value_packed_size=52,
+        slot_size=102, slot_size_aligned=102,
+    ),
+    # KVQ-2: sinks live in a per-sequence side buffer; slot layout unchanged.
+    "turboquant_3bit_nuqv_sink32": dict(
+        key_fp8=False, key_quant_bits=3,
+        key_mse_bits=3, value_quant_bits=3,
+        mse_bits=3, n_centroids=8, centroid_bits=3,
+        norm_correction=True,
+        key_packed_size=50, value_packed_size=52,
+        slot_size=102, slot_size_aligned=102,
+    ),
+    # KVQ-3: out1 @ head_dim=128 -> round(128*0.01)=1 outlier -> +3 value bytes.
+    "turboquant_3bit_nuqv_out1": dict(
+        key_fp8=False, key_quant_bits=3,
+        key_mse_bits=3, value_quant_bits=3,
+        mse_bits=3, n_centroids=8, centroid_bits=3,
+        norm_correction=True,
+        key_packed_size=50, value_packed_size=55,
+        slot_size=105, slot_size_aligned=106,
+    ),
+    "turboquant_3bit_nuqv_out1_sink32": dict(
+        key_fp8=False, key_quant_bits=3,
+        key_mse_bits=3, value_quant_bits=3,
+        mse_bits=3, n_centroids=8, centroid_bits=3,
+        norm_correction=True,
+        key_packed_size=50, value_packed_size=55,
+        slot_size=105, slot_size_aligned=106,
+    ),
 }
 # fmt: on
 
