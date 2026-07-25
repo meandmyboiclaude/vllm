@@ -711,6 +711,8 @@ class EngineArgs:
     mamba_cache_mode: MambaCacheMode = CacheConfig.mamba_cache_mode
     replayssm_buffer_len: int = CacheConfig.replayssm_buffer_len
     use_replayssm: bool = CacheConfig.use_replayssm
+    replayssm_route: str = CacheConfig.replayssm_route
+    use_replayssm_spec: bool = CacheConfig.use_replayssm_spec
 
     mamba_backend: MambaBackendEnum = MambaBackendEnum.TRITON
     mamba_ssu_algorithm: MambaSSUAlgorithm | None = None
@@ -1244,6 +1246,14 @@ class EngineArgs:
             "--replayssm-buffer-len", **cache_kwargs["replayssm_buffer_len"]
         )
         cache_group.add_argument("--use-replayssm", **cache_kwargs["use_replayssm"])
+        cache_group.add_argument(
+            "--replayssm-route",
+            **cache_kwargs["replayssm_route"],
+        )
+        cache_group.add_argument(
+            "--use-replayssm-spec",
+            **cache_kwargs["use_replayssm_spec"],
+        )
         cache_group.add_argument(
             "--kv-offloading-size", **cache_kwargs["kv_offloading_size"]
         )
@@ -2010,6 +2020,8 @@ class EngineArgs:
             mamba_cache_mode=self.mamba_cache_mode,
             replayssm_buffer_len=self.replayssm_buffer_len,
             use_replayssm=self.use_replayssm,
+            replayssm_route=self.replayssm_route,
+            use_replayssm_spec=self.use_replayssm_spec,
             kv_offloading_size=self.kv_offloading_size,
             kv_offloading_backend=self.kv_offloading_backend,
         )
