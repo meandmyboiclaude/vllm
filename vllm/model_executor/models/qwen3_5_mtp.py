@@ -14,6 +14,9 @@ from vllm.distributed import get_pp_group, tensor_model_parallel_all_gather
 from vllm.logger import init_logger
 from vllm.model_executor.layers.linear import ColumnParallelLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
+from vllm.model_executor.layers.quantization.mtp_head import (
+    maybe_get_mtp_head_quant_config,
+)
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -84,15 +87,39 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
             config.hidden_size,
         )
 
+        # GPTQ: quantized checkpoints exclude MTP from quantization via
+        # quantization_config.dynamic with "-:pattern" entries, so the MTP
+        # block loads unquantized. It is also unquantized when the target
+        # model itself is unquantized.
+        mtp_gptq_excluded = False
+        if quant_config and quant_config.get_name() not in ("modelopt_fp4",):
+            hf_qc = getattr(model_config.hf_config, "quantization_config", None)
+            if isinstance(hf_qc, dict):
+                dynamic = hf_qc.get("dynamic", {})
+                mtp_gptq_excluded = any(
+                    k.startswith("-:") and "mtp" in k for k in dynamic
+                )
+        mtp_unquantized = quant_config is None or mtp_gptq_excluded
+
+        # Opt-in (VLLM_MTP_HEAD_QUANT): reclaim VRAM by quantizing the otherwise
+        # bf16/fp16 MTP head linears at load time. Only engages when the whole
+        # block is unquantized (bf16), never over an already-quantized block.
+        mtp_head_quant = (
+            maybe_get_mtp_head_quant_config(quant_config)
+            if mtp_unquantized
+            else None
+        )
+
         # Workaround: mtp.fc is stored as BF16 in NVFP4 checkpoints but is
         # missing from hf_quant_config.json exclude_modules. Force unquantized.
         # Ref: https://github.com/vllm-project/vllm/pull/38650
         # Ref: https://github.com/NVIDIA/Model-Optimizer/pull/1124
-        fc_quant = (
-            None
-            if (quant_config and quant_config.get_name() == "modelopt_fp4")
-            else quant_config
-        )
+        if mtp_head_quant is not None:
+            fc_quant = mtp_head_quant
+        elif quant_config and quant_config.get_name() == "modelopt_fp4":
+            fc_quant = None
+        else:
+            fc_quant = quant_config
         self.fc = ColumnParallelLinear(
             self.config.hidden_size * 2,
             self.config.hidden_size,
@@ -103,16 +130,11 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
             prefix=f"{prefix}.fc",
         )
 
-        # GPTQ: quantized checkpoints may exclude MTP from quantization via
-        # quantization_config.dynamic with "-:pattern" entries. When detected,
-        # disable quantization for MTP layers so they use unquantized params.
         original_quant = vllm_config.quant_config
-        if quant_config and quant_config.get_name() not in ("modelopt_fp4",):
-            hf_qc = getattr(model_config.hf_config, "quantization_config", None)
-            if isinstance(hf_qc, dict):
-                dynamic = hf_qc.get("dynamic", {})
-                if any(k.startswith("-:") and "mtp" in k for k in dynamic):
-                    vllm_config.quant_config = None
+        if mtp_head_quant is not None:
+            vllm_config.quant_config = mtp_head_quant
+        elif mtp_gptq_excluded:
+            vllm_config.quant_config = None
         self.layers = torch.nn.ModuleList(
             Qwen3_5DecoderLayer(
                 vllm_config,
