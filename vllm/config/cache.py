@@ -36,6 +36,7 @@ CacheDType = Literal[
 ]
 MambaDType = Literal["auto", "float32", "float16", "bfloat16"]
 MambaCacheMode = Literal["all", "align", "none"]
+ReplaySSMRoute = Literal["state_and_output", "output_only"]
 PrefixCachingHashAlgo = Literal["sha256", "sha256_cbor", "xxhash", "xxhash_cbor"]
 KVOffloadingBackend = Literal["native", "lmcache"]
 
@@ -148,7 +149,9 @@ class CacheConfig:
     replayssm_buffer_len: int = Field(default=16, gt=0)
     """ReplaySSM history buffer length B: with use_replayssm, standard decode
     caches recent SSM inputs in a size-B ring buffer and flushes the checkpoint
-    state to HBM every B steps. Default 16."""
+    state to HBM every B steps. Default 16. Speculative decode (use_replayssm_spec)
+    keeps an L = B + 1 + num_speculative_tokens history window in a power-of-two
+    next_pow2(L) ring buffer, so B must be >= 1 + num_speculative_tokens."""
     use_replayssm: bool = False
     """Use the ReplaySSM Mamba2 decode kernel: cache recent SSM inputs and skip
     the per-step full-state store, writing the checkpoint back only on flush.
@@ -156,6 +159,18 @@ class CacheConfig:
     mamba backend; standard (non-speculative) decode only. In align mode flushes
     are most efficient when mamba_block_size is a multiple of replayssm_buffer_len,
     but this is not required."""
+    replayssm_route: ReplaySSMRoute = "output_only"
+    """ReplaySSM compute route (only meaningful when use_replayssm is True):
+    - "output_only" (default): inner-product route. Computes the output from
+       the checkpoint state plus the cached inputs without materializing the
+       per-step state (the state is only built on flush steps).
+    - "state_and_output": outer-product route. Reconstructs the full SSM state
+       every step via tl.dot, then reads the output from it."""
+    use_replayssm_spec: bool = False
+    """Use the ReplaySSM speculative-decode kernel (circular cache + early-flush)
+    for Mamba2 and GDN. Requires speculative decoding and mamba_cache_mode='none';
+    reuses vLLM's causal_conv1d_update for the conv (hybrid). Mutually exclusive
+    with use_replayssm. replayssm_buffer_len must be >= 1 + num_speculative_tokens."""
 
     # Will be set after profiling.
     num_gpu_blocks: int | None = field(default=None, init=False)
