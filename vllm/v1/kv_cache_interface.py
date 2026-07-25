@@ -379,6 +379,53 @@ def _apply_alignment_padding(spec: MLAAttentionSpec | SlidingWindowMLASpec):
 
 
 @dataclass(frozen=True, kw_only=True)
+class TQFullAttentionSpec(FullAttentionSpec):
+    """FullAttentionSpec with TQ-aware page size.
+
+    Python equivalent of the C++ TQ4FullAttentionSpec. Overrides
+    real_page_size_bytes to use TQ slot bytes instead of the raw
+    head_size * dtype formula.
+    """
+
+    tq_slot_size: int = 0
+    # KVQ-2: attention-sink retention. Sinks live in a per-sequence side buffer
+    # (a fixed cost, independent of context length), NOT in the per-block page,
+    # so they do not change real_page_size_bytes. These fields record the honest
+    # side-buffer accounting so the allocator can reserve it.
+    tq_sink_tokens: int = 0
+    tq_sink_kv_bytes: int = 0  # fp16 K+V bytes per sink token per KV head
+
+    @property
+    def real_page_size_bytes(self) -> int:
+        if self.tq_slot_size > 0:
+            return self.block_size * self.num_kv_heads * self.tq_slot_size
+        return super().real_page_size_bytes
+
+    @property
+    def tq_sink_side_bytes_per_seq(self) -> int:
+        """Per-sequence fp16 sink side-buffer size (KVQ-2). Zero when disabled."""
+        if self.tq_sink_tokens <= 0:
+            return 0
+        return self.tq_sink_tokens * self.num_kv_heads * self.tq_sink_kv_bytes
+
+    @classmethod
+    def merge(cls, specs: list[Self]) -> Self:
+        merged = super().merge(specs)
+        assert all(s.tq_slot_size == specs[0].tq_slot_size for s in specs), (
+            "All TQ layers in the same KV cache group must use the same tq_slot_size."
+        )
+        assert all(s.tq_sink_tokens == specs[0].tq_sink_tokens for s in specs), (
+            "All TQ layers in the same KV cache group must use the same sink policy."
+        )
+        return replace(
+            merged,
+            tq_slot_size=specs[0].tq_slot_size,
+            tq_sink_tokens=specs[0].tq_sink_tokens,
+            tq_sink_kv_bytes=specs[0].tq_sink_kv_bytes,
+        )
+
+
+@dataclass(frozen=True, kw_only=True)
 class MLAAttentionSpec(FullAttentionSpec):
     # TODO(Lucas/Chen): less hacky way to do this
     cache_dtype_str: str | None = None

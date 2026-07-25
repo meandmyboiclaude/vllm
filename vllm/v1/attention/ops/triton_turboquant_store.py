@@ -30,6 +30,10 @@ def _store_quantized_value(
     slot_base,  # byte offset into KV_cache_ptr for this slot+head
     d_offs,  # tl.arange(0, BLOCK_D)
     d_mask,  # d_offs < D
+    Val_midpoints_ptr,  # [N_VAL_CENTROIDS-1] float32 (used only when VALUE_NUQ)
+    Outlier_idx_ptr,  # [NH, N_OUTLIERS] int (used only when N_OUTLIERS>0)
+    Outlier_val_ptr,  # [NH, N_OUTLIERS] float32 (used only when N_OUTLIERS>0)
+    outlier_row,  # pid: row into the outlier tensors
     D: tl.constexpr,
     KPS: tl.constexpr,
     VQB: tl.constexpr,
@@ -37,22 +41,47 @@ def _store_quantized_value(
     BLOCK_D: tl.constexpr,
     BLOCK_VAL: tl.constexpr,
     BLOCK_GRP: tl.constexpr,
+    VALUE_NUQ: tl.constexpr = 0,
+    N_VAL_CENTROIDS: tl.constexpr = 8,
+    N_OUTLIERS: tl.constexpr = 0,
 ):
-    """Uniform quantization of values to VQB bits, pack, and store with scale/zero."""
+    """Quantize values to VQB bits, pack, and store with scale/zero.
+
+    Two value codecs share the same packed layout and side bytes:
+      * uniform (VALUE_NUQ=0): per-vector min/max linear quantization; the
+        side fp16 pair stores (scale, min).
+      * non-uniform (VALUE_NUQ=1, KVQ-1): per-vector mean/std companding onto
+        a Lloyd-Max N(0,1) codebook; the side fp16 pair stores (std, mean).
+        Decoding maps the stored index through the value centroid table.
+    """
     val_cache_offset = KPS
 
     if VQB == 3:
         val_vec = tl.load(Value_ptr + base + d_offs, mask=d_mask, other=0.0).to(
             tl.float32
         )
-        val_min = tl.min(tl.where(d_mask, val_vec, float("inf")), axis=0)
-        val_max = tl.max(tl.where(d_mask, val_vec, -float("inf")), axis=0)
-        v_scale = (val_max - val_min) / 7.0
-        v_scale = tl.where(v_scale > 1e-8, v_scale, 1e-8)
-
-        q_vals = tl.minimum(
-            tl.maximum(((val_vec - val_min) / v_scale + 0.5).to(tl.int32), 0), 7
-        )
+        if VALUE_NUQ:
+            v_mean = tl.sum(tl.where(d_mask, val_vec, 0.0), axis=0) / D
+            v_cen = tl.where(d_mask, val_vec - v_mean, 0.0)
+            v_var = tl.sum(v_cen * v_cen, axis=0) / D
+            v_scale = tl.sqrt(v_var)
+            v_scale = tl.where(v_scale > 1e-8, v_scale, 1e-8)
+            v_zero = v_mean
+            z = (val_vec - v_mean) / v_scale
+            q_vals = tl.zeros([BLOCK_D], dtype=tl.int32)
+            for _m in range(N_VAL_CENTROIDS - 1):
+                mid_m = tl.load(Val_midpoints_ptr + _m)
+                q_vals += (z >= mid_m).to(tl.int32)
+            q_vals = tl.minimum(tl.maximum(q_vals, 0), N_VAL_CENTROIDS - 1)
+        else:
+            val_min = tl.min(tl.where(d_mask, val_vec, float("inf")), axis=0)
+            val_max = tl.max(tl.where(d_mask, val_vec, -float("inf")), axis=0)
+            v_scale = (val_max - val_min) / 7.0
+            v_scale = tl.where(v_scale > 1e-8, v_scale, 1e-8)
+            v_zero = val_min
+            q_vals = tl.minimum(
+                tl.maximum(((val_vec - val_min) / v_scale + 0.5).to(tl.int32), 0), 7
+            )
 
         grp_offs = tl.arange(0, BLOCK_GRP)
         grp_mask = grp_offs < (D // 8)
@@ -86,7 +115,7 @@ def _store_quantized_value(
             KV_cache_ptr + slot_base + sc_offset + 1,
             ((sc_u16 >> 8) & 0xFF).to(tl.uint8),
         )
-        zr_f16 = val_min.to(tl.float16)
+        zr_f16 = v_zero.to(tl.float16)
         zr_u16 = zr_f16.to(tl.uint16, bitcast=True)
         tl.store(KV_cache_ptr + slot_base + sc_offset + 2, (zr_u16 & 0xFF).to(tl.uint8))
         tl.store(
@@ -135,6 +164,23 @@ def _store_quantized_value(
             ((zr_u16 >> 8) & 0xFF).to(tl.uint8),
         )
 
+    # ── OUTLIER SIDE-CHANNEL (KVQ-3) ──────────────────────────────────
+    # Region layout after (scale, zero): [idx bytes (N_OUTLIERS) |
+    # fp16 values (2*N_OUTLIERS)]. Indices/values are precomputed on host
+    # (top-|v| per vector) and written verbatim here; decode scatter-gathers.
+    if N_OUTLIERS > 0:
+        out_off = val_cache_offset + VAL_DATA_BYTES + 4
+        for _j in range(N_OUTLIERS):
+            oi = tl.load(Outlier_idx_ptr + outlier_row * N_OUTLIERS + _j).to(tl.uint8)
+            tl.store(KV_cache_ptr + slot_base + out_off + _j, oi)
+            ov = tl.load(Outlier_val_ptr + outlier_row * N_OUTLIERS + _j)
+            ov_u16 = ov.to(tl.float16).to(tl.uint16, bitcast=True)
+            vpos = out_off + N_OUTLIERS + 2 * _j
+            tl.store(KV_cache_ptr + slot_base + vpos, (ov_u16 & 0xFF).to(tl.uint8))
+            tl.store(
+                KV_cache_ptr + slot_base + vpos + 1, ((ov_u16 >> 8) & 0xFF).to(tl.uint8)
+            )
+
 
 # ═══════════════════════════════════════════════════════════════════════
 # FP8 key store + value uniform quantization
@@ -147,6 +193,9 @@ def _tq_fused_store_fp8(
     Value_ptr,  # [NH, D] float16/bfloat16 — raw values
     KV_cache_ptr,  # [total_bytes] uint8 (flattened view)
     Slot_mapping_ptr,  # [N] int32 — per-token slot indices
+    Val_midpoints_ptr,  # [N_VAL_CENTROIDS-1] float32 (used only when VALUE_NUQ)
+    Outlier_idx_ptr,  # [NH, N_OUTLIERS] int (used only when N_OUTLIERS>0)
+    Outlier_val_ptr,  # [NH, N_OUTLIERS] float32 (used only when N_OUTLIERS>0)
     # Cache strides (for computing byte offsets)
     stride_cache_block: tl.constexpr,
     stride_cache_pos: tl.constexpr,
@@ -165,6 +214,9 @@ def _tq_fused_store_fp8(
     BLOCK_VAL: tl.constexpr,
     BLOCK_GRP: tl.constexpr = 16,
     FP8_E4B15: tl.constexpr = 0,  # 1 = e4b15 (Ampere/Ada), 0 = e4nv (Hopper+)
+    VALUE_NUQ: tl.constexpr = 0,
+    N_VAL_CENTROIDS: tl.constexpr = 8,
+    N_OUTLIERS: tl.constexpr = 0,
 ):
     """FP8 key cast+scatter + value uniform quantization."""
     pid = tl.program_id(0)
@@ -204,6 +256,10 @@ def _tq_fused_store_fp8(
         slot_base,
         d_offs,
         d_mask,
+        Val_midpoints_ptr,
+        Outlier_idx_ptr,
+        Outlier_val_ptr,
+        pid,
         D=D,
         KPS=KPS,
         VQB=VQB,
@@ -211,6 +267,9 @@ def _tq_fused_store_fp8(
         BLOCK_D=BLOCK_D,
         BLOCK_VAL=BLOCK_VAL,
         BLOCK_GRP=BLOCK_GRP,
+        VALUE_NUQ=VALUE_NUQ,
+        N_VAL_CENTROIDS=N_VAL_CENTROIDS,
+        N_OUTLIERS=N_OUTLIERS,
     )
 
 
@@ -228,6 +287,9 @@ def _tq_fused_store_mse(
     Value_ptr,  # [NH, D] float32 — raw values
     # Quantization tables
     Midpoints_ptr,  # [n_centroids-1] float32
+    Val_midpoints_ptr,  # [N_VAL_CENTROIDS-1] float32 (used only when VALUE_NUQ)
+    Outlier_idx_ptr,  # [NH, N_OUTLIERS] int (used only when N_OUTLIERS>0)
+    Outlier_val_ptr,  # [NH, N_OUTLIERS] float32 (used only when N_OUTLIERS>0)
     # Cache and indexing
     KV_cache_ptr,  # [total_bytes] uint8 (flattened view)
     Slot_mapping_ptr,  # [N] int32 — per-token slot indices
@@ -252,6 +314,9 @@ def _tq_fused_store_mse(
     MSE_BITS: tl.constexpr,
     N_CENTROIDS: tl.constexpr,
     BLOCK_GRP: tl.constexpr = 16,
+    VALUE_NUQ: tl.constexpr = 0,
+    N_VAL_CENTROIDS: tl.constexpr = 8,
+    N_OUTLIERS: tl.constexpr = 0,
 ):
     """Fused MSE quantize + pack + store.
 
@@ -335,6 +400,10 @@ def _tq_fused_store_mse(
         slot_base,
         d_offs,
         d_mask,
+        Val_midpoints_ptr,
+        Outlier_idx_ptr,
+        Outlier_val_ptr,
+        pid,
         D=D,
         KPS=KPS,
         VQB=VQB,
@@ -342,6 +411,9 @@ def _tq_fused_store_mse(
         BLOCK_D=BLOCK_D,
         BLOCK_VAL=BLOCK_VAL,
         BLOCK_GRP=BLOCK_GRP,
+        VALUE_NUQ=VALUE_NUQ,
+        N_VAL_CENTROIDS=N_VAL_CENTROIDS,
+        N_OUTLIERS=N_OUTLIERS,
     )
 
 
@@ -361,6 +433,9 @@ def triton_turboquant_store(
     key_packed_size: int,
     value_quant_bits: int,
     key_fp8: bool = False,
+    value_nuq: bool = False,
+    val_midpoints: torch.Tensor | None = None,  # [n_val_centroids-1] float32
+    value_outliers: int = 0,  # KVQ-3: per-vector exact outliers (0 = disabled)
 ):
     """Launch TQ store kernel (FP8 or MSE path)."""
     N, H, D = key.shape
@@ -373,6 +448,31 @@ def triton_turboquant_store(
     val_data_bytes = math.ceil(D * value_quant_bits / 8)
 
     BLOCK_VAL = triton.next_power_of_2(val_data_bytes)
+
+    # Non-uniform value codebook (KVQ-1). Midpoints are only dereferenced when
+    # VALUE_NUQ=1; pass the key midpoints as a harmless placeholder otherwise so
+    # the kernel arg is always a valid pointer.
+    n_val_centroids = 2**value_quant_bits
+    val_mid = val_midpoints if val_midpoints is not None else midpoints
+    value_nuq_flag = 1 if value_nuq else 0
+
+    # KVQ-3 outlier side-channel: pick the top-|v| elements per (token, head)
+    # vector on host (cheap, vectorized) and pass indices + signed fp16 values
+    # for the kernel to write. Index is stored in 1 byte, so head_dim <= 256.
+    n_outliers = int(value_outliers)
+    if n_outliers > 0:
+        assert D <= 256, "KVQ-3 outlier index is 1 byte; requires head_dim <= 256"
+        v_abs = value.reshape(NH, D).abs()
+        out_idx = v_abs.topk(n_outliers, dim=1).indices.to(torch.int32).contiguous()
+        out_val = (
+            torch.gather(value.reshape(NH, D), 1, out_idx.to(torch.int64))
+            .to(torch.float32)
+            .contiguous()
+        )
+    else:
+        # Placeholders — never dereferenced when N_OUTLIERS=0.
+        out_idx = slot_mapping
+        out_val = val_mid
 
     # Cache strides (element_size=1 for uint8, so stride in bytes = stride())
     stride_block = kv_cache.stride(0)
@@ -394,6 +494,9 @@ def triton_turboquant_store(
             v_flat,
             kv_cache,
             slot_mapping,
+            val_mid,
+            out_idx,
+            out_val,
             stride_cache_block=stride_block,
             stride_cache_pos=stride_pos,
             stride_cache_head=stride_head,
@@ -407,6 +510,9 @@ def triton_turboquant_store(
             BLOCK_VAL=BLOCK_VAL,
             BLOCK_GRP=block_grp,
             FP8_E4B15=fp8_e4b15,
+            VALUE_NUQ=value_nuq_flag,
+            N_VAL_CENTROIDS=n_val_centroids,
+            N_OUTLIERS=n_outliers,
             num_warps=4,
             num_stages=1,
         )
@@ -428,6 +534,9 @@ def triton_turboquant_store(
         norms.squeeze(1),
         v_flat,
         midpoints,
+        val_mid,
+        out_idx,
+        out_val,
         kv_cache,
         slot_mapping,
         stride_cache_block=stride_block,
@@ -445,6 +554,9 @@ def triton_turboquant_store(
         MSE_BITS=mse_bits,
         N_CENTROIDS=n_centroids,
         BLOCK_GRP=block_grp,
+        VALUE_NUQ=value_nuq_flag,
+        N_VAL_CENTROIDS=n_val_centroids,
+        N_OUTLIERS=n_outliers,
         num_warps=4,
         num_stages=1,
     )
