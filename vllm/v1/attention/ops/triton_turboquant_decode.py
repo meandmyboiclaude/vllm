@@ -9,10 +9,15 @@ Supports FP8 (E4M3) keys, 3-bit and 4-bit uniform quantized values.
 """
 
 import math
+from dataclasses import dataclass
 from typing import Any
 
 import torch
 
+from vllm.model_executor.layers.quantization.turboquant.sink import (
+    SINK_HASH_MULT,
+    SINK_HASH_SHIFT,
+)
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.ops.triton_decode_attention import (
@@ -52,6 +57,9 @@ def _tq_decode_stage1(
     # TQ parameters
     Centroids_ptr,  # [n_centroids] float32
     Val_centroids_ptr,  # [n_val_centroids] float32 (used only when VALUE_NUQ)
+    # KVQ-2 sink side buffer (dereferenced only when SINK_TOKENS > 0)
+    Sink_kv_ptr,  # [SINK_SLOTS, Hk, 2*D] float16
+    Sink_tag_ptr,  # [SINK_SLOTS] int64
     # Output (intermediate for stage2)
     Mid_o_ptr,  # [B, Hq, NUM_KV_SPLITS, D+1] float32
     # Strides
@@ -87,6 +95,11 @@ def _tq_decode_stage1(
     VALUE_NUQ: tl.constexpr = 0,  # 1 = non-uniform (Lloyd-Max) value codebook
     N_VAL_CENTROIDS: tl.constexpr = 8,
     N_OUTLIERS: tl.constexpr = 0,  # KVQ-3: exact value outliers per vector
+    # KVQ-2: 0 disables the sink branch entirely (compiled out).
+    SINK_TOKENS: tl.constexpr = 0,
+    SINK_SLOTS: tl.constexpr = 0,  # power of two
+    SINK_STRIDE_SLOT: tl.constexpr = 0,
+    SINK_STRIDE_HEAD: tl.constexpr = 0,
 ):
     bid = tl.program_id(0)  # batch index
     hid = tl.program_id(1)  # q_head index
@@ -154,6 +167,33 @@ def _tq_decode_stage1(
             + page_off.to(tl.int64) * stride_cache_pos
             + tl.cast(kv_head, tl.int64) * stride_cache_head
         )
+
+        # ============================================================
+        # KVQ-2 SINK LOOKUP: positions inside the sink window whose row
+        # still carries their physical slot read back at fp16 instead of
+        # being dequantized. The tag check is what makes a stale or
+        # collided row degrade to the quantized path rather than return
+        # another token's data.
+        # ============================================================
+        if SINK_TOKENS > 0:
+            slot_ids = block_nums * BLOCK_SIZE + page_off.to(tl.int64)
+            sink_window = kv_mask & (kv_offs < SINK_TOKENS)
+            sink_rows = ((slot_ids * SINK_HASH_MULT) >> SINK_HASH_SHIFT) & (
+                SINK_SLOTS - 1
+            )
+            sink_tags = tl.load(
+                Sink_tag_ptr + sink_rows, mask=sink_window, other=-1
+            )
+            sink_hit = sink_window & (sink_tags == slot_ids)
+            sink_bases = (
+                sink_rows * SINK_STRIDE_SLOT
+                + tl.cast(kv_head, tl.int64) * SINK_STRIDE_HEAD
+            )
+            sink_k = tl.load(
+                Sink_kv_ptr + sink_bases[:, None] + d_offs[None, :],
+                mask=sink_hit[:, None] & d_mask[None, :],
+                other=0.0,
+            ).to(tl.float32)
 
         # ============================================================
         # COMPUTE ATTENTION SCORES: [BLOCK_KV]
@@ -226,6 +266,19 @@ def _tq_decode_stage1(
 
             scores = vec_norms * term1 * ATTN_SCALE
             scores = tl.where(kv_mask, scores, -float("inf"))
+
+        if SINK_TOKENS > 0:
+            # The sink key is stored in the same space q_rot lives in
+            # (Hadamard-rotated for MSE presets, raw for FP8), so the exact
+            # score is a plain dot product with no norm factor.
+            sink_scores = (
+                tl.sum(
+                    tl.where(d_mask[None, :], q_rot[None, :] * sink_k, 0.0),
+                    axis=1,
+                )
+                * ATTN_SCALE
+            )
+            scores = tl.where(sink_hit, sink_scores, scores)
 
         # ============================================================
         # ONLINE SOFTMAX UPDATE (block-level)
@@ -339,6 +392,16 @@ def _tq_decode_stage1(
                     d_offs[None, :] == o_idx[:, None], o_val[:, None], values
                 )
 
+        # KVQ-2: sink values are exact, so they supersede both the
+        # dequantized vector and the KVQ-3 outlier patch.
+        if SINK_TOKENS > 0:
+            sink_v = tl.load(
+                Sink_kv_ptr + sink_bases[:, None] + HEAD_DIM + d_offs[None, :],
+                mask=sink_hit[:, None] & d_mask[None, :],
+                other=0.0,
+            ).to(tl.float32)
+            values = tl.where(sink_hit[:, None], sink_v, values)
+
         # ============================================================
         # WEIGHTED VALUE ACCUMULATION
         # ============================================================
@@ -365,6 +428,8 @@ def _tq_full_dequant_kv(
     Block_table_ptr,
     Centroids_ptr,
     Val_centroids_ptr,  # [n_val_centroids] float32 (used only when VALUE_NUQ)
+    Sink_kv_ptr,  # [SINK_SLOTS, Hk, 2*D] float16 (only when SINK_TOKENS > 0)
+    Sink_tag_ptr,  # [SINK_SLOTS] int64
     K_out_ptr,  # [B, Hk, max_seq, D] float16
     V_out_ptr,  # [B, Hk, max_seq, D] float16
     stride_ko_b,
@@ -392,6 +457,11 @@ def _tq_full_dequant_kv(
     VALUE_NUQ: tl.constexpr = 0,  # 1 = non-uniform (Lloyd-Max) value codebook
     N_VAL_CENTROIDS: tl.constexpr = 8,
     N_OUTLIERS: tl.constexpr = 0,  # KVQ-3: exact value outliers per vector
+    # KVQ-2: 0 disables the sink branch entirely (compiled out).
+    SINK_TOKENS: tl.constexpr = 0,
+    SINK_SLOTS: tl.constexpr = 0,
+    SINK_STRIDE_SLOT: tl.constexpr = 0,
+    SINK_STRIDE_HEAD: tl.constexpr = 0,
 ):
     """Full dequant: reconstruct K (MSE centroids * norm or FP8) and V to fp16."""
     pos = tl.program_id(0)
@@ -411,6 +481,19 @@ def _tq_full_dequant_kv(
     d_offs = tl.arange(0, BLOCK_D)
     d_mask = d_offs < HEAD_DIM
 
+    # KVQ-2: same tag-validated lookup as the decode kernel. K_out is written
+    # in the space the caller expects (rotated for MSE, raw for FP8), which is
+    # exactly the space the sink copy was stored in.
+    if SINK_TOKENS > 0:
+        slot_id = block_num * BLOCK_SIZE + tl.cast(page_off, tl.int64)
+        in_sink_window = pos < SINK_TOKENS
+        sink_row = ((slot_id * SINK_HASH_MULT) >> SINK_HASH_SHIFT) & (SINK_SLOTS - 1)
+        sink_tag = tl.load(Sink_tag_ptr + sink_row, mask=in_sink_window, other=-1)
+        sink_hit = in_sink_window & (sink_tag == slot_id)
+        sink_base = (
+            sink_row * SINK_STRIDE_SLOT + tl.cast(hid, tl.int64) * SINK_STRIDE_HEAD
+        )
+
     # === K dequant ===
     ko_base = bid * stride_ko_b + hid * stride_ko_h + pos * stride_ko_s
     if KEY_FP8:
@@ -419,7 +502,6 @@ def _tq_full_dequant_kv(
             k_recon = k_raw.to(tl.float8e4b15, bitcast=True).to(tl.float32)
         else:
             k_recon = k_raw.to(tl.float8e4nv, bitcast=True).to(tl.float32)
-        tl.store(K_out_ptr + ko_base + d_offs, k_recon.to(tl.float16), mask=d_mask)
     else:
         # MSE unpack (3-bit or 4-bit) + norms
         mse_bit_off = d_offs * MSE_BITS
@@ -451,7 +533,15 @@ def _tq_full_dequant_kv(
         vec_norm = (n_lo | (n_hi << 8)).to(tl.float16, bitcast=True).to(tl.float32)
 
         k_recon = vec_norm * k_mse
-        tl.store(K_out_ptr + ko_base + d_offs, k_recon.to(tl.float16), mask=d_mask)
+
+    if SINK_TOKENS > 0:
+        sink_k = tl.load(
+            Sink_kv_ptr + sink_base + d_offs,
+            mask=sink_hit & d_mask,
+            other=0.0,
+        ).to(tl.float32)
+        k_recon = tl.where(sink_hit, sink_k, k_recon)
+    tl.store(K_out_ptr + ko_base + d_offs, k_recon.to(tl.float16), mask=d_mask)
 
     # === V dequant ===
     val_base = slot_base + KPS
@@ -512,6 +602,14 @@ def _tq_full_dequant_kv(
             o_val = (ov_lo | (ov_hi << 8)).to(tl.float16, bitcast=True).to(tl.float32)
             v_vals = tl.where(d_offs == o_idx, o_val, v_vals)
 
+    if SINK_TOKENS > 0:
+        sink_v = tl.load(
+            Sink_kv_ptr + sink_base + HEAD_DIM + d_offs,
+            mask=sink_hit & d_mask,
+            other=0.0,
+        ).to(tl.float32)
+        v_vals = tl.where(sink_hit, sink_v, v_vals)
+
     vo_base = bid * stride_vo_b + hid * stride_vo_h + pos * stride_vo_s
     tl.store(V_out_ptr + vo_base + d_offs, v_vals.to(tl.float16), mask=d_mask)
 
@@ -525,6 +623,62 @@ def _tq_full_dequant_kv(
 # ---------------------------------------------------------------------------
 
 _layout_cache: dict = {}
+
+
+# ---------------------------------------------------------------------------
+# KVQ-2 sink runtime binding
+#
+# The sink buffers reach the decode launcher through module state rather than
+# through new keyword arguments, because two downstream patches pin this
+# function's call shape: P101 text-patches the continuation-prefill decode call
+# verbatim (a new kwarg there breaks its anchor) and P40 rebinds this symbol
+# with a wrapper carrying a fixed signature (a new kwarg there is a TypeError).
+# The attention impl publishes the binding for the layer it is about to run;
+# execution is sequential per layer, and the buffers are persistent, so a
+# CUDA-graph capture records stable pointers.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class SinkRuntime:
+    """Per-layer sink side-buffer binding consumed by the decode launcher."""
+
+    kv: torch.Tensor  # [SINK_SLOTS, Hk, 2*D] float16
+    tags: torch.Tensor  # [SINK_SLOTS] int64
+    sink_tokens: int
+
+
+_ACTIVE_SINK: SinkRuntime | None = None
+
+
+def set_active_sink(runtime: SinkRuntime | None) -> None:
+    """Bind (or clear) the sink side buffer for the layer about to execute."""
+    global _ACTIVE_SINK
+    _ACTIVE_SINK = runtime
+
+
+def get_active_sink() -> SinkRuntime | None:
+    return _ACTIVE_SINK
+
+
+def _sink_kernel_args(centroids: torch.Tensor) -> tuple:
+    """Resolve (kv, tags, tokens, slots, stride_slot, stride_head).
+
+    With sinks off, the pointer slots take a live placeholder tensor the way
+    the value-codebook argument already does — the kernel never dereferences
+    them because ``SINK_TOKENS`` is 0.
+    """
+    sink = _ACTIVE_SINK
+    if sink is None or sink.sink_tokens <= 0 or sink.tags.numel() == 0:
+        return (centroids, centroids, 0, 0, 0, 0)
+    return (
+        sink.kv,
+        sink.tags,
+        sink.sink_tokens,
+        sink.tags.shape[0],
+        sink.kv.stride(0),
+        sink.kv.stride(1),
+    )
 
 
 def _get_layout(D, mse_bits, value_quant_bits, key_packed_size):
@@ -620,6 +774,14 @@ def triton_turboquant_decode_attention(
 
     # Stage 1: split-KV tiled attention scoring + value accumulation
     fp8_e4b15 = _use_fp8_e4b15(device.index or 0)
+    (
+        sink_kv,
+        sink_tags,
+        sink_tokens,
+        sink_slots,
+        sink_stride_slot,
+        sink_stride_head,
+    ) = _sink_kernel_args(centroids)
     BLOCK_KV = 4
     grid = (B, Hq, NUM_KV_SPLITS)
     _tq_decode_stage1[grid](
@@ -629,6 +791,8 @@ def triton_turboquant_decode_attention(
         seq_lens,
         centroids,
         val_cent,
+        sink_kv,
+        sink_tags,
         mid_o,
         q_rot.stride(0),
         q_rot.stride(1),
@@ -658,6 +822,10 @@ def triton_turboquant_decode_attention(
         VALUE_NUQ=value_nuq_flag,
         N_VAL_CENTROIDS=n_val_centroids,
         N_OUTLIERS=n_outliers,
+        SINK_TOKENS=sink_tokens,
+        SINK_SLOTS=sink_slots,
+        SINK_STRIDE_SLOT=sink_stride_slot,
+        SINK_STRIDE_HEAD=sink_stride_head,
         num_warps=1,
         num_stages=1,
     )

@@ -31,6 +31,10 @@ from vllm.model_executor.layers.quantization.turboquant.centroids import (
     get_centroids,
     get_value_codebook,
 )
+from vllm.model_executor.layers.quantization.turboquant.sink import (
+    SINK_EMPTY_TAG,
+    build_sink_spec,
+)
 from vllm.triton_utils import triton
 from vllm.utils.math_utils import round_up
 from vllm.v1.attention.backend import (
@@ -50,8 +54,10 @@ from vllm.v1.attention.backends.fa_utils import (
 )
 from vllm.v1.attention.backends.utils import split_decodes_and_prefills
 from vllm.v1.attention.ops.triton_turboquant_decode import (
+    SinkRuntime,
     _tq_full_dequant_kv,
     _use_fp8_e4b15,
+    set_active_sink,
     triton_turboquant_decode_attention,
 )
 from vllm.v1.attention.ops.triton_turboquant_store import triton_turboquant_store
@@ -201,6 +207,10 @@ class TurboQuantMetadata(AttentionMetadata):
     # without per-step D2H syncs.
     query_start_loc_cpu: torch.Tensor | None = None
     seq_lens_cpu: torch.Tensor | None = None
+    # (num_tokens,) logical position of each token, used by KVQ-2 to decide
+    # which stores belong in the sink side buffer. A view of the runner's
+    # persistent positions buffer, so it is CUDA-graph safe.
+    token_positions: torch.Tensor | None = None
 
 
 class TurboQuantMetadataBuilder(AttentionMetadataBuilder[TurboQuantMetadata]):
@@ -298,6 +308,7 @@ class TurboQuantMetadataBuilder(AttentionMetadataBuilder[TurboQuantMetadata]):
             num_decode_tokens=num_decode_tokens,
             query_start_loc_cpu=cam.query_start_loc_cpu,
             seq_lens_cpu=cam.seq_lens_cpu_upper_bound,
+            token_positions=cam.positions,
         )
 
 
@@ -347,17 +358,6 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         self._val_data_bytes = math.ceil(head_size * cfg.effective_value_quant_bits / 8)
         self._n_centroids = cfg.n_centroids if not cfg.key_fp8 else 1
 
-        # KVQ-2: the sink side-buffer store/gather is not yet wired into the
-        # Triton kernels (pending GPU iteration). Warn so this preset does not
-        # silently behave like its no-sink base preset at runtime.
-        if cfg.sink_enabled:
-            logger.warning(
-                "TurboQuant sink retention (sink_tokens=%d) is configured but "
-                "the runtime side-buffer path is not yet active; decode falls "
-                "back to quantized values for sink positions.",
-                cfg.sink_tokens,
-            )
-
         # Detect flash-attn version (FA2/3/4) for prefill paths.
         self.fa_version = get_flash_attn_version(head_size=head_size)
 
@@ -367,6 +367,30 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         self.max_num_kv_splits = (
             vllm_config.attention_config.tq_max_kv_splits_for_cuda_graph
         )
+
+        # KVQ-2: size the sink side buffer from the concurrency limit — the
+        # cost is fixed per sequence and does not grow with context length.
+        self._max_num_seqs = vllm_config.scheduler_config.max_num_seqs
+        self._sink_spec = self._build_sink_spec()
+
+    def _build_sink_spec(self):
+        """Side-buffer geometry for the currently resolved TQ preset."""
+        return build_sink_spec(
+            max_num_seqs=self._max_num_seqs,
+            sink_tokens=self.tq_config.sink_tokens,
+            num_kv_heads=self.num_kv_heads,
+            head_dim=self.head_size,
+        )
+
+    def _sink_runtime(self, layer) -> "SinkRuntime | None":
+        """Sink binding for ``layer``, or None when the preset has no sinks."""
+        if not self._sink_spec.enabled:
+            return None
+        kv = getattr(layer, "_tq_sink_kv", None)
+        tags = getattr(layer, "_tq_sink_tags", None)
+        if kv is None or tags is None:
+            return None
+        return SinkRuntime(kv=kv, tags=tags, sink_tokens=self._sink_spec.sink_tokens)
 
     def _flash_attn_varlen(
         self,
@@ -441,6 +465,8 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             self.head_size * cfg.effective_value_quant_bits / 8
         )
         self._n_centroids = cfg.n_centroids if not cfg.key_fp8 else 1
+        # KVQ-4 can swap a sink preset in or out for this layer.
+        self._sink_spec = self._build_sink_spec()
         logger.info(
             "TurboQuant layer %s: per-layer preset override -> %s", name, resolved
         )
@@ -481,6 +507,32 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             else:
                 layer._tq_val_centroids = None
                 layer._tq_val_midpoints = None
+
+            # KVQ-2: per-layer sink side buffer. Allocated here so it is
+            # counted by the memory profiler, and left absent entirely when
+            # the preset does not ask for sinks.
+            spec = self._sink_spec
+            if spec.enabled:
+                layer._tq_sink_kv = torch.zeros(
+                    spec.kv_shape, dtype=torch.float16, device=device
+                )
+                layer._tq_sink_tags = torch.full(
+                    spec.tag_shape,
+                    SINK_EMPTY_TAG,
+                    dtype=torch.int64,
+                    device=device,
+                )
+                logger.info(
+                    "TurboQuant layer %s: KVQ-2 sink retention active "
+                    "(sink_tokens=%d, rows=%d, %.1f MiB)",
+                    getattr(layer, "layer_name", "?"),
+                    spec.sink_tokens,
+                    spec.num_slots,
+                    spec.total_bytes / (1024 * 1024),
+                )
+            else:
+                layer._tq_sink_kv = None
+                layer._tq_sink_tags = None
             layer._tq_cached = True
 
     def do_kv_cache_update(
@@ -508,7 +560,35 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         v = value[:N].view(N, self.num_kv_heads, self.head_size)
         # (B, H, N, C) -> (B, N, H, C) for TQ kernels
         kv_cache = kv_cache.transpose(1, 2)
-        self._store_kv(k, v, kv_cache, slot_mapping, layer)
+        positions = self._token_positions(layer, N)
+        self._store_kv(k, v, kv_cache, slot_mapping, layer, positions)
+
+    def _token_positions(self, layer, num_tokens: int) -> torch.Tensor | None:
+        """Logical position of each stored token, for the KVQ-2 store gate.
+
+        The KV-cache update runs as its own custom op, so the metadata is
+        reached through the forward context rather than an argument. Any
+        failure to resolve it leaves sinks unwritten, which degrades to the
+        no-sink preset instead of storing something wrong.
+        """
+        if not self._sink_spec.enabled:
+            return None
+        try:
+            from vllm.forward_context import get_forward_context
+
+            layer_name = layer.layer_name
+            attn_metadata = get_forward_context().attn_metadata
+            if isinstance(attn_metadata, list):
+                # Speculative decoding: [0] is the base-model metadata dict.
+                attn_metadata = attn_metadata[0]
+            if isinstance(attn_metadata, dict):
+                attn_metadata = attn_metadata.get(layer_name)
+            positions = getattr(attn_metadata, "token_positions", None)
+        except Exception:
+            return None
+        if positions is None or positions.shape[0] < num_tokens:
+            return None
+        return positions[:num_tokens]
 
     def forward(
         self,
@@ -550,6 +630,10 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         tq_layer: Any = layer
         device = q.device
         self._ensure_on_device(tq_layer, device)
+        # KVQ-2: publish this layer's side buffer for the decode launcher.
+        # Set unconditionally (None included) so a sink layer never leaks its
+        # binding into the next, sink-free layer.
+        set_active_sink(self._sink_runtime(tq_layer))
         Pi = tq_layer._tq_Pi
         PiT = tq_layer._tq_PiT
         centroids = tq_layer._tq_centroids
@@ -669,8 +753,10 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         kv_cache: torch.Tensor,  # (num_blocks, block_size, Hk, slot_size)
         slot_mapping: torch.Tensor,
         layer: Any,
+        positions: torch.Tensor | None = None,
     ):
         """Quantize + store via fused Triton kernel."""
+        sink = self._sink_runtime(layer) if positions is not None else None
         triton_turboquant_store(
             key,
             value,
@@ -685,6 +771,10 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             value_nuq=self.tq_config.value_nuq,
             val_midpoints=getattr(layer, "_tq_val_midpoints", None),
             value_outliers=self.tq_config.n_value_outliers,
+            sink_tokens=sink.sink_tokens if sink is not None else 0,
+            positions=positions if sink is not None else None,
+            sink_kv=sink.kv if sink is not None else None,
+            sink_tags=sink.tags if sink is not None else None,
         )
 
     # ------------------------------------------------------------------ #
@@ -921,6 +1011,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         k_cached = k_buf[:, :, :alloc_len, :]
         v_cached = v_buf[:, :, :alloc_len, :]
 
+        sink = self._sink_runtime(layer)
         grid = (alloc_len, 1 * Hk)
         _tq_full_dequant_kv[grid](
             kv_cache,
@@ -929,6 +1020,8 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             getattr(layer, "_tq_val_centroids", None)
             if self.tq_config.value_nuq
             else centroids,
+            sink.kv if sink is not None else centroids,
+            sink.tags if sink is not None else centroids,
             k_cached,
             v_cached,
             k_cached.stride(0),
@@ -956,6 +1049,10 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             VALUE_NUQ=1 if self.tq_config.value_nuq else 0,
             N_VAL_CENTROIDS=self.tq_config.n_value_centroids,
             N_OUTLIERS=self.tq_config.n_value_outliers,
+            SINK_TOKENS=sink.sink_tokens if sink is not None else 0,
+            SINK_SLOTS=sink.tags.shape[0] if sink is not None else 0,
+            SINK_STRIDE_SLOT=sink.kv.stride(0) if sink is not None else 0,
+            SINK_STRIDE_HEAD=sink.kv.stride(1) if sink is not None else 0,
             num_warps=4,
         )
 

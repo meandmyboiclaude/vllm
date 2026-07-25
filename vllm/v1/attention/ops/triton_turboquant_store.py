@@ -7,6 +7,9 @@ Two kernels:
 2. _tq_fused_store_mse: Fused binary-search bucketize + MSE index
    packing + value quantization.
 
+Plus the KVQ-2 sink side-buffer pair (_tq_sink_claim / _tq_sink_write), which
+only runs when a preset requests sink retention.
+
 The launcher `triton_turboquant_store` selects the appropriate kernel.
 """
 
@@ -14,6 +17,10 @@ import math
 
 import torch
 
+from vllm.model_executor.layers.quantization.turboquant.sink import (
+    SINK_HASH_MULT,
+    SINK_HASH_SHIFT,
+)
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.ops.triton_turboquant_decode import _use_fp8_e4b15
 
@@ -415,6 +422,133 @@ def _tq_fused_store_mse(
 
 
 # ═══════════════════════════════════════════════════════════════════════
+# KVQ-2: attention-sink side buffer (fp16 K/V retention for positions < N)
+#
+# Written as two launches on purpose. Colliding slots race for a row, and a
+# single kernel could leave the row's tag naming one slot while its payload
+# came from another — the one failure mode that would corrupt output rather
+# than merely degrade it. Splitting the write puts a kernel boundary (a global
+# memory barrier) between "settle the tag" and "write the payload of whichever
+# slot the tag settled on", so tag and payload can never disagree.
+# ═══════════════════════════════════════════════════════════════════════
+
+
+@triton.jit
+def _tq_sink_claim(
+    Positions_ptr,  # [N] int — logical position of each token
+    Slot_mapping_ptr,  # [N] int — physical cache slot of each token
+    Sink_tag_ptr,  # [SINK_SLOTS] int64 — slot currently owning each row
+    SINK_TOKENS: tl.constexpr,
+    SINK_SLOTS: tl.constexpr,  # power of two
+):
+    """Phase A: claim a side-buffer row for every sink-eligible token."""
+    token_idx = tl.program_id(0)
+    slot = tl.load(Slot_mapping_ptr + token_idx).to(tl.int64)
+    pos = tl.load(Positions_ptr + token_idx).to(tl.int64)
+    if slot < 0 or pos < 0 or pos >= SINK_TOKENS:
+        return
+    row = ((slot * SINK_HASH_MULT) >> SINK_HASH_SHIFT) & (SINK_SLOTS - 1)
+    tl.store(Sink_tag_ptr + row, slot)
+
+
+@triton.jit
+def _tq_sink_write(
+    Key_src_ptr,  # [NH, D] key in the space the decode kernel scores in
+    Norms_ptr,  # [NH] float32 — key norms (MSE path only)
+    Value_ptr,  # [NH, D] raw values
+    Positions_ptr,  # [N] int
+    Slot_mapping_ptr,  # [N] int
+    Sink_tag_ptr,  # [SINK_SLOTS] int64
+    Sink_kv_ptr,  # [SINK_SLOTS, H, 2*D] float16
+    D: tl.constexpr,
+    H: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    SINK_TOKENS: tl.constexpr,
+    SINK_SLOTS: tl.constexpr,
+    SINK_STRIDE_SLOT: tl.constexpr,
+    SINK_STRIDE_HEAD: tl.constexpr,
+    SCALE_BY_NORM: tl.constexpr,  # 1 = MSE path (key stored normalized+rotated)
+):
+    """Phase B: write fp16 K/V for the tokens whose row claim survived.
+
+    ``Key_src_ptr`` is the rotated, unit-normalized key for MSE presets (paired
+    with ``Norms_ptr`` to undo the normalization) and the raw key for FP8
+    presets — in both cases the space the decode kernel's ``q_rot`` lives in,
+    so the sink branch scores with a plain dot product.
+    """
+    pid = tl.program_id(0)
+    token_idx = pid // H
+    head_idx = pid % H
+
+    slot = tl.load(Slot_mapping_ptr + token_idx).to(tl.int64)
+    pos = tl.load(Positions_ptr + token_idx).to(tl.int64)
+    if slot < 0 or pos < 0 or pos >= SINK_TOKENS:
+        return
+    row = ((slot * SINK_HASH_MULT) >> SINK_HASH_SHIFT) & (SINK_SLOTS - 1)
+    if tl.load(Sink_tag_ptr + row) != slot:
+        # Lost the row to a colliding slot; this token stays quantized-only.
+        return
+
+    d_offs = tl.arange(0, BLOCK_D)
+    d_mask = d_offs < D
+    base = pid * D
+
+    k_vec = tl.load(Key_src_ptr + base + d_offs, mask=d_mask, other=0.0).to(tl.float32)
+    if SCALE_BY_NORM:
+        k_vec = k_vec * tl.load(Norms_ptr + pid).to(tl.float32)
+    v_vec = tl.load(Value_ptr + base + d_offs, mask=d_mask, other=0.0).to(tl.float32)
+
+    entry = row * SINK_STRIDE_SLOT + tl.cast(head_idx, tl.int64) * SINK_STRIDE_HEAD
+    tl.store(Sink_kv_ptr + entry + d_offs, k_vec.to(tl.float16), mask=d_mask)
+    tl.store(Sink_kv_ptr + entry + D + d_offs, v_vec.to(tl.float16), mask=d_mask)
+
+
+def _store_sink_side_buffer(
+    key_src: torch.Tensor,  # [NH, D]
+    norms: torch.Tensor | None,  # [NH] float32, MSE path only
+    value: torch.Tensor,  # [NH, D]
+    positions: torch.Tensor,  # [N]
+    slot_mapping: torch.Tensor,  # [N]
+    sink_kv: torch.Tensor,  # [SINK_SLOTS, H, 2*D] float16
+    sink_tags: torch.Tensor,  # [SINK_SLOTS] int64
+    sink_tokens: int,
+    num_heads: int,
+    head_dim: int,
+) -> None:
+    """Launch the KVQ-2 claim + write pair for this store batch."""
+    n_tokens = slot_mapping.shape[0]
+    num_slots = sink_tags.shape[0]
+    _tq_sink_claim[(n_tokens,)](
+        positions,
+        slot_mapping,
+        sink_tags,
+        SINK_TOKENS=sink_tokens,
+        SINK_SLOTS=num_slots,
+        num_warps=1,
+        num_stages=1,
+    )
+    _tq_sink_write[(n_tokens * num_heads,)](
+        key_src,
+        norms if norms is not None else key_src,
+        value,
+        positions,
+        slot_mapping,
+        sink_tags,
+        sink_kv,
+        D=head_dim,
+        H=num_heads,
+        BLOCK_D=triton.next_power_of_2(head_dim),
+        SINK_TOKENS=sink_tokens,
+        SINK_SLOTS=num_slots,
+        SINK_STRIDE_SLOT=sink_kv.stride(0),
+        SINK_STRIDE_HEAD=sink_kv.stride(1),
+        SCALE_BY_NORM=1 if norms is not None else 0,
+        num_warps=4,
+        num_stages=1,
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════
 # Launcher
 # ═══════════════════════════════════════════════════════════════════════
 
@@ -433,6 +567,12 @@ def triton_turboquant_store(
     value_nuq: bool = False,
     val_midpoints: torch.Tensor | None = None,  # [n_val_centroids-1] float32
     value_outliers: int = 0,  # KVQ-3: per-vector exact outliers (0 = disabled)
+    # KVQ-2 sink retention. All four must be supplied together; any of them
+    # missing leaves the side buffer untouched and the store byte-identical.
+    sink_tokens: int = 0,
+    positions: torch.Tensor | None = None,  # [N] logical position per token
+    sink_kv: torch.Tensor | None = None,  # [SINK_SLOTS, H, 2*D] float16
+    sink_tags: torch.Tensor | None = None,  # [SINK_SLOTS] int64
 ):
     """Launch TQ store kernel (FP8 or MSE path)."""
     N, H, D = key.shape
@@ -478,6 +618,18 @@ def triton_turboquant_store(
 
     block_grp = triton.next_power_of_2(D // 8) if D >= 8 else 1
 
+    sink_active = (
+        sink_tokens > 0
+        and positions is not None
+        and sink_kv is not None
+        and sink_tags is not None
+        and sink_tags.shape[0] > 0
+        # Geometry must match this layer, or the writes would land off-head.
+        and sink_kv.shape[1] == H
+        and sink_kv.shape[2] == 2 * D
+        and positions.shape[0] >= N
+    )
+
     # ── FP8 PATH: in-kernel FP8 cast + scatter via fp8 kernel ──
     if key_fp8:
         k_flat = key.reshape(NH, D).contiguous()
@@ -513,6 +665,20 @@ def triton_turboquant_store(
             num_warps=4,
             num_stages=1,
         )
+        if sink_active:
+            # FP8 keys are scored unrotated, so the sink copy is the raw key.
+            _store_sink_side_buffer(
+                k_flat,
+                None,
+                v_flat,
+                positions,
+                slot_mapping,
+                sink_kv,
+                sink_tags,
+                sink_tokens,
+                H,
+                D,
+            )
         return
 
     # ── MSE PATH: external GEMM + fused bucketize/pack kernel ──
@@ -557,3 +723,20 @@ def triton_turboquant_store(
         num_warps=4,
         num_stages=1,
     )
+
+    if sink_active:
+        # MSE keys are scored in Hadamard-rotated space against q_rot, so the
+        # sink copy is the same rotated vector with its norm folded back in
+        # (y * ||k|| == k @ PiT) — reusing the GEMM the store already did.
+        _store_sink_side_buffer(
+            y,
+            norms.squeeze(1),
+            v_flat,
+            positions,
+            slot_mapping,
+            sink_kv,
+            sink_tags,
+            sink_tokens,
+            H,
+            D,
+        )
