@@ -2433,6 +2433,7 @@ class GPUModelRunner(
             _num_computed_tokens_cpu=num_computed_tokens_cpu,
             seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
             replayssm_decode_base_cpu=replayssm_decode_base_cpu,
+            num_prompt_tokens_cpu=num_prompt_tokens_cpu,
             num_reqs=num_reqs_padded,
             num_actual_tokens=num_tokens_padded,
             max_query_len=max_query_len,
@@ -2496,7 +2497,17 @@ class GPUModelRunner(
             )
 
             extra_attn_metadata_args = {}
-            if use_spec_decode and isinstance(
+            # Under ReplaySSM-spec, draft-less steps must still reach the
+            # spec cursor machinery:
+            needs_mamba_spec_args = use_spec_decode or (
+                self.speculative_config is not None
+                and self.cache_config.use_replayssm_spec
+                and isinstance(
+                    builder,
+                    (Mamba2AttentionMetadataBuilder, GDNAttentionMetadataBuilder),
+                )
+            )
+            if needs_mamba_spec_args and isinstance(
                 builder,
                 (
                     Mamba2AttentionMetadataBuilder,
