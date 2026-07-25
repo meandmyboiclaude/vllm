@@ -175,6 +175,7 @@ if TYPE_CHECKING:
     VLLM_RAY_EXTRA_ENV_VARS_TO_COPY: str = ""
     VLLM_MARLIN_USE_ATOMIC_ADD: bool = False
     VLLM_MARLIN_INPUT_DTYPE: Literal["int8", "fp8"] | None = None
+    VLLM_MTP_HEAD_QUANT: Literal["off", "fp8", "int8"] = "off"
     VLLM_HUMMING_ONLINE_QUANT_CONFIG: dict[str, Any] | None = None
     VLLM_HUMMING_INPUT_QUANT_CONFIG: dict[str, Any] | None = None
     VLLM_HUMMING_USE_F16_ACCUM: bool = False
@@ -1441,6 +1442,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # The activation dtype for marlin kernel
     "VLLM_MARLIN_INPUT_DTYPE": env_with_choices(
         "VLLM_MARLIN_INPUT_DTYPE", None, ["int8", "fp8"]
+    ),
+    # Quantize the integrated MTP (multi-token-prediction) drafter head's
+    # linear weights at load time to reclaim VRAM. The MTP head ships in
+    # bf16/fp16 even when the target model is quantized (it is excluded from
+    # the target's quant config), so this offers ~0.4 GiB of KV headroom on
+    # a 24 GiB card. "fp8" uses per-output-channel fp8 (native on SM89+),
+    # "int8" uses per-output-channel int8; both keep the target verifier
+    # unchanged so only drafter acceptance rate (perf), not correctness, is
+    # affected. Default "off".
+    "VLLM_MTP_HEAD_QUANT": env_with_choices(
+        "VLLM_MTP_HEAD_QUANT", "off", ["off", "fp8", "int8"]
     ),
     # The online quantization dtype for humming kernel
     "VLLM_HUMMING_ONLINE_QUANT_CONFIG": lambda: maybe_convert_json_str_or_file(
