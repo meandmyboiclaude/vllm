@@ -18,3 +18,12 @@ All picks auto-merged; py_compile spot-checks clean. CI workflows stripped
 (6c3688a0ad1). Perf motivation: the −13% prod-prompt TPS regression on stock
 nightly (VLLM-UPDATE-20260725.md) — picks theory tested by the post-build
 prod-30 screen.
+
+## Second wave (2026-07-25, scout-agent verdict)
+| pick | why |
+|---|---|
+| #48177 | TQ KV-dtype preserve in reshape (fresh head incl. main merge) |
+| #43747 | TQ cudagraph capture crash w/ spec-decode + chunked-prefill (BUG-127-adjacent suspect) — auto-merged over our #46461 pick |
+| #48188 | ~6x Mamba chunk-metadata computation (prod long-prefill perf) |
+| #49798 | hand-applied essence (import + guard) — PR head was stacked on unrelated multimodal work |
+Rejected for today (scout): #46067/#48815/#49738 (conflict stacking risk on scheduler/turboquant), #43642 (competes with #48363), base-bump past 0ba2aa35 (8 irrelevant commits).
