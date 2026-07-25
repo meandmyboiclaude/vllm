@@ -561,15 +561,32 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         # (B, H, N, C) -> (B, N, H, C) for TQ kernels
         kv_cache = kv_cache.transpose(1, 2)
         positions = self._token_positions(layer, N)
+        if positions is None and self._sink_spec.enabled:
+            # The tag check only proves "this row was claimed by this physical
+            # slot", not "by the sequence that owns the slot now". That gap is
+            # closed by every sink-eligible token claiming its row as it is
+            # stored. If the store gate cannot run, a slot freed by one
+            # sequence and re-issued to another would still carry the old
+            # owner's tag, and the reader would return the old owner's K/V.
+            # Dropping every tag turns that into an all-miss (the quantized
+            # path) instead of silently wrong data.
+            self._invalidate_sink_tags(layer)
         self._store_kv(k, v, kv_cache, slot_mapping, layer, positions)
+
+    @staticmethod
+    def _invalidate_sink_tags(layer) -> None:
+        tags = getattr(layer, "_tq_sink_tags", None)
+        if tags is not None:
+            tags.fill_(SINK_EMPTY_TAG)
 
     def _token_positions(self, layer, num_tokens: int) -> torch.Tensor | None:
         """Logical position of each stored token, for the KVQ-2 store gate.
 
         The KV-cache update runs as its own custom op, so the metadata is
-        reached through the forward context rather than an argument. Any
-        failure to resolve it leaves sinks unwritten, which degrades to the
-        no-sink preset instead of storing something wrong.
+        reached through the forward context rather than an argument. Returning
+        None means "the gate cannot run this step"; the caller then drops the
+        side buffer's tags, because leaving them live would let a re-issued
+        slot read its previous owner's K/V.
         """
         if not self._sink_spec.enabled:
             return None
@@ -585,8 +602,16 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 attn_metadata = attn_metadata.get(layer_name)
             positions = getattr(attn_metadata, "token_positions", None)
         except Exception:
+            logger.warning_once(
+                "TurboQuant KVQ-2: token positions unreachable from the "
+                "forward context; sink retention is inactive this step."
+            )
             return None
         if positions is None or positions.shape[0] < num_tokens:
+            logger.warning_once(
+                "TurboQuant KVQ-2: attention metadata carries no usable "
+                "token_positions; sink retention is inactive this step."
+            )
             return None
         return positions[:num_tokens]
 

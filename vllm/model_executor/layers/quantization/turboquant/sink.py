@@ -105,8 +105,16 @@ def sink_row_for_slot(slot: int, num_slots: int) -> int:
     """Row holding the side-buffer entry for physical cache ``slot``.
 
     Mirrors the Triton expression exactly (int64 multiply, logical shift, mask
-    against a power-of-two row count). Consecutive slots land on distinct rows
-    because ``SINK_HASH_MULT >> SINK_HASH_SHIFT`` is odd.
+    against a power-of-two row count).
+
+    Note that a sequence's own sinks occupy *consecutive* slots, and this hash
+    does not keep a run of 32 of them on 32 distinct rows once the table is
+    small: at ``num_slots`` 64 a run of 32 covers 17 rows and at 128 it covers
+    30, because the step between adjacent slots
+    (``SINK_HASH_MULT >> SINK_HASH_SHIFT``, or one more) shares factors with
+    the mask. Tables of 256 rows and up are collision-free on a run of 32.
+    Small tables come from small ``max_num_seqs``; raise
+    ``VLLM_TQ_SINK_OVERPROVISION`` there to buy the rows back.
     """
     if num_slots <= 0:
         raise ValueError("sink side buffer is disabled (num_slots == 0)")

@@ -159,11 +159,35 @@ def test_row_matches_kernel_expression():
         assert sink_row_for_slot(slot, n) == expected
 
 
-def test_consecutive_slots_do_not_self_collide():
-    # A sequence's sink positions are consecutive slots inside a block; they
-    # must land on distinct rows or a sequence would evict its own sinks.
-    n = 2048
-    rows = {sink_row_for_slot(1000 + i, n) for i in range(SINK)}
+def test_consecutive_slots_self_collide_on_small_tables():
+    # A sequence's sink positions are consecutive slots inside a block, so the
+    # hash has to spread a run of SINK consecutive slots. It does — but only
+    # once the table is big enough. Below 256 rows the run folds onto itself
+    # and a sequence evicts its own sinks; those sizes are exactly what small
+    # max_num_seqs deployments get, so the loss is pinned here rather than
+    # assumed away.
+    worst = {64: 18, 128: 31}  # upper bound on distinct rows for a run of 32
+    for n, cap in worst.items():
+        for base in (0, 1000, 65536):
+            rows = {sink_row_for_slot(base + i, n) for i in range(SINK)}
+            assert len(rows) <= cap, (n, base, len(rows))
+            assert len(rows) < SINK, (n, base)
+    for n in (256, 1024, 2048):
+        for base in (0, 1000, 65536):
+            rows = {sink_row_for_slot(base + i, n) for i in range(SINK)}
+            assert len(rows) == SINK, (n, base, len(rows))
+
+
+def test_table_size_for_small_concurrency_is_a_colliding_one():
+    # Ties the row counts above to the configs that produce them, so a change
+    # to sink_cache_slots that moves a deployment into the colliding regime
+    # shows up here.
+    assert sink_cache_slots(max_num_seqs=1, sink_tokens=SINK, overprovision=2) == 64
+    assert sink_cache_slots(max_num_seqs=2, sink_tokens=SINK, overprovision=2) == 128
+    assert sink_cache_slots(max_num_seqs=4, sink_tokens=SINK, overprovision=2) == 256
+    # Over-provisioning buys the run back at small concurrency.
+    assert sink_cache_slots(max_num_seqs=2, sink_tokens=SINK, overprovision=8) == 512
+    rows = {sink_row_for_slot(1000 + i, 512) for i in range(SINK)}
     assert len(rows) == SINK
 
 
@@ -538,9 +562,13 @@ def test_decode_launcher_signature_is_unchanged_for_p40():
 
 
 def test_p101_anchors_still_match_the_backend_source():
-    # P101 text-patches the continuation-prefill decode call verbatim. Its
-    # anchors are reproduced here (KVQ-spliced form, indent 24) so a future
-    # edit to that block fails this test rather than the boot.
+    # P101 text-patches the continuation-prefill decode call verbatim, so its
+    # anchor covers the *whole* call including every keyword argument. Pinning
+    # only the `if` header (as this test first did) let the KVQ-1/KVQ-3 kwargs
+    # break P101 silently: its committed anchor still ends at PiT=PiT, while
+    # the tree now passes value_nuq / val_centroids / value_outliers too. Both
+    # anchors are reproduced in full here so any further edit to this block
+    # fails CI, and so re-anchoring P101 has an exact target to copy.
     text = _read(BACKEND_SRC)
     threshold_anchor = (
         "# do_kv_cache_update already stored all tokens to TQ cache, "
@@ -553,6 +581,8 @@ def test_p101_anchors_still_match_the_backend_source():
     )
     assert threshold_anchor in text
     pad = " " * 16
+    body = " " * 20
+    arg = " " * 24
     loop_anchor = (
         f"{pad}# Continuation chunk: tokens already stored to TQ cache\n"
         f"{pad}# by do_kv_cache_update. Use decode kernel directly to\n"
@@ -561,11 +591,47 @@ def test_p101_anchors_still_match_the_backend_source():
         "_continuation_prefill.\n"
         f"{pad}cached_len = seq_len - q_len\n"
         f"{pad}if q_len <= _CONTINUATION_DECODE_THRESHOLD:\n"
+        f"{body}# Fast path: treat each query as a decode request\n"
+        f"{body}# with incremental seq_lens for causal masking.\n"
+        f"{body}# Slice from pre-built arange (no kernel launch)\n"
+        f"{body}synth_seq_lens = _arange_cache[cached_len + 1 : seq_len + 1]\n"
+        f"{body}synth_bt = attn_metadata.block_table[i : i + 1]"
+        ".expand(q_len, -1)\n"
+        f"{body}out = triton_turboquant_decode_attention(\n"
+        f"{arg}query=q_seq,\n"
+        f"{arg}kv_cache=kv_cache,\n"
+        f"{arg}block_table=synth_bt,\n"
+        f"{arg}seq_lens=synth_seq_lens,\n"
+        f"{arg}Pi=Pi,\n"
+        f"{arg}centroids=centroids,\n"
+        f"{arg}scale=self.scale,\n"
+        f"{arg}mse_bits=self.tq_config.key_mse_bits,\n"
+        f"{arg}key_packed_size=self.tq_config.key_packed_size,\n"
+        f"{arg}value_quant_bits=(self.tq_config."
+        "effective_value_quant_bits),\n"
+        f"{arg}key_fp8=self.tq_config.key_fp8,\n"
+        f"{arg}norm_correction=self.tq_config.norm_correction,\n"
+        f"{arg}PiT=PiT,\n"
+        f"{arg}value_nuq=self.tq_config.value_nuq,\n"
+        f'{arg}val_centroids=getattr(layer, "_tq_val_centroids", None),\n'
+        f"{arg}value_outliers=self.tq_config.n_value_outliers,\n"
+        f"{body})\n"
     )
     assert loop_anchor in text
     # P101's own drift markers must stay absent (they signal it already ran).
     assert "_CONTINUATION_DECODE_MAX_CACHED_LEN" not in text
     assert "use_decode_continuation" not in text
+
+
+def test_store_gate_failure_drops_the_tags():
+    # The tag proves which slot claimed a row, not which sequence owns that
+    # slot now. Only the store keeps the two in step, so a step that cannot
+    # run the store gate has to drop every tag — otherwise a slot freed by one
+    # sequence and re-issued to another is read at the old owner's K/V.
+    text = _read(BACKEND_SRC)
+    assert "def _invalidate_sink_tags(" in text
+    assert "self._invalidate_sink_tags(layer)" in text
+    assert "tags.fill_(SINK_EMPTY_TAG)" in text
 
 
 def test_metadata_carries_positions_for_the_store_gate():
