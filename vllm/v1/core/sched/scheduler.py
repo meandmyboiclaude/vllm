@@ -391,7 +391,15 @@ class Scheduler(SchedulerInterface):
         # boundaries. May yield an empty chunk (budget cannot reach the next
         # boundary); the caller then skips the request.
         if end < last_cache_position:
-            end = end // block_size * block_size
+            # #40757 (adapted to the #47782 shape): if flooring to the block
+            # grid would empty the chunk, keep the sub-block end — an empty
+            # chunk permanently starves the request when the encoder cache
+            # cannot hold two adjacent multimodal inputs (scheduler spin).
+            # Mamba state is still maintained by preprocess_mamba; only the
+            # block-boundary checkpoint is skipped for this sub-block chunk.
+            aligned = end // block_size * block_size
+            if aligned > start:
+                end = aligned
 
         next_block_boundary = (start // block_size + 1) * block_size
         tail_boundary = (
