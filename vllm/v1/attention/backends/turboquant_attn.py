@@ -26,8 +26,10 @@ import torch.nn.functional as F
 
 from vllm.config import get_current_vllm_config
 from vllm.config.cache import CacheDType
+from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization.turboquant.centroids import (
     get_centroids,
+    get_value_codebook,
 )
 from vllm.triton_utils import triton
 from vllm.utils.math_utils import round_up
@@ -57,6 +59,8 @@ from vllm.v1.worker.workspace import (
     current_workspace_manager,
     is_workspace_manager_initialized,
 )
+
+logger = init_logger(__name__)
 
 _HAS_FLASH_ATTN = is_flash_attn_varlen_func_available()
 if _HAS_FLASH_ATTN:
@@ -103,6 +107,10 @@ class TurboQuantAttentionBackend(AttentionBackend):
         "turboquant_4bit_nc",
         "turboquant_k3v4_nc",
         "turboquant_3bit_nc",
+        "turboquant_3bit_nuqv",
+        "turboquant_3bit_nuqv_sink32",
+        "turboquant_3bit_nuqv_out1",
+        "turboquant_3bit_nuqv_out1_sink32",
     ]
 
     @staticmethod
@@ -339,6 +347,17 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         self._val_data_bytes = math.ceil(head_size * cfg.effective_value_quant_bits / 8)
         self._n_centroids = cfg.n_centroids if not cfg.key_fp8 else 1
 
+        # KVQ-2: the sink side-buffer store/gather is not yet wired into the
+        # Triton kernels (pending GPU iteration). Warn so this preset does not
+        # silently behave like its no-sink base preset at runtime.
+        if cfg.sink_enabled:
+            logger.warning(
+                "TurboQuant sink retention (sink_tokens=%d) is configured but "
+                "the runtime side-buffer path is not yet active; decode falls "
+                "back to quantized values for sink positions.",
+                cfg.sink_tokens,
+            )
+
         # Detect flash-attn version (FA2/3/4) for prefill paths.
         self.fa_version = get_flash_attn_version(head_size=head_size)
 
@@ -386,6 +405,46 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             fa_version=self.fa_version,
         )
 
+    def _resolve_layer_preset(self, layer) -> None:
+        """KVQ-4: adopt this layer's per-layer preset for the compute path.
+
+        Keeps the runtime store/decode config consistent with the per-layer
+        KV-cache spec built in ``Attention.get_kv_cache_spec``. A no-op unless
+        ``VLLM_TQ_LAYER_BITS`` overrides this layer, so the default path is
+        untouched.
+        """
+        if getattr(self, "_layer_preset_resolved", False):
+            return
+        self._layer_preset_resolved = True
+        name = getattr(layer, "layer_name", None)
+        if name is None:
+            return
+        from vllm.model_executor.layers.quantization.turboquant.config import (
+            TurboQuantConfig,
+            resolve_tq_layer_preset,
+        )
+        from vllm.model_executor.models.utils import extract_layer_index
+
+        resolved = resolve_tq_layer_preset(
+            extract_layer_index(name), self.kv_cache_dtype
+        )
+        if resolved == self.kv_cache_dtype:
+            return
+        self.tq_config = TurboQuantConfig.from_cache_dtype(resolved, self.head_size)
+        cfg = self.tq_config
+        self._mse_bytes = (
+            math.ceil(self.head_size * cfg.key_mse_bits / 8)
+            if not cfg.key_fp8
+            else self.head_size
+        )
+        self._val_data_bytes = math.ceil(
+            self.head_size * cfg.effective_value_quant_bits / 8
+        )
+        self._n_centroids = cfg.n_centroids if not cfg.key_fp8 else 1
+        logger.info(
+            "TurboQuant layer %s: per-layer preset override -> %s", name, resolved
+        )
+
     def _ensure_on_device(self, layer, device):
         """One-time derivation of TQ buffers (rotation matrix, midpoints).
 
@@ -394,6 +453,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         quantizer is symmetric around zero (sign-flipping a coordinate
         maps it to the mirror centroid with identical distortion).
         """
+        self._resolve_layer_preset(layer)
         if not hasattr(layer, "_tq_cached"):
             D = self.head_size
 
@@ -412,6 +472,15 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
 
             c_sorted, _ = layer._tq_centroids.sort()
             layer._tq_midpoints = (c_sorted[:-1] + c_sorted[1:]) / 2
+
+            # KVQ-1: non-uniform value codebook (Lloyd-Max N(0,1)).
+            if self.tq_config.value_nuq:
+                v_cent, v_mid = get_value_codebook(self.tq_config.value_quant_bits)
+                layer._tq_val_centroids = v_cent.to(device=device, dtype=torch.float32)
+                layer._tq_val_midpoints = v_mid.to(device=device, dtype=torch.float32)
+            else:
+                layer._tq_val_centroids = None
+                layer._tq_val_midpoints = None
             layer._tq_cached = True
 
     def do_kv_cache_update(
@@ -613,6 +682,9 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             key_packed_size=self.tq_config.key_packed_size,
             value_quant_bits=self.tq_config.effective_value_quant_bits,
             key_fp8=self.tq_config.key_fp8,
+            value_nuq=self.tq_config.value_nuq,
+            val_midpoints=getattr(layer, "_tq_val_midpoints", None),
+            value_outliers=self.tq_config.n_value_outliers,
         )
 
     # ------------------------------------------------------------------ #
@@ -782,6 +854,9 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                         key_fp8=self.tq_config.key_fp8,
                         norm_correction=self.tq_config.norm_correction,
                         PiT=PiT,
+                        value_nuq=self.tq_config.value_nuq,
+                        val_centroids=getattr(layer, "_tq_val_centroids", None),
+                        value_outliers=self.tq_config.n_value_outliers,
                     )
                 else:
                     # Large continuation: dequant cached K/V and use
@@ -851,6 +926,9 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             kv_cache,
             block_table,
             centroids,
+            getattr(layer, "_tq_val_centroids", None)
+            if self.tq_config.value_nuq
+            else centroids,
             k_cached,
             v_cached,
             k_cached.stride(0),
@@ -875,6 +953,9 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             BLOCK_D=BLOCK_D,
             NORM_CORRECTION=1 if self.tq_config.norm_correction else 0,
             FP8_E4B15=_use_fp8_e4b15(device.index or 0),
+            VALUE_NUQ=1 if self.tq_config.value_nuq else 0,
+            N_VAL_CENTROIDS=self.tq_config.n_value_centroids,
+            N_OUTLIERS=self.tq_config.n_value_outliers,
             num_warps=4,
         )
 
@@ -990,6 +1071,9 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             key_fp8=self.tq_config.key_fp8,
             norm_correction=self.tq_config.norm_correction,
             PiT=PiT,
+            value_nuq=self.tq_config.value_nuq,
+            val_centroids=getattr(layer, "_tq_val_centroids", None),
+            value_outliers=self.tq_config.n_value_outliers,
             mid_o_buf=mid_o_buf,
             output_buf=output_buf,
             lse_buf=lse_buf,
