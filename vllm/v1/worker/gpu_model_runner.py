@@ -7427,7 +7427,6 @@ class GPUModelRunner(
                             kv_cache_spec.kv_quant_mode == KVQuantMode.NONE
                             and not isinstance(kv_cache_spec, TQFullAttentionSpec)
                         )
-                        and not isinstance(kv_cache_spec, TQFullAttentionSpec)
                         else getattr(
                             kv_cache_spec,
                             "cache_dtype_str",
