@@ -4,15 +4,25 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import math
+import os
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from vllm.config import ModelConfig
 
 logger = logging.getLogger(__name__)
+
+# KVQ-4: per-layer bit allocation. A JSON object mapping full-attention layer
+# index (string) to a TQ preset name, e.g.
+#   VLLM_TQ_LAYER_BITS='{"0":"turboquant_3bit_nc","4":"turboquant_3bit_nuqv"}'
+# Unlisted layers fall back to the model-level --kv-cache-dtype preset. An empty
+# / unset value means a uniform map (no behavior change).
+TQ_LAYER_BITS_ENV = "VLLM_TQ_LAYER_BITS"
 
 # Named TQ presets: each maps to frozen config parameters.
 # key_quant_bits: 8 = FP8 keys, 3-4 = MSE (Lloyd-Max) quantized keys.
@@ -37,6 +47,49 @@ TQ_PRESETS: dict[str, dict] = {
         "key_quant_bits": 3,
         "value_quant_bits": 3,
         "norm_correction": True,
+    },
+    # KVQ-1: non-uniform (Lloyd-Max) quantized values. Same 3-bit storage
+    # and identical slot size as turboquant_3bit_nc, but values are encoded
+    # against an analytic N(0,1) Lloyd-Max codebook (per-vector mean/std
+    # companding) instead of naive uniform min/max. Value bits dominate the
+    # quality loss, so this recovers PPL at zero extra storage.
+    "turboquant_3bit_nuqv": {
+        "key_quant_bits": 3,
+        "value_quant_bits": 3,
+        "norm_correction": True,
+        "value_nuq": True,
+    },
+    # KVQ-2: attention-sink retention. Composes KVQ-1 with fp16 retention of
+    # the first 32 token positions per sequence (K+V) in a small per-sequence
+    # side buffer, read back at full precision during decode. Sinks carry
+    # outsized attention mass; keeping them lossless is cheap (fixed 32-token
+    # cost) and stabilizes long-context quality.
+    "turboquant_3bit_nuqv_sink32": {
+        "key_quant_bits": 3,
+        "value_quant_bits": 3,
+        "norm_correction": True,
+        "value_nuq": True,
+        "sink_tokens": 32,
+    },
+    # KVQ-3: per-value outlier side-channel. The top ~1% |elements| of each
+    # value vector are stored exactly (index + fp16) in a small inline side
+    # region and scatter-gathered back during decode. Heavy-tailed value
+    # distributions lose most quality to a few large elements; keeping them
+    # exact removes those errors. Composable with sink32.
+    "turboquant_3bit_nuqv_out1": {
+        "key_quant_bits": 3,
+        "value_quant_bits": 3,
+        "norm_correction": True,
+        "value_nuq": True,
+        "value_outlier_pct": 0.01,
+    },
+    "turboquant_3bit_nuqv_out1_sink32": {
+        "key_quant_bits": 3,
+        "value_quant_bits": 3,
+        "norm_correction": True,
+        "value_nuq": True,
+        "value_outlier_pct": 0.01,
+        "sink_tokens": 32,
     },
 }
 
@@ -73,6 +126,14 @@ class TurboQuantConfig:
         turboquant_4bit_nc: 4-bit MSE keys + 4-bit values + NC, 3.8x, +2.71%
         turboquant_k3v4_nc: 3-bit MSE keys + 4-bit values + NC, ~3.5x, +10.63%
         turboquant_3bit_nc: 3-bit MSE keys + 3-bit values + NC, 4.9x, +20.59%
+        turboquant_3bit_nuqv: 3-bit MSE keys + 3-bit NON-UNIFORM (Lloyd-Max)
+            values + NC. Identical slot size to turboquant_3bit_nc; recovers
+            value-side quality (value bits dominate PPL loss).
+        turboquant_3bit_nuqv_sink32: KVQ-1 + fp16 retention of the first 32
+            token positions per sequence (K+V) in a small side buffer.
+        turboquant_3bit_nuqv_out1: KVQ-1 + top ~1% |value elements| stored
+            exact (index + fp16) inline and gathered back at decode.
+        turboquant_3bit_nuqv_out1_sink32: KVQ-1 + outliers + sink retention.
 
     Args:
         head_dim: Attention head dimension (e.g. 64, 96, 128).
@@ -90,6 +151,9 @@ class TurboQuantConfig:
     value_quant_bits: int = 4  # 3-4 = uniform quantized values
     seed: int = 42  # kept for backward compatibility; no longer used internally
     norm_correction: bool = False
+    value_nuq: bool = False  # KVQ-1: non-uniform (Lloyd-Max) value codebook
+    sink_tokens: int = 0  # KVQ-2: first N positions kept fp16 in a side buffer
+    value_outlier_pct: float = 0.0  # KVQ-3: fraction of value elements kept exact
 
     @property
     def key_fp8(self) -> bool:
@@ -125,6 +189,55 @@ class TurboQuantConfig:
         return 2**self.mse_bits
 
     @property
+    def n_value_centroids(self) -> int:
+        """Codebook size for non-uniform value quantization (2^value_bits)."""
+        return 2**self.value_quant_bits
+
+    @property
+    def n_value_outliers(self) -> int:
+        """Number of per-vector value elements kept exact (KVQ-3).
+
+        ``round(head_dim * pct)`` with a floor of 1 when outliers are enabled,
+        so a non-zero percentage always retains at least one element.
+        """
+        if self.value_outlier_pct <= 0.0:
+            return 0
+        return max(1, round(self.head_dim * self.value_outlier_pct))
+
+    @property
+    def value_outliers_enabled(self) -> bool:
+        return self.n_value_outliers > 0
+
+    @property
+    def value_outlier_bytes(self) -> int:
+        """Inline side-channel bytes: per outlier 1 index byte + 2 fp16 bytes."""
+        return self.n_value_outliers * 3
+
+    @property
+    def sink_enabled(self) -> bool:
+        """Whether attention-sink fp16 retention is active (KVQ-2)."""
+        return self.sink_tokens > 0
+
+    @property
+    def sink_kv_bytes_per_token(self) -> int:
+        """fp16 K+V bytes retained per sink token, per KV head.
+
+        Sinks keep both key and value at full fp16 precision:
+        head_dim * 2 bytes (K) + head_dim * 2 bytes (V).
+        """
+        return 2 * self.head_dim * 2
+
+    def sink_side_bytes_per_seq(self, num_kv_heads: int) -> int:
+        """Honest per-sequence side-buffer cost for sink retention (KVQ-2).
+
+        A fixed cost independent of context length: only the first
+        ``sink_tokens`` positions are retained, across all KV heads.
+        """
+        if not self.sink_enabled:
+            return 0
+        return self.sink_tokens * num_kv_heads * self.sink_kv_bytes_per_token
+
+    @property
     def key_packed_size(self) -> int:
         """Packed bytes for a single KEY vector.
 
@@ -150,10 +263,22 @@ class TurboQuantConfig:
     def value_packed_size(self) -> int:
         """Packed bytes for a single VALUE vector.
 
-        Uniform quantization: ceil(head_dim * bits / 8) + 4 bytes (scale + zero fp16).
+        Layout: [packed indices | scale(fp16) | zero(fp16) | outliers].
+        Base = ceil(head_dim * bits / 8) + 4 bytes (scale + zero fp16). When
+        the KVQ-3 outlier side-channel is enabled, appends
+        ``n_value_outliers * 3`` bytes (index + fp16 value per outlier).
         """
         data_bytes = math.ceil(self.head_dim * self.value_quant_bits / 8)
-        return data_bytes + 4  # +2 scale(fp16) +2 zero(fp16)
+        return data_bytes + 4 + self.value_outlier_bytes
+
+    @property
+    def value_outlier_offset(self) -> int:
+        """Byte offset of the outlier region within a value vector (KVQ-3).
+
+        Sits after the packed indices and the (scale, zero) fp16 pair.
+        """
+        data_bytes = math.ceil(self.head_dim * self.value_quant_bits / 8)
+        return data_bytes + 4
 
     @property
     def slot_size(self) -> int:
@@ -229,7 +354,71 @@ class TurboQuantConfig:
             key_quant_bits=preset["key_quant_bits"],
             value_quant_bits=preset["value_quant_bits"],
             norm_correction=preset["norm_correction"],
+            value_nuq=preset.get("value_nuq", False),
+            sink_tokens=preset.get("sink_tokens", 0),
+            value_outlier_pct=preset.get("value_outlier_pct", 0.0),
         )
+
+
+@lru_cache(maxsize=8)
+def _parse_tq_layer_bits(raw: str) -> tuple[tuple[int, str], ...]:
+    """Parse and validate the per-layer bit map JSON (KVQ-4).
+
+    Cached on the raw string so repeated resolution is cheap.
+
+    Args:
+        raw: JSON object string ``{"<layer_idx>": "<preset>"}`` (or empty).
+
+    Returns:
+        Tuple of ``(layer_idx, preset_name)`` pairs.
+
+    Raises:
+        ValueError: on malformed JSON, non-integer keys, or unknown presets.
+    """
+    if not raw:
+        return ()
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"{TQ_LAYER_BITS_ENV} is not valid JSON: {e}") from e
+    if not isinstance(data, dict):
+        raise ValueError(
+            f"{TQ_LAYER_BITS_ENV} must be a JSON object mapping layer index to "
+            f"preset name, got {type(data).__name__}."
+        )
+    items: list[tuple[int, str]] = []
+    for k, v in data.items():
+        try:
+            idx = int(k)
+        except (TypeError, ValueError) as e:
+            raise ValueError(
+                f"{TQ_LAYER_BITS_ENV} layer key {k!r} is not an integer."
+            ) from e
+        if v not in TQ_PRESETS:
+            valid = ", ".join(TQ_PRESETS)
+            raise ValueError(
+                f"{TQ_LAYER_BITS_ENV} maps layer {idx} to unknown preset {v!r}. "
+                f"Valid presets: {valid}"
+            )
+        items.append((idx, v))
+    return tuple(items)
+
+
+def get_tq_layer_bits_map() -> dict[int, str]:
+    """Current per-layer preset override map from the environment (KVQ-4)."""
+    raw = os.environ.get(TQ_LAYER_BITS_ENV, "").strip()
+    return dict(_parse_tq_layer_bits(raw))
+
+
+def resolve_tq_layer_preset(layer_idx: int, default_dtype: str) -> str:
+    """Resolve the effective TQ preset for a layer (KVQ-4).
+
+    Returns the per-layer override if the layer index is present in the map,
+    otherwise ``default_dtype`` (the model-level ``--kv-cache-dtype`` preset).
+    With no map set, this is always ``default_dtype`` — a uniform allocation
+    with no behavior change.
+    """
+    return get_tq_layer_bits_map().get(layer_idx, default_dtype)
 
 
 def _get_full_attention_layer_indices(model_config: ModelConfig) -> list[int]:
