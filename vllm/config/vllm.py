@@ -1161,6 +1161,28 @@ class VllmConfig:
             else:
                 self.scheduler_config.async_scheduling = True
 
+        if (
+            self.speculative_config is not None
+            and self.speculative_config.relaxed_thinking
+        ):
+            if self.scheduler_config.async_scheduling:
+                raise ValueError(
+                    "relaxed_thinking cannot be used with async scheduling "
+                    "because the scheduler may verify the next speculative "
+                    "window before the request thinking state is refreshed."
+                )
+            if self.device_config.device_type == "cpu":
+                raise ValueError("relaxed_thinking is not supported on CPU workers.")
+            if self.model_config is not None and getattr(
+                self.model_config, "skip_tokenizer_init", False
+            ):
+                raise ValueError(
+                    "relaxed_thinking cannot be used with "
+                    "skip_tokenizer_init=True because reasoning token IDs "
+                    "must be initialized."
+                )
+
+
         if self.parallel_config.disable_nccl_for_dp_synchronization is None:
             if self.scheduler_config.async_scheduling:
                 if self.parallel_config.data_parallel_size > 1 and (
@@ -1623,6 +1645,27 @@ class VllmConfig:
                     "Auto-initialization of reasoning token IDs failed. "
                     "Please check whether your reasoning parser has implemented "
                     "the `reasoning_start_str` and `reasoning_end_str`."
+                )
+
+        if (
+            self.speculative_config is not None
+            and self.speculative_config.relaxed_thinking
+        ):
+            if self.reasoning_config is None or not self.reasoning_config.enabled:
+                raise ValueError(
+                    "relaxed_thinking requires a reasoning parser or "
+                    "reasoning_config with initialized token IDs."
+                )
+            start_ids = self.reasoning_config.reasoning_start_token_ids
+            end_ids = self.reasoning_config.reasoning_end_token_ids
+            if start_ids is None or end_ids is None:
+                raise ValueError(
+                    "relaxed_thinking requires reasoning start/end token IDs."
+                )
+            if len(start_ids) != 1 or len(end_ids) != 1:
+                raise ValueError(
+                    "relaxed_thinking requires single-token reasoning "
+                    "start/end markers."
                 )
 
         # Resolve kv_offloading-derived connector name into kv_transfer_config
@@ -2325,6 +2368,8 @@ class VllmConfig:
             ):
                 unsupported.append(f"speculative method '{speculative_config.method}'")
 
+            if speculative_config.relaxed_thinking:
+                unsupported.append("relaxed thinking speculative decoding")
             # V2 EagleSpeculator does not support parallel_drafting (for P-Eagle).
             # DFlash and DSpark use parallel drafting natively in V2 via their
             # own speculators.
