@@ -770,6 +770,10 @@ class GPUModelRunner(
             cp_kv_cache_interleave_size=self.parallel_config.cp_kv_cache_interleave_size,
             reasoning_config=self.vllm_config.reasoning_config,
             use_replayssm=self.cache_config.use_replayssm,
+            relaxed_thinking=bool(
+                self.speculative_config is not None
+                and self.speculative_config.relaxed_thinking
+            ),
         )
 
         # Separate cuda stream for overlapping transfer of sampled token ids from
@@ -7373,6 +7377,10 @@ class GPUModelRunner(
                 cp_kv_cache_interleave_size=self.parallel_config.cp_kv_cache_interleave_size,
                 reasoning_config=self.vllm_config.reasoning_config,
                 use_replayssm=self.cache_config.use_replayssm,
+                relaxed_thinking=bool(
+                    self.speculative_config is not None
+                    and self.speculative_config.relaxed_thinking
+                ),
                 slot_mapping_modes=slot_mapping_modes,
             )
 
