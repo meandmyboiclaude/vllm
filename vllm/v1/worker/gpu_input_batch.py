@@ -107,6 +107,7 @@ class InputBatch:
         cp_kv_cache_interleave_size: int = 1,
         reasoning_config: ReasoningConfig | None = None,
         use_replayssm: bool = False,
+        relaxed_thinking: bool = False,
         slot_mapping_modes: list[SlotMappingMode] | None = None,
     ):
         self.thinking_budget_state_holder = maybe_create_thinking_budget_state_holder(
@@ -115,6 +116,7 @@ class InputBatch:
             num_spec_tokens,
             device,
             PIN_MEMORY,
+            relaxed_thinking=relaxed_thinking,
         )
         self.thinking_token_budget_reqs: set[str] = set()
         self.is_pooling_model = is_pooling_model
