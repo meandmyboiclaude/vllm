@@ -23,9 +23,6 @@ import torch
 from vllm.logger import init_logger
 from vllm.model_executor.warmup.qwen_triton_warmup import (
     _synchronize_device,
-    _warm_zero_kv_blocks_kernel,
-    _warm_zero_kv_blocks_with_runner_zeroer,
-    _zero_kv_warmup_config,
 )
 
 if TYPE_CHECKING:
@@ -141,19 +138,6 @@ def hybrid_mamba_triton_warmup(
 
     device = getattr(runner, "device", torch.device("cuda"))
     logger.info("Warming up hybrid Mamba2 Triton kernels.")
-
-    # Zero-KV-blocks kernel: hybrid models always need KV block zeroing
-    # (KVCacheConfig.needs_kv_cache_zeroing is True when mamba layers exist).
-    zero_config = _zero_kv_warmup_config(runner)
-    warmed_zeroer = _warm_zero_kv_blocks_with_runner_zeroer(runner)
-    if zero_config is not None:
-        _warm_zero_kv_blocks_kernel(device, zero_config)
-    elif not warmed_zeroer:
-        logger.info("Skipping hybrid zero-kv warmup: no KVBlockZeroer metadata.")
-
-    # Slot-mapping kernel: covers block_table_stride == 1, which hybrid
-    # models hit (large mamba-aligned attention block size -> one block per
-    # request) and the generic block-table warmup does not reach.
 
     # Prefill causal-conv1d kernel: warm one layer per distinct JIT key.
     seen_keys: set[tuple] = set()
