@@ -23,7 +23,6 @@ import torch
 from vllm.logger import init_logger
 from vllm.model_executor.warmup.qwen_triton_warmup import (
     _synchronize_device,
-    _warm_compute_slot_mapping_kernel,
     _warm_zero_kv_blocks_kernel,
     _warm_zero_kv_blocks_with_runner_zeroer,
     _zero_kv_warmup_config,
@@ -155,7 +154,6 @@ def hybrid_mamba_triton_warmup(
     # Slot-mapping kernel: covers block_table_stride == 1, which hybrid
     # models hit (large mamba-aligned attention block size -> one block per
     # request) and the generic block-table warmup does not reach.
-    _warm_compute_slot_mapping_kernel(device)
 
     # Prefill causal-conv1d kernel: warm one layer per distinct JIT key.
     seen_keys: set[tuple] = set()
