@@ -15,6 +15,7 @@ import torch
 
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+from vllm.v1.attention.ops.tq_shared_scratch import shared_scratch
 from vllm.v1.attention.ops.triton_decode_attention import (
     _fwd_kernel_stage2,
 )
@@ -600,13 +601,19 @@ def triton_turboquant_decode_attention(
     value_nuq_flag = 1 if value_nuq else 0
     n_outliers = int(value_outliers)
 
+    _shared = shared_scratch(device.index or 0)
+    if mid_o_buf is None:
+        mid_o_buf = getattr(_shared, "_tq_mid_o_buf", None)
     if (
         mid_o_buf is not None
         and mid_o_buf.shape[0] >= B
         and mid_o_buf.shape[2] >= NUM_KV_SPLITS
+        and mid_o_buf.shape[1] >= Hq
     ):
         mid_o = mid_o_buf[:B, :Hq, :NUM_KV_SPLITS, :]
     else:
+        # BUG-199: store on the per-device shared cache, NEVER on buf_holder —
+        # per-layer holders retained n_layers sets and nothing read them back.
         mid_o = torch.empty(
             B,
             Hq,
@@ -615,8 +622,7 @@ def triton_turboquant_decode_attention(
             dtype=torch.float32,
             device=device,
         )
-        if buf_holder is not None:
-            buf_holder._tq_mid_o_buf = mid_o
+        _shared._tq_mid_o_buf = mid_o
 
     # Stage 1: split-KV tiled attention scoring + value accumulation
     fp8_e4b15 = _use_fp8_e4b15(device.index or 0)
@@ -672,15 +678,22 @@ def triton_turboquant_decode_attention(
     ):
         output = output_buf[:B, :Hq, :D]
     else:
-        output = torch.empty(B, Hq, D, dtype=out_dtype, device=device)
-        if buf_holder is not None:
-            buf_holder._tq_output_buf = output
+        # BUG-199: shared per-device cache, dtype-checked (out_dtype can vary).
+        _c = getattr(_shared, "_tq_output_buf", None)
+        if _c is not None and _c.shape[0] >= B and _c.shape[1] >= Hq and _c.dtype == out_dtype:
+            output = _c[:B, :Hq]
+        else:
+            output = torch.empty(B, Hq, D, dtype=out_dtype, device=device)
+            _shared._tq_output_buf = output
     if lse_buf is not None and lse_buf.shape[0] >= B:
         lse = lse_buf[:B, :Hq]
     else:
-        lse = torch.empty(B, Hq, dtype=torch.float32, device=device)
-        if buf_holder is not None:
-            buf_holder._tq_lse_buf = lse
+        _c = getattr(_shared, "_tq_lse_buf", None)
+        if _c is not None and _c.shape[0] >= B and _c.shape[1] >= Hq:
+            lse = _c[:B, :Hq]
+        else:
+            lse = torch.empty(B, Hq, dtype=torch.float32, device=device)
+            _shared._tq_lse_buf = lse
 
     grid2 = (B, Hq)
     _fwd_kernel_stage2[grid2](
