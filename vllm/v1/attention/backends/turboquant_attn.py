@@ -18,6 +18,7 @@ Per-head per-position slot layout:
 
 import contextlib
 import functools
+from types import SimpleNamespace
 import math
 from dataclasses import dataclass, replace
 from typing import Any, ClassVar
@@ -150,6 +151,14 @@ def _get_decode_scratch(
         )
         _DECODE_SCRATCH[key] = bufs
     return bufs
+
+
+# Shared fallback decode-scratch holder (one set across ALL layers — they run
+# sequentially). Per-layer retention via buf_holder=layer both never reuses
+# (nothing reads the per-layer refs back) and retains n_layers x 3 fp32
+# buffers at high-water once neither the cudagraph fixed buffer nor the
+# workspace manager is available (the PIECEWISE + TQ-spec-decode boot shape).
+_TQ_SHARED_DECODE_SCRATCH = SimpleNamespace()
 
 
 def reset_tq_decode_scratch() -> None:
@@ -1331,7 +1340,9 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         D = self.head_size
         S = self.max_num_kv_splits
         Hq = self.num_heads
-        mid_o_buf = output_buf = lse_buf = None
+        mid_o_buf = getattr(_TQ_SHARED_DECODE_SCRATCH, "_tq_mid_o_buf", None)
+        output_buf = getattr(_TQ_SHARED_DECODE_SCRATCH, "_tq_output_buf", None)
+        lse_buf = getattr(_TQ_SHARED_DECODE_SCRATCH, "_tq_lse_buf", None)
         max_batch = self.max_decode_cudagraph_batch
         if max_batch is not None and max_batch >= B:
             # CUDA graph path: a fixed buffer sized for the largest captured
@@ -1450,7 +1461,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             mid_o_buf=mid_o_buf,
             output_buf=output_buf,
             lse_buf=lse_buf,
-            buf_holder=layer,
+            buf_holder=_TQ_SHARED_DECODE_SCRATCH,
             max_num_kv_splits=self.max_num_kv_splits,
         )
         return result
