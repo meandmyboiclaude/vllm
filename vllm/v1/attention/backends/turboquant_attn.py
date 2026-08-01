@@ -436,11 +436,22 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
 
         # Largest CUDA-graph-captured decode batch. The decode scratch is sized
         # to this once and reused, so the addresses baked into FULL cudagraphs
-        # never move. Resolves to 0 when cudagraphs are disabled (enforce_eager),
-        # so `max_batch >= B` is never true and the eager path falls back to the
-        # WorkspaceManager.
+        # never move. Resolves to 0/None when cudagraphs are disabled
+        # (enforce_eager), so `max_batch >= B` is never true and the eager path
+        # falls back to the WorkspaceManager.
+        # max_cudagraph_capture_size defaults to max_num_seqs * query_len * 2,
+        # but decode graphs are only captured for uniform-decode batches, which
+        # the dispatcher caps at max_num_seqs * query_len (see
+        # CudagraphDispatcher.initialize_cudagraph_keys). Rows above that bound
+        # can never reach _decode_attention, so sizing to it keeps every
+        # capturable batch on the fixed buffer without reserving the rest.
+        max_capture = vllm_config.compilation_config.max_cudagraph_capture_size
+        max_uniform_decode = (
+            vllm_config.scheduler_config.max_num_seqs
+            * (1 + vllm_config.num_speculative_tokens)
+        )
         self.max_decode_cudagraph_batch = (
-            vllm_config.compilation_config.max_cudagraph_capture_size
+            min(max_capture, max_uniform_decode) if max_capture else max_capture
         )
 
     def _flash_attn_varlen(
