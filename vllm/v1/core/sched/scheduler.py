@@ -255,7 +255,7 @@ class Scheduler(SchedulerInterface):
         speculative_config = vllm_config.speculative_config
         self.use_eagle = False
         self.num_spec_tokens = vllm_config.num_speculative_tokens
-        self.num_lookahead_tokens = 0
+        self.num_lookahead_tokens = vllm_config.num_lookahead_tokens
         self.dynamic_sd_lookup: DynamicSDLookup | None = None
         self.dynamic_sd_ctx_agg: str = "mean"
         self.report_unusable_drafts = False
@@ -269,21 +269,7 @@ class Scheduler(SchedulerInterface):
                     vllm_max_batch_size=self.scheduler_config.max_num_seqs,
                     vllm_num_speculative_tokens=self.num_spec_tokens,
                 )
-            if speculative_config.use_eagle():
-                self.use_eagle = True
-                self.num_lookahead_tokens = self.num_spec_tokens
-            if speculative_config.uses_draft_model():
-                self.num_lookahead_tokens = self.num_spec_tokens
-            if speculative_config.use_dflash():
-                # DFlash requires an extra lookahead slot since it uses in-fill-style
-                # decoding instead of standard next-token sampling, so it has a query
-                # for the last sampled token plus queries for each draft token.
-                self.num_lookahead_tokens = self.num_spec_tokens + 1
-            if speculative_config.use_dspark():
-                # DSpark drafts a block of num_spec_tokens query tokens in which the
-                # anchor itself is the first prediction position (no separate bonus
-                # query), so it needs exactly num_spec_tokens lookahead slots.
-                self.num_lookahead_tokens = self.num_spec_tokens
+            self.use_eagle = speculative_config.use_eagle()
             # Requests whose drafts can never be consumed (non-final prefill
             # chunks, guaranteed-final decode steps) are reported via
             # no_draft_req_ids so the V2 drafter can skip proposing for them.
