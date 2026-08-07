@@ -432,7 +432,15 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 )
 
             assert num_accepted_tokens is not None
-            num_accepted_tokens = num_accepted_tokens[spec_sequence_masks_cpu]
+            # Stale/discarded spec rows can carry num_accepted_tokens == 0 (or a
+            # value above the draft window) after a batch-composition change.
+            # Both are out of range for the spec-decode state-index loads below
+            # and for the cudagraph-padded path, so clamp at this single choke
+            # point: a live row always accepts at least the bonus token and can
+            # never legitimately exceed num_spec + 1. See vllm issue #40756.
+            num_accepted_tokens = num_accepted_tokens[spec_sequence_masks_cpu].clamp_(
+                1, self.num_spec + 1
+            )
 
         chunk_indices: torch.Tensor | None = None
         chunk_offsets: torch.Tensor | None = None
