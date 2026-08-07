@@ -2,8 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import gc
+from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import numpy as np
 import pytest
@@ -19,6 +20,7 @@ from vllm.config import (
     VllmConfig,
     set_current_vllm_config,
 )
+from vllm.config.compilation import CUDAGraphMode
 from vllm.config.reasoning import ReasoningConfig
 from vllm.distributed.parallel_state import (
     init_distributed_environment,
@@ -1752,3 +1754,200 @@ def test_mamba_cache_raises_when_max_num_seqs_exceeds_blocks():
 
         with pytest.raises(ValueError, match="max_num_seqs"):
             runner.initialize_kv_cache(kv_cache_config)
+
+
+class TestInitFp8KvScalesHybridModels:
+    """Verify init_fp8_kv_scales handles heterogeneous kv_caches entries.
+
+    Hybrid models (Mamba, DeltaNet) store per-layer state as a list of tensors
+    rather than a single tensor. init_fp8_kv_scales must iterate both forms.
+    """
+
+    @staticmethod
+    def _make_runner_stub(kv_caches):
+        runner = Mock(spec=GPUModelRunner)
+        runner.cache_config = SimpleNamespace(cache_dtype="fp8_e4m3")
+        runner.kv_caches = kv_caches
+        runner.compilation_config = SimpleNamespace(static_forward_context={})
+        runner.init_fp8_kv_scales = GPUModelRunner.init_fp8_kv_scales.__get__(
+            runner, GPUModelRunner
+        )
+        return runner
+
+    def test_zeroes_both_tensor_and_list_entries(self):
+        single_tensor = torch.ones(4, 8)
+        list_tensors = [torch.ones(2, 4), torch.ones(3, 6)]
+
+        runner = self._make_runner_stub([single_tensor, list_tensors])
+        runner.init_fp8_kv_scales()
+
+        assert (single_tensor == 0).all()
+        assert all((t == 0).all() for t in list_tensors)
+
+    def test_skips_none_entries(self):
+        tensor = torch.ones(4, 8)
+        runner = self._make_runner_stub([None, tensor, None])
+        runner.init_fp8_kv_scales()
+
+        assert (tensor == 0).all()
+
+    def test_noop_when_kv_cache_not_quantized(self):
+        tensor = torch.ones(4, 8)
+        runner = self._make_runner_stub([tensor])
+        runner.cache_config.cache_dtype = "auto"
+        runner.init_fp8_kv_scales()
+
+        assert (tensor == 1).all()
+
+    def test_mixed_none_tensor_and_list(self):
+        t1 = torch.ones(2, 2)
+        t2 = torch.ones(3, 3)
+        list_entry = [torch.ones(1, 1), torch.ones(1, 1)]
+
+        runner = self._make_runner_stub([None, t1, list_entry, None, t2])
+        runner.init_fp8_kv_scales()
+
+        assert (t1 == 0).all()
+        assert (t2 == 0).all()
+        assert all((t == 0).all() for t in list_entry)
+
+
+def test_profile_cudagraph_memory_flushes_before_retained_measurements():
+    """Graph estimates use post-flush pool residency, not warmup transients."""
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.cudagraph_dispatcher = SimpleNamespace(
+        get_capture_descs=lambda: [
+            (
+                CUDAGraphMode.FULL,
+                [SimpleNamespace(num_tokens=8, uniform=True, num_active_loras=0)] * 2,
+            )
+        ],
+        cudagraph_keys={},
+        keys_initialized=True,
+    )
+    runner.vllm_config = SimpleNamespace()
+    runner.compilation_config = SimpleNamespace(cudagraph_num_of_warmups=1)
+    runner.device = "cpu"
+    runner.max_model_len = 128
+    runner.max_num_tokens = 32
+    runner.lora_config = None
+    events: list[str] = []
+    runner._dummy_run = Mock(
+        side_effect=lambda *_args, **_kwargs: events.append("warmup")
+    )
+    encoder = Mock(token_budgets=[8])
+    encoder.get_num_graphs_to_capture.return_value = 1
+    free_memory = iter(enumerate((1000, 900, 900, 850, 850, 800)))
+
+    accelerator = Mock()
+    accelerator.synchronize.side_effect = lambda: events.append("sync")
+    accelerator.empty_cache.side_effect = lambda: events.append("flush")
+
+    def get_memory_info():
+        index, free = next(free_memory)
+        events.append(f"info:{index}")
+        return free, 2000
+
+    @contextmanager
+    def fake_graph_capture(**_kwargs):
+        events.append("enter")
+        yield
+        events.append("exit")
+
+    accelerator.get_memory_info.side_effect = get_memory_info
+    fake_platform = SimpleNamespace(
+        graph_pool_handle=lambda: object(),
+        is_rocm=lambda: False,
+    )
+
+    with (
+        patch.object(
+            GPUModelRunner,
+            "_init_minimal_kv_cache_for_profiling",
+            Mock(),
+        ),
+        patch.object(
+            GPUModelRunner,
+            "_create_encoder_cudagraph_manager",
+            Mock(return_value=encoder),
+        ),
+        patch.object(GPUModelRunner, "_freeze_gc", return_value=nullcontext()),
+        patch.object(GPUModelRunner, "_warmup_and_capture", Mock()),
+        patch.object(GPUModelRunner, "_cleanup_profiling_kv_cache", Mock()),
+        patch.object(GPUModelRunner, "maybe_remove_all_loras", Mock()),
+        patch.object(gpu_model_runner_module, "graph_capture", fake_graph_capture),
+        patch.object(gpu_model_runner_module, "current_platform", fake_platform),
+        patch.object(gpu_model_runner_module, "set_cudagraph_capturing_enabled"),
+        patch.object(gpu_model_runner_module, "CUDAGraphWrapper") as decoder_wrapper,
+        patch.object(
+            gpu_model_runner_module, "BreakableCUDAGraphWrapper"
+        ) as breakable_wrapper,
+        patch.object(gpu_model_runner_module.torch, "accelerator", accelerator),
+    ):
+        decoder_wrapper._all_instances = []
+        breakable_wrapper._all_instances = []
+        decoder_wrapper.clear_all_graphs = Mock()
+        breakable_wrapper.clear_all_graphs = Mock()
+        total = GPUModelRunner.profile_cudagraph_memory(runner)
+
+    assert total > 0
+    assert "warmup" in events[: events.index("info:0")]
+    assert events[events.index("info:0") - 3 : events.index("info:0")] == [
+        "exit",
+        "sync",
+        "flush",
+    ]
+    for index in (1, 3, 5):
+        position = events.index(f"info:{index}")
+        assert events[position - 3 : position] == ["exit", "sync", "flush"]
+
+
+def test_capture_model_measures_runtime_pool_after_flush():
+    """The runtime graph size excludes allocator blocks released after capture."""
+    runner = GPUModelRunner.__new__(GPUModelRunner)
+    runner.compilation_config = SimpleNamespace(cudagraph_mode=CUDAGraphMode.FULL)
+    runner.model_config = SimpleNamespace(enforce_eager=False)
+    runner.vllm_config = SimpleNamespace(
+        profiler_config=SimpleNamespace(capture_torch_profiler=False)
+    )
+    runner.device = "cpu"
+    runner.encoder_cudagraph_manager = None
+    runner.cudagraph_dispatcher = SimpleNamespace(
+        get_capture_descs=lambda: [],
+    )
+    events: list[str] = []
+    free_memory = iter((1000, 800))
+    accelerator = Mock()
+    accelerator.synchronize.side_effect = lambda: events.append("sync")
+    accelerator.empty_cache.side_effect = lambda: events.append("flush")
+
+    def get_runtime_memory_info():
+        events.append("info")
+        return next(free_memory), 2000
+
+    accelerator.get_memory_info.side_effect = get_runtime_memory_info
+
+    @contextmanager
+    def fake_graph_capture(**_kwargs):
+        events.append("enter")
+        yield
+        events.append("exit")
+
+    with (
+        patch.object(GPUModelRunner, "_maybe_init_encoder_cudagraph_manager"),
+        patch.object(GPUModelRunner, "_freeze_gc", return_value=nullcontext()),
+        patch.object(GPUModelRunner, "_capture_cudagraphs", Mock()),
+        patch.object(gpu_model_runner_module, "graph_capture", fake_graph_capture),
+        patch.object(gpu_model_runner_module, "set_cudagraph_capturing_enabled"),
+        patch.object(gpu_model_runner_module, "lock_workspace"),
+        patch(
+            "vllm.distributed.parallel_state.get_world_group",
+            return_value=SimpleNamespace(local_rank=1),
+        ),
+        patch.object(gpu_model_runner_module.torch, "accelerator", accelerator),
+    ):
+        size = GPUModelRunner.capture_model(runner)
+
+    assert size == 200
+    assert events[-3:] == ["sync", "flush", "info"]
+    assert events.index("exit") < len(events) - 3
