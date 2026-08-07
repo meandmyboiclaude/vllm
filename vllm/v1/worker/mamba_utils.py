@@ -1141,6 +1141,29 @@ def cleanup_mamba_state_idx(
         mamba_state_idx.pop(req_id, None)
 
 
+def has_valid_mamba_copy_indices(
+    req_state: CachedRequestState,
+    mamba_group_ids: list[int],
+    src_block_idx: int,
+    dest_block_idx: int,
+    num_accepted_tokens: int,
+    has_temporal_state: bool,
+) -> bool:
+    """Return whether all logical Mamba copy indices exist in block tables."""
+    if src_block_idx < 0 or dest_block_idx < 0:
+        return False
+
+    max_src_block_idx = src_block_idx
+    if has_temporal_state:
+        max_src_block_idx += num_accepted_tokens - 1
+
+    for mamba_group_id in mamba_group_ids:
+        block_ids = req_state.block_ids[mamba_group_id]
+        if dest_block_idx >= len(block_ids) or max_src_block_idx >= len(block_ids):
+            return False
+    return True
+
+
 class _FusedPrecopy(NamedTuple):
     """Resolved fused align pre-copy resources (all non-None once resolved)."""
 
@@ -1195,6 +1218,7 @@ def preprocess_mamba(
     assert cache_config.enable_prefix_caching
     block_size = mamba_spec.block_size
     cleanup_mamba_state_idx(scheduler_output, mamba_state_idx)
+    has_temporal_state = get_temporal_copy_spec in mamba_state_copy_funcs
 
     copy_bufs.offset = 0
     num_reqs = len(input_batch.req_ids)
@@ -1244,7 +1268,39 @@ def preprocess_mamba(
             fused.state_idx.np[i] = curr_state_idx
 
         if prev_state_idx != -1 and prev_state_idx != curr_state_idx:
-            accept_token_bias = int(input_batch.num_accepted_tokens_cpu[i]) - 1
+            num_accepted_tokens = int(input_batch.num_accepted_tokens_cpu[i])
+            if not has_valid_mamba_copy_indices(
+                req_state,
+                mamba_group_ids,
+                prev_state_idx,
+                curr_state_idx,
+                num_accepted_tokens,
+                has_temporal_state,
+            ):
+                # The accepted-token bias can outlive the block table it was
+                # derived from (DFlash + mamba_cache_mode=align + prefix
+                # caching): get_temporal_copy_spec would index
+                # block_ids[src + accepted - 1] past the end and raise before
+                # any copy metadata is staged. Fall back to a neutral copy
+                # from the last known running-state block. See issue #41884.
+                num_accepted_tokens = 1
+                input_batch.num_accepted_tokens_cpu[i] = 1
+
+            if not has_valid_mamba_copy_indices(
+                req_state,
+                mamba_group_ids,
+                prev_state_idx,
+                curr_state_idx,
+                num_accepted_tokens,
+                has_temporal_state,
+            ):
+                # Even the neutral source is gone; skip the copy for this
+                # request rather than indexing out of bounds. src_col stays -1
+                # on the fused path, which the pre-copy kernel treats as
+                # "no copy".
+                continue
+
+            accept_token_bias = num_accepted_tokens - 1
             if fused is not None:
                 assert accept_token_bias >= 0
                 fused.src_col.np[i] = prev_state_idx
