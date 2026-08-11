@@ -26,6 +26,9 @@ from vllm.model_executor.layers.linear import (
 )
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
+from vllm.model_executor.layers.quantization.utils.quant_utils import (
+    get_and_maybe_dequant_weights,
+)
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
@@ -444,8 +447,19 @@ class DFlashQwen3Model(nn.Module):
     ) -> None:
         self._hidden_norm_weight = self.hidden_norm.weight.data
 
-        # KV projection weights: [num_layers * 2 * kv_size, hidden_size]
-        kv_weights = [a.qkv_proj.weight[a.q_size :] for a in layers_attn]
+        # KV projection weights: [num_layers * 2 * kv_size, hidden_size].
+        # Dequantize quantized qkv weights to the activation dtype (the
+        # canonical helper returns the weights in [out, in] layout) so the
+        # fused ``F.linear`` in ``_project_context_kv`` works for quantized
+        # drafters.  The buffers are built lazily on first use (after
+        # ``process_weights_after_loading``), so quantized weights are in
+        # their final layout and every quant scheme is supported.
+        kv_weights = [
+            get_and_maybe_dequant_weights(
+                a.qkv_proj, out_dtype=torch.bfloat16
+            )[a.q_size:]
+            for a in layers_attn
+        ]
         self._fused_kv_weight = torch.cat(kv_weights, dim=0)
         if has_bias:
             kv_biases = [a.qkv_proj.bias[a.q_size :] for a in layers_attn]
@@ -564,10 +578,9 @@ class DFlashQwen3Model(nn.Module):
         the computation runs, and no K/V is written to cache.
         """
         if not hasattr(self, "_num_attn_layers"):
-            logger.warning_once(
-                "DFlash buffer initialization was skipped. If dummy weights are not "
-                "in use, this may indicate an error in weight loading."
-            )
+            # Build the fused-KV buffers on first use.  This runs after the
+            # loader has called ``process_weights_after_loading``, so quantized
+            # weights are in their final layout.
             self._build_fused_kv_buffers()
 
         num_ctx = context_states.shape[0]
@@ -813,7 +826,12 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
             skip_substrs=skip_substrs,
         )
         loader.load_weights(model_weights.items())
-        self.model._build_fused_kv_buffers()
+        # NOTE: fused-KV buffers are intentionally NOT built here.  They are
+        # built lazily on first use in ``precompute_and_store_context_kv``,
+        # after the loader has run ``process_weights_after_loading`` on every
+        # layer, so that ``get_and_maybe_dequant_weights`` sees quantized
+        # weights in their final layout (this is required for the fused-KV
+        # path to support quantized drafters).
 
     def _read_mask_embedding(self) -> torch.Tensor | None:
         """Checks for an override mask embedding in `mask_embedding.pt` and returns it.
