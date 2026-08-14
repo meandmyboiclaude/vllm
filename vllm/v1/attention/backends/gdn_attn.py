@@ -22,6 +22,7 @@ from vllm.v1.attention.backends.utils import (
     split_decodes_and_prefills,
 )
 from vllm.v1.kv_cache_interface import MambaSpec
+from vllm.v1.worker.gpu.attn_utils import compute_spec_metadata
 
 
 class GDNAttentionBackend(AttentionBackend):
@@ -251,6 +252,19 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         num_accepted_tokens: torch.Tensor | None = None,
         num_decode_draft_tokens_cpu: torch.Tensor | None = None,
         fast_build: bool = False,
+        spec_sequence_masks: torch.Tensor | None = None,
+        spec_sequence_masks_cpu: torch.Tensor | None = None,
+        num_spec_decodes: int = 0,
+        num_decodes: int = 0,
+        num_prefills: int = 0,
+        num_decode_tokens: int = 0,
+        num_prefill_tokens: int = 0,
+        num_spec_decode_tokens: int = 0,
+        spec_token_indx: torch.Tensor | None = None,
+        non_spec_token_indx: torch.Tensor | None = None,
+        spec_query_start_loc: torch.Tensor | None = None,
+        non_spec_query_start_loc: torch.Tensor | None = None,
+        non_spec_query_start_loc_cpu: torch.Tensor | None = None,
     ) -> GDNAttentionMetadata:
         m = common_attn_metadata
 
@@ -264,54 +278,6 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             self.vllm_config.cache_config.mamba_cache_mode,
         )
 
-        spec_sequence_masks_cpu: torch.Tensor | None = None
-        if self.use_cache_spec_kernel and num_accepted_tokens is not None:
-            # ReplaySSM spec: every post-prefill row must run through the spec
-            # kernel (a draft-less row is a T=1 window). The baseline decode /
-            # prefill paths read the checkpoint page, which lags the committed
-            # ring history, so routing any decode row there corrupts the state.
-            # num_decode_draft_tokens_cpu cannot drive this mask: it is stale
-            # on draft-less steps and -1 for decode rows whose drafts were
-            # dropped.
-            is_prefilling_cpu = m.is_prefilling
-            assert is_prefilling_cpu is not None
-            query_lens_cpu_all = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
-            spec_sequence_masks_cpu = (
-                ~is_prefilling_cpu[: query_lens_cpu_all.shape[0]]
-            ) & (query_lens_cpu_all > 0)
-            num_spec_decodes = int(spec_sequence_masks_cpu.sum().item())
-            if num_spec_decodes == 0:
-                spec_sequence_masks = None
-                spec_sequence_masks_cpu = None
-            else:
-                assert (
-                    int(query_lens_cpu_all[spec_sequence_masks_cpu].max().item())
-                    <= self.num_spec + 1
-                ), "ReplaySSM-spec decode row wider than the spec window"
-                spec_sequence_masks = async_tensor_h2d(
-                    spec_sequence_masks_cpu, device=query_start_loc.device
-                )
-        elif (
-            not self.use_spec_decode
-            or num_decode_draft_tokens_cpu is None
-            or num_decode_draft_tokens_cpu[num_decode_draft_tokens_cpu >= 0]
-            .sum()
-            .item()
-            == 0
-        ):
-            spec_sequence_masks = None
-            num_spec_decodes = 0
-        else:
-            spec_sequence_masks_cpu = num_decode_draft_tokens_cpu >= 0
-            num_spec_decodes = spec_sequence_masks_cpu.sum().item()
-            if num_spec_decodes == 0:
-                spec_sequence_masks = None
-                spec_sequence_masks_cpu = None
-            else:
-                spec_sequence_masks = async_tensor_h2d(
-                    spec_sequence_masks_cpu, device=query_start_loc.device
-                )
-
         if spec_sequence_masks is None:
             # ReplaySSM routes single-token prefill-as-decode rows to prefill.
             num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
@@ -321,132 +287,24 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                     treat_short_extends_as_decodes=not self.use_cached_kernel,
                 )
             )
+            num_spec_decodes = 0
             num_spec_decode_tokens = 0
-            spec_token_indx = None
-            non_spec_token_indx = None
-            spec_state_indices_tensor = None
-            non_spec_state_indices_tensor = block_table_tensor[:, 0]
-            spec_query_start_loc = None
             non_spec_query_start_loc = query_start_loc
             non_spec_query_start_loc_cpu = query_start_loc_cpu
+            spec_state_indices_tensor = None
+            non_spec_state_indices_tensor = block_table_tensor[:, 0]
             num_accepted_tokens = None
         else:
-            query_lens = query_start_loc[1:] - query_start_loc[:-1]
             assert spec_sequence_masks_cpu is not None
-            query_lens_cpu = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
-
-            # Use CPU tensors to avoid CPU-GPU sync
-            non_spec_query_lens_cpu = query_lens_cpu[~spec_sequence_masks_cpu]
-            num_decodes = (non_spec_query_lens_cpu == 1).sum().item()
-            # Exclude zero-length padded sequences from prefill count.
-            num_zero_len = (non_spec_query_lens_cpu == 0).sum().item()
-            num_prefills = non_spec_query_lens_cpu.size(0) - num_decodes - num_zero_len
-            num_decode_tokens = num_decodes
-            num_prefill_tokens = (
-                non_spec_query_lens_cpu.sum().item() - num_decode_tokens
-            )
-            num_spec_decode_tokens = (
-                query_lens_cpu.sum().item() - num_prefill_tokens - num_decode_tokens
-            )
-
-            # num_decodes and num_spec_decodes are mutually exclusive.
-            # Reclassify non-spec decodes as prefills when spec decodes
-            # exist — the prefill kernel handles 1-token sequences with
-            # initial state correctly, producing identical results.
-            if num_decodes > 0 and num_spec_decodes > 0:
-                num_prefills += num_decodes
-                num_prefill_tokens += num_decode_tokens
-                num_decodes = 0
-                num_decode_tokens = 0
-
+            spec_state_indices_tensor = block_table_tensor[
+                spec_sequence_masks_cpu, : self.num_spec + 1
+            ]
             if num_prefills == 0 and num_decodes == 0:
-                spec_token_size = min(
-                    num_spec_decodes * (self.num_spec + 1),
-                    query_start_loc_cpu[-1].item(),
-                )
-                spec_token_indx = torch.arange(
-                    spec_token_size,
-                    dtype=torch.int32,
-                    device=query_start_loc.device,
-                )
-                non_spec_token_indx = torch.empty(
-                    0, dtype=torch.int32, device=query_start_loc.device
-                )
-                # Filter by spec_sequence_masks to exclude padded sequences
-                spec_state_indices_tensor = block_table_tensor[
-                    spec_sequence_masks_cpu, : self.num_spec + 1
-                ]
                 non_spec_state_indices_tensor = None
-                # Padded sequences are always at the back, so the first
-                # num_spec_decodes + 1 entries of query_start_loc already
-                # contain the correct cumulative token counts.
-                spec_query_start_loc = query_start_loc[: num_spec_decodes + 1]
-                non_spec_query_start_loc = None
-                non_spec_query_start_loc_cpu = None
             else:
-                spec_token_masks = torch.repeat_interleave(
-                    spec_sequence_masks,
-                    query_lens,
-                    output_size=query_start_loc_cpu[-1].item(),
-                )
-                index = torch.argsort(spec_token_masks, stable=True)
-                num_non_spec_tokens = num_prefill_tokens + num_decode_tokens
-                non_spec_token_indx = index[:num_non_spec_tokens]
-                spec_token_indx = index[num_non_spec_tokens:]
-
-                spec_state_indices_tensor = block_table_tensor[
-                    spec_sequence_masks_cpu, : self.num_spec + 1
-                ]
                 non_spec_state_indices_tensor = block_table_tensor[
                     ~spec_sequence_masks_cpu, 0
                 ]
-
-                spec_query_start_loc = torch.zeros(
-                    num_spec_decodes + 1,
-                    dtype=torch.int32,
-                    device=query_start_loc.device,
-                )
-                torch.cumsum(
-                    query_lens[spec_sequence_masks_cpu],
-                    dim=0,
-                    out=spec_query_start_loc[1:],
-                )
-                non_spec_query_start_loc = torch.zeros(
-                    query_lens.size(0) - num_spec_decodes + 1,
-                    dtype=torch.int32,
-                    device=query_start_loc.device,
-                )
-                torch.cumsum(
-                    query_lens[~spec_sequence_masks_cpu],
-                    dim=0,
-                    out=non_spec_query_start_loc[1:],
-                )
-                non_spec_query_start_loc_cpu = torch.zeros(
-                    query_lens_cpu.size(0) - num_spec_decodes + 1,
-                    dtype=torch.int32,
-                )
-                torch.cumsum(
-                    query_lens_cpu[~spec_sequence_masks_cpu],
-                    dim=0,
-                    out=non_spec_query_start_loc_cpu[1:],
-                )
-
-            assert num_accepted_tokens is not None
-            num_accepted_tokens = num_accepted_tokens[spec_sequence_masks_cpu]
-            # A row can report 0 accepted tokens when its sampled tokens were
-            # discarded (stale async-scheduling step) while its drafts were
-            # still scheduled. Such a row has no valid spec state to resume
-            # from, and its recurrent state must not advance this step: null
-            # its state slots so the kernels skip both the initial-state read
-            # and the final-state write, and clamp the count so the slot
-            # index (num_accepted_tokens - 1) stays in bounds.
-            stale_spec_reqs = num_accepted_tokens == 0
-            spec_state_indices_tensor.masked_fill_(
-                stale_spec_reqs.unsqueeze(-1), NULL_BLOCK_ID
-            )
-            # two-sided: index (n-1) stays in bounds AND a live row can
-            # never legitimately exceed num_spec + 1 (carried #40756 guard)
-            num_accepted_tokens = num_accepted_tokens.clamp(1, self.num_spec + 1)
 
         chunk_indices: torch.Tensor | None = None
         chunk_offsets: torch.Tensor | None = None
@@ -757,4 +615,59 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         num_accepted_tokens = torch.diff(m.query_start_loc)
         num_decode_draft_tokens_cpu = (num_accepted_tokens - 1).cpu()
 
-        return self.build(0, m, num_accepted_tokens, num_decode_draft_tokens_cpu)
+        spec_sequence_masks_cpu = None
+        spec_sequence_masks = None
+        num_prefills = 0
+        num_prefill_tokens = 0
+        num_decodes = 0
+        num_decode_tokens = 0
+        num_spec_decodes = 0
+        num_spec_decode_tokens = 0
+        spec_token_indx = None
+        non_spec_token_indx = None
+        spec_query_start_loc = None
+        non_spec_query_start_loc = None
+        non_spec_query_start_loc_cpu = None
+        if self.use_spec_decode:
+            (
+                spec_sequence_masks_cpu,
+                spec_sequence_masks,
+                num_spec_decodes,
+                num_decodes,
+                num_prefills,
+                num_decode_tokens,
+                num_prefill_tokens,
+                num_spec_decode_tokens,
+                spec_token_indx,
+                non_spec_token_indx,
+                spec_query_start_loc,
+                non_spec_query_start_loc,
+                non_spec_query_start_loc_cpu,
+                num_accepted_tokens,
+            ) = compute_spec_metadata(
+                num_decode_draft_tokens_cpu,
+                num_accepted_tokens,
+                m.query_start_loc,
+                m.query_start_loc_cpu,
+                self.num_spec,
+            )
+
+        return self.build(
+            0,
+            m,
+            num_accepted_tokens,
+            num_decode_draft_tokens_cpu,
+            spec_sequence_masks_cpu=spec_sequence_masks_cpu,
+            spec_sequence_masks=spec_sequence_masks,
+            num_spec_decodes=num_spec_decodes,
+            num_decodes=num_decodes,
+            num_prefills=num_prefills,
+            num_decode_tokens=num_decode_tokens,
+            num_prefill_tokens=num_prefill_tokens,
+            num_spec_decode_tokens=num_spec_decode_tokens,
+            spec_token_indx=spec_token_indx,
+            non_spec_token_indx=non_spec_token_indx,
+            spec_query_start_loc=spec_query_start_loc,
+            non_spec_query_start_loc=non_spec_query_start_loc,
+            non_spec_query_start_loc_cpu=non_spec_query_start_loc_cpu,
+        )
