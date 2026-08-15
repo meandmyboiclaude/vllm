@@ -22,7 +22,7 @@ from vllm.v1.attention.backends.utils import (
     split_decodes_and_prefills,
 )
 from vllm.v1.kv_cache_interface import MambaSpec
-from vllm.v1.worker.gpu.attn_utils import compute_spec_metadata
+from vllm.v1.worker.gpu.attn_utils import compute_common_gdn_attn_metadata
 
 
 class GDNAttentionBackend(AttentionBackend):
@@ -252,19 +252,20 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         num_accepted_tokens: torch.Tensor | None = None,
         num_decode_draft_tokens_cpu: torch.Tensor | None = None,
         fast_build: bool = False,
-        spec_sequence_masks: torch.Tensor | None = None,
-        spec_sequence_masks_cpu: torch.Tensor | None = None,
-        num_spec_decodes: int = 0,
-        num_decodes: int = 0,
         num_prefills: int = 0,
-        num_decode_tokens: int = 0,
         num_prefill_tokens: int = 0,
+        num_decodes: int = 0,
+        num_decode_tokens: int = 0,
+        num_spec_decodes: int = 0,
         num_spec_decode_tokens: int = 0,
-        spec_token_indx: torch.Tensor | None = None,
-        non_spec_token_indx: torch.Tensor | None = None,
         spec_query_start_loc: torch.Tensor | None = None,
         non_spec_query_start_loc: torch.Tensor | None = None,
         non_spec_query_start_loc_cpu: torch.Tensor | None = None,
+        spec_sequence_masks_cpu: torch.Tensor | None = None,
+        spec_sequence_masks: torch.Tensor | None = None,
+        non_spec_sequence_masks_cpu: torch.Tensor | None = None,
+        spec_token_indx: torch.Tensor | None = None,
+        non_spec_token_indx: torch.Tensor | None = None,
     ) -> GDNAttentionMetadata:
         m = common_attn_metadata
 
@@ -287,23 +288,28 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                     treat_short_extends_as_decodes=not self.use_cached_kernel,
                 )
             )
-            num_spec_decodes = 0
             num_spec_decode_tokens = 0
-            non_spec_query_start_loc = query_start_loc
-            non_spec_query_start_loc_cpu = query_start_loc_cpu
+            spec_token_indx = None
+            non_spec_token_indx = None
             spec_state_indices_tensor = None
             non_spec_state_indices_tensor = block_table_tensor[:, 0]
+            spec_query_start_loc = None
+            non_spec_query_start_loc = query_start_loc
+            non_spec_query_start_loc_cpu = query_start_loc_cpu
             num_accepted_tokens = None
         else:
-            assert spec_sequence_masks_cpu is not None
-            spec_state_indices_tensor = block_table_tensor[
-                spec_sequence_masks_cpu, : self.num_spec + 1
-            ]
             if num_prefills == 0 and num_decodes == 0:
+                # Filter by spec_sequence_masks to exclude padded sequences
+                spec_state_indices_tensor = block_table_tensor[
+                    spec_sequence_masks_cpu, : self.num_spec + 1
+                ]
                 non_spec_state_indices_tensor = None
             else:
+                spec_state_indices_tensor = block_table_tensor[
+                    spec_sequence_masks_cpu, : self.num_spec + 1
+                ]
                 non_spec_state_indices_tensor = block_table_tensor[
-                    ~spec_sequence_masks_cpu, 0
+                    non_spec_sequence_masks_cpu, 0
                 ]
 
         chunk_indices: torch.Tensor | None = None
@@ -615,59 +621,47 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         num_accepted_tokens = torch.diff(m.query_start_loc)
         num_decode_draft_tokens_cpu = (num_accepted_tokens - 1).cpu()
 
-        spec_sequence_masks_cpu = None
-        spec_sequence_masks = None
-        num_prefills = 0
-        num_prefill_tokens = 0
-        num_decodes = 0
-        num_decode_tokens = 0
-        num_spec_decodes = 0
-        num_spec_decode_tokens = 0
-        spec_token_indx = None
-        non_spec_token_indx = None
-        spec_query_start_loc = None
-        non_spec_query_start_loc = None
-        non_spec_query_start_loc_cpu = None
-        if self.use_spec_decode:
-            (
-                spec_sequence_masks_cpu,
-                spec_sequence_masks,
-                num_spec_decodes,
-                num_decodes,
-                num_prefills,
-                num_decode_tokens,
-                num_prefill_tokens,
-                num_spec_decode_tokens,
-                spec_token_indx,
-                non_spec_token_indx,
-                spec_query_start_loc,
-                non_spec_query_start_loc,
-                non_spec_query_start_loc_cpu,
-                num_accepted_tokens,
-            ) = compute_spec_metadata(
-                num_decode_draft_tokens_cpu,
-                num_accepted_tokens,
-                m.query_start_loc,
-                m.query_start_loc_cpu,
-                self.num_spec,
-            )
+        (
+            num_prefills,
+            num_prefill_tokens,
+            num_decodes,
+            num_decode_tokens,
+            num_spec_decodes,
+            num_spec_decode_tokens,
+            spec_query_start_loc,
+            non_spec_query_start_loc,
+            non_spec_query_start_loc_cpu,
+            spec_sequence_masks_cpu,
+            spec_sequence_masks,
+            non_spec_sequence_masks_cpu,
+            spec_token_indx,
+            non_spec_token_indx,
+            num_accepted_tokens,
+        ) = compute_common_gdn_attn_metadata(
+            num_decode_draft_tokens_cpu,
+            num_accepted_tokens,
+            m.query_start_loc,
+            m.query_start_loc_cpu,
+            self.num_spec,
+        )
 
         return self.build(
             0,
             m,
             num_accepted_tokens,
             num_decode_draft_tokens_cpu,
-            spec_sequence_masks_cpu=spec_sequence_masks_cpu,
-            spec_sequence_masks=spec_sequence_masks,
-            num_spec_decodes=num_spec_decodes,
-            num_decodes=num_decodes,
             num_prefills=num_prefills,
-            num_decode_tokens=num_decode_tokens,
             num_prefill_tokens=num_prefill_tokens,
+            num_decodes=num_decodes,
+            num_decode_tokens=num_decode_tokens,
+            num_spec_decodes=num_spec_decodes,
             num_spec_decode_tokens=num_spec_decode_tokens,
-            spec_token_indx=spec_token_indx,
-            non_spec_token_indx=non_spec_token_indx,
             spec_query_start_loc=spec_query_start_loc,
             non_spec_query_start_loc=non_spec_query_start_loc,
             non_spec_query_start_loc_cpu=non_spec_query_start_loc_cpu,
+            spec_sequence_masks_cpu=spec_sequence_masks_cpu,
+            spec_sequence_masks=spec_sequence_masks,
+            non_spec_sequence_masks_cpu=non_spec_sequence_masks_cpu,
+            spec_token_indx=spec_token_indx,
+            non_spec_token_indx=non_spec_token_indx,
         )
