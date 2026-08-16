@@ -545,7 +545,16 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
     def _fused_gdn_decode_unsupported_reason(
         self, vllm_config: VllmConfig
     ) -> str | None:
-        conv_state_dtype, recurrent_state_dtype = self.get_state_dtype()
+        state_dtypes = self.get_state_dtype()
+        if len(state_dtypes) > 2:
+            # ReplaySSM page: (conv, ssm, d/k/g_cache). The fused CUDA
+            # decode kernel is not ReplaySSM-aware — report unsupported
+            # instead of crashing the 2-unpack at layer init.
+            return (
+                "the fused CUDA GDN decode kernel is not ReplaySSM-aware "
+                f"(state tuple has {len(state_dtypes)} entries)"
+            )
+        conv_state_dtype, recurrent_state_dtype = state_dtypes
         if (
             self.gqa_interleaved_layout
             or self.head_k_dim != 128
