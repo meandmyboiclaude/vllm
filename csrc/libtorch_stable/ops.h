@@ -406,7 +406,6 @@ void fused_gdn_decode_post_conv_mtp(
     torch::stable::Tensor& state, torch::stable::Tensor const& output_gate,
     torch::stable::Tensor const& norm_weight, torch::stable::Tensor& out,
     double scale, double norm_eps);
-
 #endif
 
 #ifdef VLLM_ENABLE_KIMI_K3_ATTN_RES
