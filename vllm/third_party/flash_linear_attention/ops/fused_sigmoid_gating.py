@@ -103,10 +103,8 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     if USE_INITIAL_STATE:
         if IS_CONTINUOUS_BATCHING:
             if IS_SPEC_DECODING:
-                # Clamp so a zero (stale or padded batch row) entry in
-                # num_accepted_tokens cannot index outside this request's
-                # row of ssm_state_indices; matches the clamp in the align
-                # kernel in vllm/v1/worker/mamba_utils.py.
+                # num_accepted_tokens can be 0 for stale rows whose sampled
+                # tokens were discarded; clamp so the index stays in bounds.
                 i_t = tl.maximum(tl.load(num_accepted_tokens + i_n).to(tl.int64) - 1, 0)
             else:
                 i_t = 0
