@@ -266,6 +266,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         non_spec_sequence_masks_cpu: torch.Tensor | None = None,
         spec_token_indx: torch.Tensor | None = None,
         non_spec_token_indx: torch.Tensor | None = None,
+        stale_spec_reqs: torch.Tensor | None = None,
     ) -> GDNAttentionMetadata:
         m = common_attn_metadata
 
@@ -311,6 +312,16 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 non_spec_state_indices_tensor = block_table_tensor[
                     non_spec_sequence_masks_cpu, 0
                 ]
+            if stale_spec_reqs is not None:
+                # Stale zero-accept rows (async-scheduling discard) have no
+                # valid spec state; null their slots so the kernels skip both
+                # the initial-state read and the final-state write. Mask and
+                # clamped counts come from compute_common_gdn_attn_metadata
+                # (carried #51508-subset + #40756 guard, relocated from the
+                # pre-#52297 per-group build).
+                spec_state_indices_tensor.masked_fill_(
+                    stale_spec_reqs.unsqueeze(-1), NULL_BLOCK_ID
+                )
 
         chunk_indices: torch.Tensor | None = None
         chunk_offsets: torch.Tensor | None = None
@@ -637,12 +648,18 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             spec_token_indx,
             non_spec_token_indx,
             num_accepted_tokens,
+            stale_spec_reqs,
         ) = compute_common_gdn_attn_metadata(
             num_decode_draft_tokens_cpu,
             num_accepted_tokens,
             m.query_start_loc,
             m.query_start_loc_cpu,
             self.num_spec,
+            # ReplaySSM: capture must route through the spec kernel even for
+            # q=1 (draft-less T=1 window) batches; the synthetic draft counts
+            # alone would send those to the non-spec path.
+            use_cache_spec_kernel=self.use_cache_spec_kernel,
+            is_prefilling_cpu=m.is_prefilling,
         )
 
         return self.build(
@@ -664,4 +681,5 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             non_spec_sequence_masks_cpu=non_spec_sequence_masks_cpu,
             spec_token_indx=spec_token_indx,
             non_spec_token_indx=non_spec_token_indx,
+            stale_spec_reqs=stale_spec_reqs,
         )
