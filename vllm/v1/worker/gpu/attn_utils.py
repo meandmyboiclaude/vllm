@@ -368,6 +368,8 @@ def compute_common_gdn_attn_metadata(
     query_start_loc: torch.Tensor,
     query_start_loc_cpu: torch.Tensor,
     num_spec: int,
+    use_cache_spec_kernel: bool = False,
+    is_prefilling_cpu: torch.Tensor | None = None,
 ) -> tuple[Any, ...]:
     """Compute the batch-level spec-decode metadata once per step.
 
@@ -379,7 +381,33 @@ def compute_common_gdn_attn_metadata(
     """
     spec_sequence_masks_cpu: torch.Tensor | None = None
     non_spec_sequence_masks_cpu: torch.Tensor | None = None
-    if num_spec <= 0 or num_decode_draft_tokens_cpu is None:
+    stale_spec_reqs: torch.Tensor | None = None
+    if use_cache_spec_kernel and num_accepted_tokens is not None:
+        # ReplaySSM spec: every post-prefill row must run through the spec
+        # kernel (a draft-less row is a T=1 window). The baseline decode /
+        # prefill paths read the checkpoint page, which lags the committed
+        # ring history, so routing any decode row there corrupts the state.
+        # num_decode_draft_tokens_cpu cannot drive this mask: it is stale
+        # on draft-less steps and -1 for decode rows whose drafts were
+        # dropped.
+        assert is_prefilling_cpu is not None
+        query_lens_cpu_all = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
+        spec_sequence_masks_cpu = (
+            ~is_prefilling_cpu[: query_lens_cpu_all.shape[0]]
+        ) & (query_lens_cpu_all > 0)
+        num_spec_decodes = int(spec_sequence_masks_cpu.sum().item())
+        if num_spec_decodes == 0:
+            spec_sequence_masks = None
+            spec_sequence_masks_cpu = None
+        else:
+            assert (
+                int(query_lens_cpu_all[spec_sequence_masks_cpu].max().item())
+                <= num_spec + 1
+            ), "ReplaySSM-spec decode row wider than the spec window"
+            spec_sequence_masks = async_tensor_h2d(
+                spec_sequence_masks_cpu, device=query_start_loc.device
+            )
+    elif num_spec <= 0 or num_decode_draft_tokens_cpu is None:
         spec_sequence_masks = None
         num_spec_decodes = 0
     else:
@@ -498,6 +526,18 @@ def compute_common_gdn_attn_metadata(
 
         assert num_accepted_tokens is not None
         num_accepted_tokens = num_accepted_tokens[spec_sequence_masks_cpu]
+        # A row can report 0 accepted tokens when its sampled tokens were
+        # discarded (stale async-scheduling step) while its drafts were still
+        # scheduled. Such a row has no valid spec state to resume from, and
+        # its recurrent state must not advance this step: expose the mask so
+        # per-group build() can null the row's state slots (the kernels then
+        # skip both the initial-state read and the final-state write), and
+        # clamp the count so the slot index (num_accepted_tokens - 1) stays
+        # in bounds. Two-sided: a live row can never legitimately exceed
+        # num_spec + 1 either (carried #51508-subset + #40756 guard,
+        # relocated from the pre-#52297 per-group build).
+        stale_spec_reqs = num_accepted_tokens == 0
+        num_accepted_tokens = num_accepted_tokens.clamp(1, num_spec + 1)
 
     return (
         num_prefills,
@@ -515,4 +555,5 @@ def compute_common_gdn_attn_metadata(
         spec_token_indx,
         non_spec_token_indx,
         num_accepted_tokens,
+        stale_spec_reqs,
     )
