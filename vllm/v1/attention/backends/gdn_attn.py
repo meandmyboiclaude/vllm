@@ -479,8 +479,12 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 query_start_loc.device,
             )
 
+        # The ReplaySSM cursor/ring blocks below consume context_lens_tensor
+        # on pure-(spec-)decode batches too — including cudagraph capture —
+        # so compute it unconditionally (pre-#51674 behaviour) instead of
+        # only for prefill batches.
+        context_lens_tensor = m.compute_num_computed_tokens()
         if num_prefills > 0:
-            context_lens_tensor = m.compute_num_computed_tokens()
             has_initial_state = context_lens_tensor > 0
             if spec_sequence_masks_cpu is not None:
                 has_initial_state = has_initial_state[~spec_sequence_masks_cpu]
