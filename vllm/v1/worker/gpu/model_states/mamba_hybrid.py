@@ -49,6 +49,9 @@ class MambaHybridAttnMetadata(ModelSpecificAttnMetadata):
     non_spec_sequence_masks_cpu: torch.Tensor | None = None
     spec_token_indx: torch.Tensor | None = None
     non_spec_token_indx: torch.Tensor | None = None
+    # Spec-row-shaped (len num_spec_decodes) stale zero-accept mask; GDN
+    # build() nulls those rows' state slots (carried #51508 + #40756 guard).
+    stale_spec_reqs: torch.Tensor | None = None
 
     def get_extra_common_attn_kwargs(
         self,
@@ -67,7 +70,11 @@ class MambaHybridAttnMetadata(ModelSpecificAttnMetadata):
             (Mamba2AttentionMetadataBuilder, GDNAttentionMetadataBuilder),
         ):
             return {}
-        return {
+        extra: dict[str, Any] = {}
+        if isinstance(attn_metadata_builder, GDNAttentionMetadataBuilder):
+            # Spec-row-shaped, not batch-row-shaped: no [:num_reqs] slice.
+            extra["stale_spec_reqs"] = self.stale_spec_reqs
+        return extra | {
             "num_accepted_tokens": None
             if self.num_accepted_tokens is None
             else self.num_accepted_tokens[:num_reqs],
@@ -301,6 +308,7 @@ class MambaHybridModelState(DefaultModelState):
         non_spec_sequence_masks_cpu = None
         spec_token_indx = None
         non_spec_token_indx = None
+        stale_spec_reqs = None
         if not for_capture:
             if self.vllm_config.num_speculative_tokens > 0:
                 num_accepted_tokens = self.num_accepted_tokens_gpu.new_ones(num_reqs)
@@ -344,12 +352,17 @@ class MambaHybridModelState(DefaultModelState):
                     spec_token_indx,
                     non_spec_token_indx,
                     num_accepted_tokens,
+                    stale_spec_reqs,
                 ) = compute_common_gdn_attn_metadata(
                     num_decode_draft_tokens_cpu,
                     num_accepted_tokens,
                     input_batch.query_start_loc,
                     query_start_loc_cpu,
                     self.vllm_config.num_speculative_tokens,
+                    use_cache_spec_kernel=(
+                        self.cache_config.use_replayssm_spec
+                    ),
+                    is_prefilling_cpu=is_prefilling,
                 )
 
         mamba_attn_metadata = MambaHybridAttnMetadata(
@@ -370,6 +383,7 @@ class MambaHybridModelState(DefaultModelState):
             non_spec_sequence_masks_cpu=non_spec_sequence_masks_cpu,
             spec_token_indx=spec_token_indx,
             non_spec_token_indx=non_spec_token_indx,
+            stale_spec_reqs=stale_spec_reqs,
         )
         return build_attn_metadata(
             attn_groups=attn_groups,
