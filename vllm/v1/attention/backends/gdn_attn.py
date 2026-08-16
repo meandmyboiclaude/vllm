@@ -431,15 +431,21 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 )
 
             assert num_accepted_tokens is not None
-            # Stale/discarded spec rows can carry num_accepted_tokens == 0 (or a
-            # value above the draft window) after a batch-composition change.
-            # Both are out of range for the spec-decode state-index loads below
-            # and for the cudagraph-padded path, so clamp at this single choke
-            # point: a live row always accepts at least the bonus token and can
-            # never legitimately exceed num_spec + 1. See vllm issue #40756.
-            num_accepted_tokens = num_accepted_tokens[spec_sequence_masks_cpu].clamp_(
-                1, self.num_spec + 1
+            num_accepted_tokens = num_accepted_tokens[spec_sequence_masks_cpu]
+            # A row can report 0 accepted tokens when its sampled tokens were
+            # discarded (stale async-scheduling step) while its drafts were
+            # still scheduled. Such a row has no valid spec state to resume
+            # from, and its recurrent state must not advance this step: null
+            # its state slots so the kernels skip both the initial-state read
+            # and the final-state write, and clamp the count so the slot
+            # index (num_accepted_tokens - 1) stays in bounds.
+            stale_spec_reqs = num_accepted_tokens == 0
+            spec_state_indices_tensor.masked_fill_(
+                stale_spec_reqs.unsqueeze(-1), NULL_BLOCK_ID
             )
+            # two-sided: index (n-1) stays in bounds AND a live row can
+            # never legitimately exceed num_spec + 1 (carried #40756 guard)
+            num_accepted_tokens = num_accepted_tokens.clamp(1, self.num_spec + 1)
 
         chunk_indices: torch.Tensor | None = None
         chunk_offsets: torch.Tensor | None = None
