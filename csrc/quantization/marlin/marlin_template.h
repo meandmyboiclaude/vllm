@@ -1374,6 +1374,16 @@ __global__ void Marlin(
           mma_trans<a_type_id, false, 32>(
               frag_a[k2][i], frag_b[0], frag_b[1],
               (group_blocks == -1 ? frag_c : frag_c_tmp)[i][j][0]);
+#ifdef CLUB_R4B_DEBUG
+          if (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 &&
+              threadIdx.x < 4 && k < 2 && j == 0 && i == 0) {
+            const int32_t* dbg_c = reinterpret_cast<const int32_t*>(
+                &(group_blocks == -1 ? frag_c : frag_c_tmp)[i][j][0]);
+            printf("[R4BDBG-C] t=%d k=%d c0=%d c1=%d c2=%d c3=%d\n",
+                   (int)threadIdx.x, k, dbg_c[0], dbg_c[1], dbg_c[2],
+                   dbg_c[3]);
+          }
+#endif
         } else {
           mma<a_type_id, false, 32>(
               frag_a[k2][i], frag_b[0],
@@ -2070,6 +2080,18 @@ __global__ void Marlin(
               &frag_s[0][j * 2][0])[sel]);
           sc[1] = Cdtype::num2float(reinterpret_cast<c_scalar_t*>(
               &frag_s[0][j * 2 + 1][0])[sel]);
+#ifdef CLUB_R4B_DEBUG
+          if (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 &&
+              threadIdx.x < 4 && j == 0) {
+            const uint32_t* dbg_s =
+                reinterpret_cast<const uint32_t*>(&frag_s[0][0]);
+            printf("[R4BDBG-S] t=%d sel=%d sc0=%f sc1=%f fragS0=%08x "
+                   "fragS1=%08x fragS2=%08x fragS3=%08x c_pre0=%f\n",
+                   (int)threadIdx.x, sel, sc[0], sc[1], dbg_s[0], dbg_s[1],
+                   dbg_s[2], dbg_s[3],
+                   static_cast<double>(frag_c[0][0][0][0]));
+          }
+#endif
 
   #pragma unroll
           for (int i = 0; i < thread_m_blocks; i++) {
