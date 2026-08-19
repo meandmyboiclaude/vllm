@@ -1,3 +1,4 @@
+#define CLUB_R4B_DEBUG 1
 /*
  * Modified by Neural Magic
  * Copyright (C) Marlin.2024 Elias Frantar
