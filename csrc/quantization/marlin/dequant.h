@@ -493,12 +493,32 @@ __device__ inline void dequant<__nv_fp8x4_e4m3, vllm::kFE2M1f.id(), true>(
 template <>
 __device__ inline void dequant<int32_t, vllm::kU4B8.id(), true>(
     int q, int32_t* frag_b) {
+#ifdef CLUB_U19_DEQ2
+  // [CLUB-U19 2026-08-19, dark experiment — MEASURED LOSER, keep OFF]
+  // LiquidQuant-style 2-op UINT4(+8 bias) -> INT8: mask + per-byte SIMD
+  // subtract.  The 2-op claim is PTX-level only: sm_89 has no native
+  // vsub4 and ptxas emulates it — SASS census on this exact snippet
+  // (2026-08-19, CUDA 13.x, -arch=sm_89): OFF arm 32 instructions
+  // (6 LOP3 + 2 IADD3), ON arm 88 instructions (46 PRMT emulation).
+  // 2.75x worse at the instruction level; cannot win on this silicon.
+  // Kept compile-gated dark per the parked-losers rule (bit-model
+  // equivalence proven over 100K words), not deleted.
+  int t0 = q & 0x0F0F0F0F;
+  int t1 = (q >> 4) & 0x0F0F0F0F;
+  asm("vsub4.s32.s32.s32 %0, %1, %2, %3;"
+      : "=r"(frag_b[0])
+      : "r"(t0), "r"(0x08080808), "r"(0));
+  asm("vsub4.s32.s32.s32 %0, %1, %2, %3;"
+      : "=r"(frag_b[1])
+      : "r"(t1), "r"(0x08080808), "r"(0));
+#else
   constexpr int repeated_zp = 0x08080808;
   constexpr int MASK = 0x80808080;
 
   frag_b[0] = ((q & 0x0F0F0F0F | MASK) - repeated_zp) ^ MASK;
   q >>= 4;
   frag_b[1] = ((q & 0x0F0F0F0F | MASK) - repeated_zp) ^ MASK;
+#endif
 }
 
 template <>

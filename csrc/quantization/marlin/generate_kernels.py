@@ -118,11 +118,17 @@ QUANT_CONFIGS = [
         "group_blocks": [2],
     },
     # AWQ-INT4 with INT8 activation
+    # [CLUB-R4 2026-08-19] 0.5 added: instantiate the 8-row (m_block_size_8)
+    # tile for int8 activations too.  Upstream only generated it for 16-bit
+    # A; at drafter-decode shapes (M<=8) the int8 path otherwise pads to a
+    # full 16-row tile.  Generating the instantiations is inert on its own —
+    # the runtime never selects m_block_size_8 for int8 A unless
+    # VLLM_MARLIN_INT8_M8=1 (marlin.cu, same tag).
     {
         "a_type": ["kS8"],
         "b_type": "kU4",
         "thread_configs": THREAD_CONFIGS,
-        "thread_m_blocks": [1, 2, 3, 4],
+        "thread_m_blocks": [0.5, 1, 2, 3, 4],
         "group_blocks": [-1, 2, 4, 8],
     },
     # GPTQ-INT4 with INT8 activation
@@ -130,7 +136,7 @@ QUANT_CONFIGS = [
         "a_type": ["kS8"],
         "b_type": "kU4B8",
         "thread_configs": THREAD_CONFIGS,
-        "thread_m_blocks": [1, 2, 3, 4],
+        "thread_m_blocks": [0.5, 1, 2, 3, 4],
         "group_blocks": [-1, 2, 4, 8],
     },
     # GPTQ-INT4 with FP8 activation

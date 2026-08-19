@@ -23,6 +23,8 @@
   #define MARLIN_NAMESPACE_NAME marlin
 #endif
 
+#include <cstdlib>  // [CLUB-R4] std::getenv for the VLLM_MARLIN_INT8_M8 gate
+
 #include "kernel.h"
 #include "core/registration.h"
 
@@ -422,7 +424,19 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
     int thread_n = thread_n_init;
 
     int thread_m_blocks = min(div_ceil(prob_m_split, 16), max_thread_m_blocks);
-    int m_block_size_8 = prob_m_split <= 8 && a_type.size_bits() == 16;
+    // [CLUB-R4 2026-08-19] the 8-row tile for int8 activations, opt-in.
+    // Upstream restricts m_block_size_8 to 16-bit A; the kS8 instantiations
+    // now exist (generate_kernels.py, same tag) but stay unselected unless
+    // VLLM_MARLIN_INT8_M8=1 — unset, this line is behaviorally identical to
+    // the historical `size_bits() == 16` condition.
+    static const bool club_int8_m8 = []() {
+      const char* v = std::getenv("VLLM_MARLIN_INT8_M8");
+      return v != nullptr && v[0] == '1' && v[1] == '\0';
+    }();
+    int m_block_size_8 =
+        prob_m_split <= 8 &&
+        (a_type.size_bits() == 16 ||
+         (club_int8_m8 && a_type == vllm::kS8));
 
     // Set thread config
     exec_config_t exec_cfg;
