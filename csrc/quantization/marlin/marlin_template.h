@@ -948,6 +948,19 @@ __global__ void Marlin(
     for (int i = 0; i < thread_m_blocks; i++)
       ldsm<m_block_size_8 ? 2 : 4, a_type_id>(
           frag_a[k % 2][i], &sh_a_stage[a_sh_rd_trans[k % b_sh_wr_iters][i]]);
+#ifdef CLUB_R4B_DEBUG
+    // [CLUB-R4B-DEBUG] the shared addresses the m8 read actually uses, plus
+    // the raw staged bytes at the tile base — separates a fetch-side
+    // (staged bytes wrong) from a read-side (address wrong) defect.
+    if (m_block_size_8 && is_a_8bit && blockIdx.x == 0 && blockIdx.y == 0 &&
+        blockIdx.z == 0 && threadIdx.x < 16 && k < 2 && pipe == 0) {
+      const uint32_t* raw = reinterpret_cast<const uint32_t*>(sh_a_stage);
+      printf("[R4BDBG-LD] t=%d k=%d rd_trans=%d a_sh_rd=%d stage_w0=%08x "
+             "stage_w1=%08x\n",
+             (int)threadIdx.x, k, a_sh_rd_trans[k % b_sh_wr_iters][0],
+             a_sh_rd, raw[0], raw[1]);
+    }
+#endif
     int4* sh_b_stage = sh_b + b_sh_stage * pipe;
 
   #pragma unroll
@@ -1339,6 +1352,24 @@ __global__ void Marlin(
           // (window12 A/B, scoreboard 23.91/23.96).  Mirror the 16-bit
           // matmul's m8 branch: ONE swapped-operand (D = C^T) mma per
           // (i, j) pair; [i][j][1] stays unused on the m8 path.
+#ifdef CLUB_R4B_DEBUG
+          // [CLUB-R4B-DEBUG] probe wheel only: dump the raw operands the
+          // m8 path actually consumes (first CTA, lanes 0-3, first two
+          // k-iterations). Ground truth against the craft3 response
+          // matrix — analysis has cleared every m8 branch individually,
+          // so the divergence must be visible in these registers.
+          if (blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0 &&
+              threadIdx.x < 4 && k < 2 && j == 0 && i == 0) {
+            const uint32_t* dbg_a =
+                reinterpret_cast<const uint32_t*>(&frag_a[k2][i]);
+            const uint32_t* dbg_b =
+                reinterpret_cast<const uint32_t*>(&frag_b[0]);
+            printf("[R4BDBG] t=%d k=%d k2=%d a0=%08x a1=%08x a2=%08x "
+                   "a3=%08x b0=%08x b1=%08x\n",
+                   (int)threadIdx.x, k, k2, dbg_a[0], dbg_a[1], dbg_a[2],
+                   dbg_a[3], dbg_b[0], dbg_b[1]);
+          }
+#endif
           mma_trans<a_type_id, false, 32>(
               frag_a[k2][i], frag_b[0], frag_b[1],
               (group_blocks == -1 ? frag_c : frag_c_tmp)[i][j][0]);
