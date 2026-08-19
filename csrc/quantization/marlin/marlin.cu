@@ -436,7 +436,14 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
     int m_block_size_8 =
         prob_m_split <= 8 &&
         (a_type.size_bits() == 16 ||
-         (club_int8_m8 && a_type == vllm::kS8));
+         // [CLUB-R4B 2026-08-19] the int8 m8 arm is derived and tested for
+         // the serving shape only: bias-free, fp32 global reduce.  The
+         // has_bias epilogue and global_reduce_fp16 were never co-derived
+         // with the trans accumulator — refuse the arm there (falls back
+         // to the 16-row tile: correct, just padded) rather than compute
+         // a plausible wrong number.
+         (club_int8_m8 && a_type == vllm::kS8 && !has_bias &&
+          use_fp32_reduce));
 
     // Set thread config
     exec_config_t exec_cfg;

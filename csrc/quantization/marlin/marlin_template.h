@@ -659,7 +659,17 @@ __global__ void Marlin(
   // we scale a `half2` tile in column-major layout in the former and in
   // row-major in the latter case.
   int s_sh_rd;
-  if constexpr (is_a_8bit) {
+  if constexpr (is_a_8bit && m_block_size_8) {
+    // [CLUB-R4B 2026-08-19] trans-aware scale read for the int8 8-row tile:
+    // under mma_trans the accumulator is D = C^T, so this thread's regs
+    // cover n-column `groupID = lane/4` (both 8-col groups of a j-pair),
+    // not columns 2*tig/2*tig+1.  The a8 scale rows are laid out as
+    // int4[tig'] = {4 groups x cols (2*tig', 2*tig'+1)}; reading row
+    // tig' = lane/8 (== groupID/2) puts the needed column groupID
+    // (= 2*tig' + (groupID & 1)) in every group's pair — the folds select
+    // the half with `groupID & 1`.  Precedent: bias_sh_rd's m8 branch.
+    s_sh_rd = 4 * ((threadIdx.x / 32) % tb_n_warps) + (threadIdx.x % 32) / 8;
+  } else if constexpr (is_a_8bit) {
     s_sh_rd = 4 * ((threadIdx.x / 32) % tb_n_warps) + (threadIdx.x % 4);
   } else if constexpr (group_blocks != -1)
     s_sh_rd = 8 * ((threadIdx.x / 32) % tb_n_warps) + (threadIdx.x % 32) / 4;
@@ -1320,17 +1330,56 @@ __global__ void Marlin(
 
   #pragma unroll
       for (int i = 0; i < thread_m_blocks; i++) {
-        mma<a_type_id, false, 32>(
-            frag_a[k2][i], frag_b[0],
-            (group_blocks == -1 ? frag_c : frag_c_tmp)[i][j][0]);
-        mma<a_type_id, false, 32>(
-            frag_a[k2][i], frag_b[1],
-            (group_blocks == -1 ? frag_c : frag_c_tmp)[i][j][1]);
+        if constexpr (m_block_size_8) {
+          // [CLUB-R4B 2026-08-19] the int8 mma path was never taught the
+          // 8-row fragment shape: under the R4 gate the load side switches
+          // to 8-row half-fragments (halved a_sh layout + ldsm<2>) while
+          // this consumer issued full-tile mma on them — M=1/6 rows
+          // PARITY_FAIL relerr=nan exactly where the gate engages
+          // (window12 A/B, scoreboard 23.91/23.96).  Mirror the 16-bit
+          // matmul's m8 branch: ONE swapped-operand (D = C^T) mma per
+          // (i, j) pair; [i][j][1] stays unused on the m8 path.
+          mma_trans<a_type_id, false, 32>(
+              frag_a[k2][i], frag_b[0], frag_b[1],
+              (group_blocks == -1 ? frag_c : frag_c_tmp)[i][j][0]);
+        } else {
+          mma<a_type_id, false, 32>(
+              frag_a[k2][i], frag_b[0],
+              (group_blocks == -1 ? frag_c : frag_c_tmp)[i][j][0]);
+          mma<a_type_id, false, 32>(
+              frag_a[k2][i], frag_b[1],
+              (group_blocks == -1 ? frag_c : frag_c_tmp)[i][j][1]);
+        }
       }
 
       if constexpr (group_blocks != -1) {
         if (group_blocks == 2 || k == 1) {
-          if constexpr (a_type == vllm::kS8) {
+          if constexpr (a_type == vllm::kS8 && m_block_size_8) {
+            // [CLUB-R4B 2026-08-19] trans fold: D = C^T, so regs c0/c1 hold
+            // TRUE n-column `groupID` of group 2j and c2/c3 the same column
+            // of group 2j+1 (m-rows 2*tig / 2*tig+1).  frag_s was loaded
+            // via the m8 s_sh_rd (row tig' = lane/8), so each group's pair
+            // holds columns (2*tig', 2*tig'+1); `groupID & 1` selects the
+            // one this thread accumulates.  Only [i][j][0] exists on the
+            // m8 path (single mma_trans); [i][j][1] stays zero.
+            int sel = ((threadIdx.x % 32) >> 2) & 1;
+            int s_lo = (int)reinterpret_cast<uint16_t*>(
+                &frag_s[k2][j * 2][0])[sel];
+            int s_hi = (int)reinterpret_cast<uint16_t*>(
+                &frag_s[k2][j * 2 + 1][0])[sel];
+
+  #pragma unroll
+            for (int i = 0; i < thread_m_blocks; i++) {
+  #pragma unroll
+              for (int g = 0; g < 4; g++) {
+                int scale = g < 2 ? s_lo : s_hi;
+                *reinterpret_cast<int32_t*>(&frag_c[i][j][0][g]) +=
+                    *reinterpret_cast<int32_t*>(&frag_c_tmp[i][j][0][g]) *
+                    scale;
+                frag_c_tmp[i][j][0][g] = 0.0f;
+              }
+            }
+          } else if constexpr (a_type == vllm::kS8) {
             int2 s_vals[2];
             s_vals[0] = {
                 (int)reinterpret_cast<uint16_t*>(&frag_s[k2][j * 2][0])[0],
@@ -1860,7 +1909,33 @@ __global__ void Marlin(
         }
       }
 
-      if constexpr (is_a_8bit) {
+      if constexpr (is_a_8bit && m_block_size_8) {
+        // [CLUB-R4B 2026-08-19] per-token (per m-row) activation scales
+        // under the trans accumulator: reg g's m-row is 2*tig + (g % 2)
+        // (D-columns are TRUE m-rows), NOT groupID-based, and g/2 selects
+        // the n-column half — which shares the same two m-rows.  Load the
+        // two rows this thread owns; only [i][j][0] exists on the m8 path.
+        float frag_a_s[2];
+        frag_a_s[0] = sh_a_s[(threadIdx.x % 4) * 2];
+        frag_a_s[1] = sh_a_s[(threadIdx.x % 4) * 2 + 1];
+
+  #pragma unroll
+        for (int j = 0; j < 2; j++) {
+  #pragma unroll
+          for (int i = 0; i < thread_m_blocks; i++) {
+  #pragma unroll
+            for (int g = 0; g < 4; g++) {
+              float c_val = frag_c[i][j][0][g];
+
+              if constexpr (a_type == vllm::kS8) {
+                c_val = __int2float_rn(*reinterpret_cast<int32_t*>(&c_val));
+              }
+              float s_val = frag_a_s[g % 2];
+              frag_c[i][j][0][g] = c_val * s_val;
+            }
+          }
+        }
+      } else if constexpr (is_a_8bit) {
         float frag_a_s[2 * thread_m_blocks];
 
         for (int i = 0; i < 2 * thread_m_blocks; i++)
@@ -1948,7 +2023,32 @@ __global__ void Marlin(
       // For 8-bit channelwise, we apply the scale before the global reduction
       // that converts the fp32 results to fp16 (so that we avoid possible
       // overflow in fp16)
-      if constexpr (!has_act_order && group_blocks == -1 && is_a_8bit) {
+      if constexpr (!has_act_order && group_blocks == -1 && is_a_8bit &&
+                    m_block_size_8) {
+        // [CLUB-R4B 2026-08-19] channelwise weight scales under the trans
+        // accumulator: c0/c1 hold TRUE n-column `groupID` of group 2j,
+        // c2/c3 the same column of group 2j+1.  frag_s came in via the m8
+        // s_sh_rd (row tig' = lane/8: 4 groups x columns 2*tig'/2*tig'+1);
+        // `groupID & 1` selects the column.  Only [i][j][0] exists.
+        int sel = ((threadIdx.x % 32) >> 2) & 1;
+  #pragma unroll
+        for (int j = 0; j < 2; j++) {
+          float sc[2];
+          sc[0] = Cdtype::num2float(reinterpret_cast<c_scalar_t*>(
+              &frag_s[0][j * 2][0])[sel]);
+          sc[1] = Cdtype::num2float(reinterpret_cast<c_scalar_t*>(
+              &frag_s[0][j * 2 + 1][0])[sel]);
+
+  #pragma unroll
+          for (int i = 0; i < thread_m_blocks; i++) {
+  #pragma unroll
+            for (int g = 0; g < 4; g++) {
+              frag_c[i][j][0][g] *= sc[g < 2 ? 0 : 1];
+            }
+          }
+        }
+      } else if constexpr (!has_act_order && group_blocks == -1 &&
+                           is_a_8bit) {
   #pragma unroll
         for (int j = 0; j < 2; j++) {
           float2 aa[2];
