@@ -1729,7 +1729,16 @@ __global__ void Marlin(
     if constexpr (m_block_size_8) {
       c_sh_wr = (8 * c_sh_stride) * ((threadIdx.x % 32) % 4 * 2) +
                 (threadIdx.x % 32) / 4;
-      c_sh_wr += 64 * (threadIdx.x / 32);
+      // [CLUB-R4B 2026-08-21] under is_a_8bit each n-warp covers 32 output
+      // columns (the j loop runs 2, not 4), so the per-warp column offset
+      // must halve as well.  With the 16-bit constant 64, warp w>0 wrote
+      // its first 8 columns into the c_sh_stride padding (lost) and the
+      // remaining 24 into the NEXT row's columns 0-23 — producing craft4's
+      // exact map: 32-of-64 cols at M=1, the 8/24 row split at r>=1
+      // (misplaced zero-writes from row r-1 clobber cols 0-23), row 0
+      // asymmetric (nothing spills into it), and cols 32-63 never written
+      // (the uninitialized-read row-7 nan).
+      c_sh_wr += (is_a_8bit ? 32 : 64) * (threadIdx.x / 32);
     } else {
       c_sh_wr =
           (4 * c_sh_stride) * ((threadIdx.x % 32) / 4) + (threadIdx.x % 32) % 4;
