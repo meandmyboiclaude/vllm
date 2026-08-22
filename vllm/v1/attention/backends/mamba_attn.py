@@ -791,46 +791,61 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
                     n_blocks, dtype=torch.int8, device=cursor_device
                 )
             sbi = state_indices_tensor_d[:, 0]
-            commit_replayssm_spec(
-                self.spec_write_pos,
-                self.spec_post_origin,
-                self.spec_is_flush,
-                num_accepted_tokens.to(torch.int32),
-                sbi,
-                max_cache_len=self.spec_flush_threshold,
-                max_spec_len=self.max_spec_len,
-                cache_buf_len=self.spec_cache_buf_len,
-            )
-            # prefill->decode reset for first-decode rows (cursors only; no conv
-            # seed -- conv_state carries context). A request's first spec verify
-            # has num_computed_tokens == num_prompt_tokens; that resets its
-            # (possibly recycled) block's cursors to write_pos=0, and -- because
-            # the commit above runs BEFORE this reset -- also undoes any write_pos
-            # the first-decode commit advanced from the freshly-zeroed cursor.
-            # Derive the mask from the DEVICE-side compute_num_computed_tokens()
-            # (always populated), NOT _num_computed_tokens_cpu, which is None on
-            # the spec verify path -> the old guard silently skipped the reset,
-            # leaving recycled blocks with stale cursors and fresh blocks with a
-            # wrong first-decode write_pos (coherent-but-divergent output +
-            # acceptance drop).
             num_prompt_tokens_cpu = common_attn_metadata.num_prompt_tokens_cpu
+            num_prompt_d = None
             if num_prompt_tokens_cpu is not None:
-                ctx_lens = common_attn_metadata.compute_num_computed_tokens()
-                num_prompt_d = num_prompt_tokens_cpu.to(
-                    ctx_lens.device, non_blocking=True
+                num_prompt_d = num_prompt_tokens_cpu[:num_decodes].to(
+                    cursor_device, non_blocking=True
                 )
-                first_decode_d = (
-                    ctx_lens[:num_decodes] == num_prompt_d[:num_decodes]
-                ).to(torch.int8)
-                reset_replayssm_spec_cursors(
+                # Rows carrying no request (warmup/idle dummy batches; the V2
+                # runner marks them with the -1 sentinel, see mamba_hybrid.py,
+                # and V1 dummy rows carry 0) reuse block ids of live blocks --
+                # NULL them so the commit/reset below never advance a live
+                # block's cursors off a dummy batch.
+                sbi = torch.where(
+                    num_prompt_d > 0, sbi, torch.full_like(sbi, NULL_BLOCK_ID)
+                )
+            # Capture dummies only need the persistent buffers attached (the
+            # graph records their fixed addresses); running the commit/reset on
+            # a dummy's recycled block ids would corrupt live cursors.
+            if not self._capturing:
+                commit_replayssm_spec(
                     self.spec_write_pos,
                     self.spec_post_origin,
                     self.spec_is_flush,
-                    first_decode_d,
+                    num_accepted_tokens.to(torch.int32),
                     sbi,
                     max_cache_len=self.spec_flush_threshold,
                     max_spec_len=self.max_spec_len,
+                    cache_buf_len=self.spec_cache_buf_len,
                 )
+                # prefill->decode reset for first-decode rows (cursors only; no
+                # conv seed -- conv_state carries context). A request's first
+                # spec verify has num_computed_tokens == num_prompt_tokens; that
+                # resets its (possibly recycled) block's cursors to write_pos=0,
+                # and -- because the commit above runs BEFORE this reset -- also
+                # undoes any write_pos the first-decode commit advanced from the
+                # freshly-zeroed cursor. Derive the mask from the DEVICE-side
+                # compute_num_computed_tokens() (always populated), NOT
+                # _num_computed_tokens_cpu, which is None on the spec verify
+                # path -> the old guard silently skipped the reset, leaving
+                # recycled blocks with stale cursors and fresh blocks with a
+                # wrong first-decode write_pos (coherent-but-divergent output +
+                # acceptance drop).
+                if num_prompt_d is not None:
+                    ctx_lens = common_attn_metadata.compute_num_computed_tokens()
+                    first_decode_d = (ctx_lens[:num_decodes] == num_prompt_d).to(
+                        torch.int8
+                    )
+                    reset_replayssm_spec_cursors(
+                        self.spec_write_pos,
+                        self.spec_post_origin,
+                        self.spec_is_flush,
+                        first_decode_d,
+                        sbi,
+                        max_cache_len=self.spec_flush_threshold,
+                        max_spec_len=self.max_spec_len,
+                    )
             spec_write_pos_d = self.spec_write_pos
             spec_post_origin_d = self.spec_post_origin
             spec_is_flush_d = self.spec_is_flush

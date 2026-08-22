@@ -605,7 +605,19 @@ def triton_turboquant_decode_attention(
     # Value codebook (KVQ-1). Only dereferenced when value_nuq; pass the key
     # centroids as a harmless placeholder otherwise so the arg is always valid.
     n_val_centroids = 2**value_quant_bits
-    val_cent = val_centroids if val_centroids is not None else centroids
+    if value_nuq:
+        # Loud-fail: falling back to the KEY centroid table (or a VQB the
+        # kernel compiles as uniform) would silently corrupt decoded values.
+        if value_quant_bits != 3:
+            raise ValueError(
+                "value_nuq requires value_quant_bits == 3 "
+                f"(got {value_quant_bits})"
+            )
+        if val_centroids is None:
+            raise ValueError("value_nuq=True but val_centroids is None")
+        val_cent = val_centroids
+    else:
+        val_cent = centroids
     value_nuq_flag = 1 if value_nuq else 0
     n_outliers = int(value_outliers)
 

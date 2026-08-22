@@ -775,6 +775,12 @@ def profile_cudagraph_memory(runner: "GPUModelRunner") -> int:
         # or their private-pool memory is never returned.
         CUDAGraphWrapper.clear_all_graphs()
         BreakableCUDAGraphWrapper.clear_all_graphs()
+        # The local `manager` reference keeps the model manager alive through
+        # the teardown below; drop its graphs explicitly so the sampled FULL
+        # graphs release the throwaway pool before the allocator flush.
+        manager.graphs.clear()
+        manager._max_full_descs_to_capture = None
+        manager._capture_mem_samples = None
         _teardown_profiling_state(runner)
 
 

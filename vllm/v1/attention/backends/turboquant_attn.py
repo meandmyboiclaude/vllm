@@ -60,6 +60,7 @@ from vllm.v1.attention.ops.flydsl_turboquant_decode import (
     is_flydsl_available,
     is_flydsl_gqa6_available,
 )
+from vllm.v1.attention.ops.tq_shared_scratch import reset_shared_scratch
 from vllm.v1.attention.ops.triton_turboquant_decode import (
     _tq_full_dequant_kv,
     _use_fp8_e4b15,
@@ -165,9 +166,13 @@ def reset_tq_decode_scratch() -> None:
     """Release the shared decode scratch (called on model-runner teardown)."""
     _DECODE_SCRATCH.clear()
     # The shared fallback holder retains _tq_mid_o_buf/_tq_output_buf/
-    # _tq_lse_buf GPU tensors (buf_holder writes on the non-cudagraph decode
-    # path); drop them too so shutdown actually frees the scratch.
+    # _tq_lse_buf GPU tensors (the SoA decode launcher writes them via
+    # buf_holder); drop them too so shutdown actually frees the scratch.
     _TQ_SHARED_DECODE_SCRATCH.__dict__.clear()
+    # The CUDA Triton decode launcher keeps its eager high-water scratch on
+    # its own per-device cache (BUG-199), not on buf_holder — clear that too
+    # or shutdown leaks 3 GPU buffers per device.
+    reset_shared_scratch()
 
 
 def _build_hadamard(d: int, device_str: str) -> torch.Tensor:
@@ -1217,6 +1222,9 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             _tq_full_dequant_kv[grid](
                 kv_cache,
                 block_table,
+                centroids,
+                # KVQ-1 value codebook; the key centroids are a harmless
+                # placeholder when VALUE_NUQ=0 (never dereferenced).
                 getattr(layer, "_tq_val_centroids", None)
                 if self.tq_config.value_nuq
                 else centroids,
@@ -1431,7 +1439,10 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 mid_o_buf=mid_o_buf,
                 output_buf=output_buf,
                 lse_buf=lse_buf,
-                buf_holder=layer,
+                # The SoA launcher stashes its high-water scratch on buf_holder;
+                # a per-layer holder retained n_layers sets that nothing read
+                # back (BUG-199), so hand it the shared holder read above.
+                buf_holder=_TQ_SHARED_DECODE_SCRATCH,
                 max_num_kv_splits=self.max_num_kv_splits,
                 sinks=self.sinks,
                 sliding_window=self.sliding_window,

@@ -1667,6 +1667,7 @@ class GPUModelRunner(
             self.num_accepted_tokens_event.record()
         elif (
             self.cache_config.mamba_cache_mode == "none"
+            and not self.cache_config.use_replayssm_spec
             and not self.use_async_scheduling
         ):
             # NOTE: gated off under async scheduling — the normalized CPU

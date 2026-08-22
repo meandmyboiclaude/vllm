@@ -112,6 +112,9 @@ class CPUModelRunner(GPUModelRunner):
         vllm.v1.sample.rejection_sampler.rejection_random_sample_kernel = (
             cpu_tl.rejection_random_sample_kernel
         )
+        vllm.v1.sample.rejection_sampler.relaxed_thinking_sample_kernel = (
+            cpu_tl.relaxed_thinking_sample_kernel
+        )
         vllm.v1.sample.rejection_sampler.expand_kernel = cpu_tl.expand_kernel
         vllm.v1.sample.rejection_sampler.sample_recovered_tokens_kernel = (
             cpu_tl.sample_recovered_tokens_kernel

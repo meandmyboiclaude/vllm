@@ -453,7 +453,19 @@ def triton_turboquant_store(
     # VALUE_NUQ=1; pass the key midpoints as a harmless placeholder otherwise so
     # the kernel arg is always a valid pointer.
     n_val_centroids = 2**value_quant_bits
-    val_mid = val_midpoints if val_midpoints is not None else midpoints
+    if value_nuq:
+        # Loud-fail: bucketizing against the KEY midpoints (or a VQB the
+        # kernel compiles as uniform) would silently write a wrong codec.
+        if value_quant_bits != 3:
+            raise ValueError(
+                "value_nuq requires value_quant_bits == 3 "
+                f"(got {value_quant_bits})"
+            )
+        if val_midpoints is None:
+            raise ValueError("value_nuq=True but val_midpoints is None")
+        val_mid = val_midpoints
+    else:
+        val_mid = midpoints
     value_nuq_flag = 1 if value_nuq else 0
 
     # KVQ-3 outlier side-channel: pick the top-|v| elements per (token, head)

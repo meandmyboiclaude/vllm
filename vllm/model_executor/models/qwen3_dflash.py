@@ -490,21 +490,24 @@ class DFlashQwen3Model(nn.Module):
         self._hidden_norm_weight = self.hidden_norm.weight.data
 
         # KV projection weights: [num_layers * 2 * kv_size, hidden_size].
-        # Dequantize quantized qkv weights to the activation dtype (the
-        # canonical helper returns the weights in [out, in] layout) so the
-        # fused ``F.linear`` in ``_project_context_kv`` works for quantized
-        # drafters.  The buffers are built lazily on first use (after
+        # Dequantize quantized qkv weights to the model's activation dtype
+        # (derived from the unquantized norm weight, so bf16 models stay bf16
+        # and fp16 models stay fp16; the canonical helper returns the weights
+        # in [out, in] layout) so the fused ``F.linear`` in
+        # ``_project_context_kv`` works for quantized drafters.  The buffers
+        # are built lazily on first use (after
         # ``process_weights_after_loading``), so quantized weights are in
         # their final layout and every quant scheme is supported.
+        kv_dtype = self._hidden_norm_weight.dtype
         kv_weights = [
-            get_and_maybe_dequant_weights(
-                a.qkv_proj, out_dtype=torch.bfloat16
-            )[a.q_size:]
+            get_and_maybe_dequant_weights(a.qkv_proj, out_dtype=kv_dtype)[a.q_size :]
             for a in layers_attn
         ]
         self._fused_kv_weight = torch.cat(kv_weights, dim=0)
         if has_bias:
-            kv_biases = [a.qkv_proj.bias[a.q_size :] for a in layers_attn]
+            kv_biases = [
+                a.qkv_proj.bias[a.q_size :].to(kv_dtype) for a in layers_attn
+            ]
             self._fused_kv_bias: torch.Tensor | None = torch.cat(kv_biases, dim=0)
         else:
             self._fused_kv_bias = None
@@ -888,7 +891,11 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
         # after the loader has run ``process_weights_after_loading`` on every
         # layer, so that ``get_and_maybe_dequant_weights`` sees quantized
         # weights in their final layout (this is required for the fused-KV
-        # path to support quantized drafters).
+        # path to support quantized drafters).  A weight reload must drop any
+        # previously built buffers so the next use rebuilds them from the
+        # fresh weights.
+        if hasattr(self.model, "_num_attn_layers"):
+            del self.model._num_attn_layers
 
     def _read_mask_embedding(self) -> torch.Tensor | None:
         """Checks for an override mask embedding in `mask_embedding.pt` and returns it.
