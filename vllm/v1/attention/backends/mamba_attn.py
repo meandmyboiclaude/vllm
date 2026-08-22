@@ -121,6 +121,9 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
         # L = B + max_spec_len history window; physical pow2 ring = next_pow2(L).
         self.spec_flush_threshold = self.max_cache_len + self.max_spec_len
         self.spec_cache_buf_len = 1 << (self.spec_flush_threshold - 1).bit_length()
+        # True while build_for_cudagraph_capture drives build(): the V2
+        # runner's capture dummy carries no CPU decode-base/computed counts.
+        self._capturing: bool = False
 
         scheduler_config = vllm_config.scheduler_config
         self.decode_cudagraph_max_bs: int = scheduler_config.max_num_seqs
@@ -305,12 +308,16 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
                 device=m.query_start_loc.device,
             )
 
-        return self.build(
-            0,
-            m,
-            num_accepted_tokens=num_accepted_tokens,
-            prev_last_scheduled_idx=prev_last_scheduled_idx,
-        )
+        self._capturing = True
+        try:
+            return self.build(
+                0,
+                m,
+                num_accepted_tokens=num_accepted_tokens,
+                prev_last_scheduled_idx=prev_last_scheduled_idx,
+            )
+        finally:
+            self._capturing = False
 
     def build(
         self,
@@ -656,58 +663,78 @@ class BaseMambaAttentionMetadataBuilder(AttentionMetadataBuilder[M], abc.ABC):
 
         if self.use_cached_kernel and num_decodes > 0:
             decode_base_cpu = common_attn_metadata.replayssm_decode_base_cpu
+            if decode_base_cpu is None:
+                # The V2 runner keeps no decode-base buffer; its prompt-length
+                # column carries the same anchor (prefill length at
+                # (re)admission, see mamba_hybrid.py), so a resumed request
+                # still re-anchors past its replayed output. Matches the GDN
+                # cached-decode path on that runner.
+                decode_base_cpu = common_attn_metadata.num_prompt_tokens_cpu
             num_computed_tokens_cpu = common_attn_metadata._num_computed_tokens_cpu
             if decode_base_cpu is None or num_computed_tokens_cpu is None:
-                raise ValueError(
-                    "--use-replayssm requires CPU decode-base and "
-                    "computed-token counts to derive decode write positions"
-                )
-            num_computed_d = num_computed_tokens_cpu[:num_decodes]
-            decode_base_d = decode_base_cpu[:num_decodes]
-            align_mode = self.vllm_config.cache_config.mamba_cache_mode == "align"
-            block_size = self.kv_cache_spec.block_size
-            if align_mode:
-                # After a boundary the align copy leaves an exact checkpoint at
-                # the block start and the new block's ring restarts empty, so
-                # re-anchor there; max() keeps the prompt-end anchor for the
-                # first (partial) block.
-                effective_base = torch.maximum(
-                    decode_base_d, (num_computed_d // block_size) * block_size
-                )
+                if not self._capturing:
+                    raise ValueError(
+                        "--use-replayssm requires CPU decode-base (or prompt "
+                        "length) and computed-token counts to derive decode "
+                        "write positions"
+                    )
+                # Capture dummy: the graph records only the staged buffers'
+                # addresses (decode_write_pos_d / decode_is_flush_d); every
+                # replay refills them from a real batch, so zeros suffice.
+                write_pos_cpu = torch.zeros(num_decodes, dtype=torch.int32)
+                is_flush_cpu = torch.zeros(num_decodes, dtype=torch.int8)
             else:
-                effective_base = decode_base_d
-            # write_pos counts decode steps since the ring's last full-state
-            # write (the anchor), so a resumed request re-anchors correctly.
-            decode_steps_cpu = num_computed_d - effective_base
-            query_lens_cpu = (
-                common_attn_metadata.query_start_loc_cpu[1 : num_decodes + 1]
-                - common_attn_metadata.query_start_loc_cpu[:num_decodes]
-            )
-            valid_decode_rows = query_lens_cpu > 0
-            # A single-token prefill row replayed as decode (query_len==1 with
-            # prior state) has decode_steps < 0; force it to a one-token flush
-            # (write_pos=0, is_flush=1). The flush branch reads an empty history
-            # window, so it applies exactly one recurrence step off the checkpoint
-            # -- identical to the baseline decode kernel for that row. The split
-            # (treat_short_extends_as_decodes=False) admits only such rows here.
-            leftover_prompt = valid_decode_rows & (decode_steps_cpu < 0)
-            decode_steps_cpu = torch.where(
-                valid_decode_rows & ~leftover_prompt,
-                decode_steps_cpu,
-                torch.zeros_like(decode_steps_cpu),
-            )
-            write_pos_cpu = torch.remainder(decode_steps_cpu, self.max_cache_len)
-            is_flush_cpu = (
-                write_pos_cpu == self.max_cache_len - 1
-            ) | leftover_prompt
-            if align_mode:
-                # Force a flush on the step completing a mamba block so the exact
-                # boundary state is materialized for prefix caching.
-                is_flush_cpu = is_flush_cpu | (
-                    valid_decode_rows
-                    & ((num_computed_d + query_lens_cpu) % block_size == 0)
+                num_computed_d = num_computed_tokens_cpu[:num_decodes]
+                decode_base_d = decode_base_cpu[:num_decodes]
+                align_mode = (
+                    self.vllm_config.cache_config.mamba_cache_mode == "align"
                 )
-            is_flush_cpu = is_flush_cpu.to(torch.int8)
+                block_size = self.kv_cache_spec.block_size
+                if align_mode:
+                    # After a boundary the align copy leaves an exact checkpoint
+                    # at the block start and the new block's ring restarts
+                    # empty, so re-anchor there; max() keeps the prompt-end
+                    # anchor for the first (partial) block.
+                    effective_base = torch.maximum(
+                        decode_base_d, (num_computed_d // block_size) * block_size
+                    )
+                else:
+                    effective_base = decode_base_d
+                # write_pos counts decode steps since the ring's last full-state
+                # write (the anchor), so a resumed request re-anchors correctly.
+                decode_steps_cpu = num_computed_d - effective_base
+                query_lens_cpu = (
+                    common_attn_metadata.query_start_loc_cpu[1 : num_decodes + 1]
+                    - common_attn_metadata.query_start_loc_cpu[:num_decodes]
+                )
+                valid_decode_rows = query_lens_cpu > 0
+                # A single-token prefill row replayed as decode (query_len==1
+                # with prior state) has decode_steps < 0; force it to a
+                # one-token flush (write_pos=0, is_flush=1). The flush branch
+                # reads an empty history window, so it applies exactly one
+                # recurrence step off the checkpoint -- identical to the
+                # baseline decode kernel for that row. The split
+                # (treat_short_extends_as_decodes=False) admits only such rows.
+                leftover_prompt = valid_decode_rows & (decode_steps_cpu < 0)
+                decode_steps_cpu = torch.where(
+                    valid_decode_rows & ~leftover_prompt,
+                    decode_steps_cpu,
+                    torch.zeros_like(decode_steps_cpu),
+                )
+                write_pos_cpu = torch.remainder(
+                    decode_steps_cpu, self.max_cache_len
+                )
+                is_flush_cpu = (
+                    write_pos_cpu == self.max_cache_len - 1
+                ) | leftover_prompt
+                if align_mode:
+                    # Force a flush on the step completing a mamba block so the
+                    # exact boundary state is materialized for prefix caching.
+                    is_flush_cpu = is_flush_cpu | (
+                        valid_decode_rows
+                        & ((num_computed_d + query_lens_cpu) % block_size == 0)
+                    )
+                is_flush_cpu = is_flush_cpu.to(torch.int8)
             write_pos_d = async_tensor_h2d(
                 write_pos_cpu.to(torch.int32).tolist(),
                 dtype=torch.int32,

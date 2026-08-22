@@ -52,19 +52,36 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
 
     def get_state_dtype(self) -> tuple[torch.dtype, ...]:
         if self.cache_config.use_replayssm_spec:
-            return MambaStateDtypeCalculator.gated_delta_net_replayssm_spec_state_dtype(
-                self.model_config.dtype,
-                self.cache_config.mamba_cache_dtype,
-                self.cache_config.mamba_ssm_cache_dtype,
+            dtypes = (
+                MambaStateDtypeCalculator.gated_delta_net_replayssm_spec_state_dtype(
+                    self.model_config.dtype,
+                    self.cache_config.mamba_cache_dtype,
+                    self.cache_config.mamba_ssm_cache_dtype,
+                )
             )
         elif self.cache_config.use_replayssm:
-            return MambaStateDtypeCalculator.gated_delta_net_replayssm_state_dtype(
+            dtypes = MambaStateDtypeCalculator.gated_delta_net_replayssm_state_dtype(
                 self.model_config.dtype,
                 self.cache_config.mamba_cache_dtype,
                 self.cache_config.mamba_ssm_cache_dtype,
             )
-        return MambaStateDtypeCalculator.gated_delta_net_state_dtype(
-            self.model_config.dtype,
-            self.cache_config.mamba_cache_dtype,
-            self.cache_config.mamba_ssm_cache_dtype,
-        )
+        else:
+            return MambaStateDtypeCalculator.gated_delta_net_state_dtype(
+                self.model_config.dtype,
+                self.cache_config.mamba_cache_dtype,
+                self.cache_config.mamba_ssm_cache_dtype,
+            )
+        # The ReplaySSM dtype tuples above carry the ring-cache entries
+        # (d/k/g) beyond the baseline (conv, ssm). A subclass whose
+        # get_state_shape lacks the matching ReplaySSM branches would have
+        # those entries silently zip-truncated out of page sizing and
+        # bind_kv_cache, so fail loudly at spec-build time instead.
+        shapes = tuple(self.get_state_shape())
+        if len(shapes) != len(dtypes):
+            raise ValueError(
+                f"{type(self).__name__}.get_state_shape() returned "
+                f"{len(shapes)} states but the ReplaySSM dtype tuple has "
+                f"{len(dtypes)} entries; the subclass is missing the "
+                "matching ReplaySSM branches in get_state_shape."
+            )
+        return dtypes

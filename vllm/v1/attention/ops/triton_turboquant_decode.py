@@ -680,8 +680,14 @@ def triton_turboquant_decode_attention(
     else:
         # BUG-199: shared per-device cache, dtype-checked (out_dtype can vary).
         _c = getattr(_shared, "_tq_output_buf", None)
-        if _c is not None and _c.shape[0] >= B and _c.shape[1] >= Hq and _c.dtype == out_dtype:
-            output = _c[:B, :Hq]
+        if (
+            _c is not None
+            and _c.shape[0] >= B
+            and _c.shape[1] >= Hq
+            and _c.shape[2] >= D
+            and _c.dtype == out_dtype
+        ):
+            output = _c[:B, :Hq, :D]
         else:
             output = torch.empty(B, Hq, D, dtype=out_dtype, device=device)
             _shared._tq_output_buf = output

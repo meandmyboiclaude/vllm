@@ -328,6 +328,26 @@ def _copy_and_expand_dflash_inputs_kernel_impl(
         )
 
 
+# Keep in sync with the constants in vllm/v1/sample/rejection_sampler.py.
+# Imported literally to avoid an import cycle through vllm.triton_utils.
+_PLACEHOLDER_TOKEN_ID = -1
+_NO_THINK_BOUNDARY_TOKEN_ID = -2
+_FP32_RECOVERY_EPS = float.fromhex("0x1p-24")
+_FP64_RECOVERY_EPS = float.fromhex("0x1p-64")
+
+
+def _reconstruct_target_probs(target_logits, target_max, target_inv_sum):
+    """Rebuild dense float32 target probabilities from online-softmax state.
+
+    The Triton rejection kernels consume ``target_logits`` with per-row
+    ``target_max``/``target_inv_sum`` normalization state; the C++ CPU
+    kernels predate that and expect materialized probabilities.
+    """
+    return torch.exp(
+        target_logits.float() - target_max.float().unsqueeze(-1)
+    ) * target_inv_sum.float().unsqueeze(-1)
+
+
 def _rejection_greedy_sample_kernel_impl(
     output_token_ids,
     cu_num_draft_tokens,
@@ -336,6 +356,8 @@ def _rejection_greedy_sample_kernel_impl(
     bonus_token_ids,
     is_greedy,
     max_spec_len,
+    think_start_token_id=_NO_THINK_BOUNDARY_TOKEN_ID,
+    think_end_token_id=_NO_THINK_BOUNDARY_TOKEN_ID,
     uniform_probs=None,
     synthetic_conditional_rates=None,
     SYNTHETIC_MODE=False,
@@ -348,17 +370,83 @@ def _rejection_greedy_sample_kernel_impl(
     assert not SYNTHETIC_MODE, "Synthetic acceptance not supported with CPU sampling"
     orig_dtype = output_token_ids.dtype
     output_token_ids_i64 = _ensure_int64(output_token_ids)
+    cu_num_draft_tokens_i64 = _ensure_int64(cu_num_draft_tokens)
+    draft_token_ids_i64 = _ensure_int64(draft_token_ids)
+    target_argmax_i64 = _ensure_int64(target_argmax)
     torch.ops._C.rejection_greedy_sample_kernel_impl(
         output_token_ids_i64,
-        _ensure_int64(cu_num_draft_tokens),
-        _ensure_int64(draft_token_ids),
-        _ensure_int64(target_argmax),
+        cu_num_draft_tokens_i64,
+        draft_token_ids_i64,
+        target_argmax_i64,
         _ensure_int64(bonus_token_ids),
         is_greedy,
         max_spec_len,
     )
+    if (
+        think_start_token_id != _NO_THINK_BOUNDARY_TOKEN_ID
+        or think_end_token_id != _NO_THINK_BOUNDARY_TOKEN_ID
+    ):
+        # The Triton kernel stops speculation after an accepted thinking
+        # boundary token; the C++ kernel predates the feature, so apply the
+        # same truncation to its output here.
+        start_idx = 0
+        for req_idx in range(cu_num_draft_tokens_i64.numel()):
+            end_idx = int(cu_num_draft_tokens_i64[req_idx].item())
+            if is_greedy is None or bool(is_greedy[req_idx].item()):
+                for pos in range(end_idx - start_idx):
+                    draft_id = int(draft_token_ids_i64[start_idx + pos].item())
+                    if draft_id != int(target_argmax_i64[start_idx + pos].item()):
+                        break
+                    if draft_id in (think_start_token_id, think_end_token_id):
+                        output_token_ids_i64[req_idx, pos + 1 :] = (
+                            _PLACEHOLDER_TOKEN_ID
+                        )
+                        break
+            start_idx = end_idx
     if orig_dtype != torch.int64:
         output_token_ids.copy_(output_token_ids_i64.to(orig_dtype))
+
+
+def _sample_lazy_recovered_tokens(
+    draft_token_ids_i64,
+    draft_probs,
+    target_probs,
+    recovery_seeds,
+    vocab_size,
+    no_draft_probs,
+    use_fp64_gumbel,
+):
+    """Eagerly reproduce the Triton kernel's lazy exponential-race recovery.
+
+    Scores every vocab entry as ``adjusted_prob / Exp(1)`` with noise drawn
+    from the token's recovery seed and takes the argmax, falling back to the
+    target argmax when every adjusted probability is zero. torch's CPU
+    Philox stream differs from Triton's, so results match the recovery
+    distribution per seed, not bit-for-bit.
+    """
+    num_tokens = target_probs.shape[0]
+    recovered = torch.zeros(num_tokens, dtype=torch.int64)
+    noise_dtype = torch.float64 if use_fp64_gumbel else torch.float32
+    eps = _FP64_RECOVERY_EPS if use_fp64_gumbel else _FP32_RECOVERY_EPS
+    generator = torch.Generator(device="cpu")
+    for token_idx in range(num_tokens):
+        token_target = target_probs[token_idx]
+        if no_draft_probs:
+            prob = token_target.clone()
+            prob[draft_token_ids_i64[token_idx]] = 0.0
+        else:
+            prob = (token_target - draft_probs[token_idx].float()).clamp_(min=0.0)
+        generator.manual_seed(int(recovery_seeds[token_idx].item()))
+        u = torch.rand(vocab_size, dtype=noise_dtype, generator=generator)
+        noise = (-torch.log1p(-u)).clamp_(min=eps)
+        score = prob.to(noise_dtype) / noise
+        score[prob <= 0.0] = 0.0
+        best_id = int(score.argmax().item())
+        if score[best_id] > 0.0:
+            recovered[token_idx] = best_id
+        else:
+            recovered[token_idx] = token_target.argmax()
+    return recovered
 
 
 def _rejection_random_sample_kernel_impl(
@@ -366,18 +454,25 @@ def _rejection_random_sample_kernel_impl(
     cu_num_draft_tokens,
     draft_token_ids,
     draft_probs,
-    target_probs,
+    target_logits,
+    target_max,
+    target_inv_sum,
     bonus_token_ids,
-    recovered_token_ids,
+    recovery_seeds,
     uniform_probs,
     is_greedy,
     max_spec_len,
     vocab_size,
     synthetic_conditional_rates=None,
+    BLOCK_SIZE=None,
     NO_DRAFT_PROBS=False,
     SYNTHETIC_MODE=False,
+    USE_FP64_GUMBEL=False,
 ):
-    # C++ kernel expects int64 for all integer tensors and float32 for probs.
+    # The C++ CPU kernel keeps the eager-recovery calling convention: dense
+    # float32 target probabilities plus precomputed recovered token ids. The
+    # Triton kernel consumes online-softmax state with lazy in-kernel
+    # recovery, so rebuild both eager inputs before dispatching.
     # uniform_probs is intentionally float64 in Python to avoid exact-zero
     # samples; cast to float32 here for C++ compatibility.
     # Note: synthetic_conditional_rates and SYNTHETIC_MODE are passed by the
@@ -387,15 +482,38 @@ def _rejection_random_sample_kernel_impl(
     assert not SYNTHETIC_MODE, "Synthetic acceptance not supported with CPU sampling"
     orig_dtype = output_token_ids.dtype
     output_token_ids_i64 = _ensure_int64(output_token_ids)
+    draft_token_ids_i64 = _ensure_int64(draft_token_ids)
+    target_probs = _reconstruct_target_probs(target_logits, target_max, target_inv_sum)
+    uniform_probs_f32 = uniform_probs.to(torch.float32)
+    padded = draft_token_ids_i64 < 0
+    if bool(padded.any()):
+        # The Triton kernel rejects padded (-1) draft ids outright; the C++
+        # kernel would index target_probs with them, so clamp the id and
+        # force the rejection through an unreachable uniform threshold.
+        draft_token_ids_i64 = torch.where(
+            padded, torch.zeros_like(draft_token_ids_i64), draft_token_ids_i64
+        )
+        if uniform_probs_f32 is uniform_probs:
+            uniform_probs_f32 = uniform_probs_f32.clone()
+        uniform_probs_f32[padded] = float("inf")
+    recovered_token_ids = _sample_lazy_recovered_tokens(
+        draft_token_ids_i64,
+        draft_probs,
+        target_probs,
+        recovery_seeds,
+        vocab_size,
+        NO_DRAFT_PROBS,
+        USE_FP64_GUMBEL,
+    )
     torch.ops._C.rejection_random_sample_kernel_impl(
         output_token_ids_i64,
         _ensure_int64(cu_num_draft_tokens),
-        _ensure_int64(draft_token_ids),
+        draft_token_ids_i64,
         draft_probs,
         target_probs,
         _ensure_int64(bonus_token_ids),
-        _ensure_int64(recovered_token_ids),
-        uniform_probs.to(torch.float32),
+        recovered_token_ids,
+        uniform_probs_f32,
         is_greedy,
         max_spec_len,
         vocab_size,
@@ -427,7 +545,9 @@ def _sample_recovered_tokens_kernel_impl(
     cu_num_draft_tokens,
     draft_token_ids,
     draft_probs,
-    target_probs,
+    target_logits,
+    target_max,
+    target_inv_sum,
     inv_q,
     vocab_size,
     BLOCK_SIZE=None,
@@ -438,7 +558,9 @@ def _sample_recovered_tokens_kernel_impl(
     # has already applied to `inv_q` (fp64 vs fp32). The CPU kernel consumes
     # `inv_q` directly, so the flag is accepted for interface parity and the
     # value is read at its existing dtype.
-    # C++ reads integer tensors as int64_t*; ensure correct dtype.
+    # C++ reads integer tensors as int64_t*; ensure correct dtype. The C++
+    # kernel also predates the online-softmax state, so materialize dense
+    # target probabilities from it.
     orig_dtype = output_token_ids.dtype
     output_i64 = _ensure_int64(output_token_ids)
     torch.ops._C.sample_recovered_tokens_kernel_impl(
@@ -446,7 +568,7 @@ def _sample_recovered_tokens_kernel_impl(
         _ensure_int64(cu_num_draft_tokens),
         _ensure_int64(draft_token_ids),
         draft_probs,
-        target_probs,
+        _reconstruct_target_probs(target_logits, target_max, target_inv_sum),
         # C++ kernel reads inv_q as float32.
         inv_q.to(torch.float32),
         vocab_size,
