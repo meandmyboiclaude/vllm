@@ -1665,7 +1665,14 @@ class GPUModelRunner(
 
             assert self.num_accepted_tokens_event is not None
             self.num_accepted_tokens_event.record()
-        elif self.cache_config.mamba_cache_mode == "none":
+        elif (
+            self.cache_config.mamba_cache_mode == "none"
+            and not self.use_async_scheduling
+        ):
+            # NOTE: gated off under async scheduling — the normalized CPU
+            # accepted-counts this publishes are discarded there (the true
+            # counts are restored on GPU next step), so running it would
+            # re-apply token_bias to an already-migrated state.
             # "none" mode: the spec-decode GDN/mamba kernels leave the
             # accepted state at block-table column num_accepted-1 (conv:
             # window offset num_accepted-1), but the non-spec decode path

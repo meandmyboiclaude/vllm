@@ -767,9 +767,11 @@ def profile_cudagraph_memory(runner: "GPUModelRunner") -> int:
     finally:
         compilation_counter.num_cudagraph_captured = saved_num_cudagraph_captured
         compilation_counter.num_gpu_runner_capture_triggers = saved_capture_triggers
-        _teardown_profiling_state(runner)
+        # Destroy wrapper-owned graphs BEFORE the teardown's allocator flush,
+        # or their private-pool memory is never returned.
         CUDAGraphWrapper.clear_all_graphs()
         BreakableCUDAGraphWrapper.clear_all_graphs()
+        _teardown_profiling_state(runner)
 
 
 def _extrapolate_full_graph_memory(mem_samples: list[int], total_graphs: int) -> int:
@@ -822,6 +824,11 @@ def _teardown_profiling_state(runner: "GPUModelRunner") -> None:
         del runner.kv_cache_config
     # Dropping the manager releases the profiling graphs and throwaway pool.
     runner.cudagraph_manager = None
+    # Release drafter graphs captured during profiling too; the real
+    # capture_model() re-initializes the speculator's manager and re-captures.
+    speculator = getattr(runner, "speculator", None)
+    if speculator is not None and hasattr(speculator, "query_cudagraph_manager"):
+        speculator.query_cudagraph_manager = None
     # Release encoder graphs captured during profiling; the real
     # capture_model() re-captures them.
     if runner.model_state.supports_mm_inputs:

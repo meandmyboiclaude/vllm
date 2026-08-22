@@ -1073,7 +1073,10 @@ def _commensurate_padded_block_size(
     group block sizes is unchanged), is a multiple of the layer's current
     kernel-aligned block size, and whose natural page fits in
     ``max_page_size``. ``None`` if no such size exists."""
-    per_token_bytes = layer_spec.real_page_size_bytes // layer_spec.block_size
+    # Same basis as the padded-spec validity check (unpadded page bytes), so
+    # a TQ-style spec whose real and unpadded page sizes diverge can never
+    # pick a block whose dense page overflows the shared page.
+    per_token_bytes = layer_spec.unpadded_page_size_bytes // layer_spec.block_size
     cap = min(base_block_lcm, max_page_size // per_token_bytes)
     for candidate in range(cap, 0, -1):
         if base_block_lcm % candidate == 0 and candidate % layer_spec.block_size == 0:

@@ -53,6 +53,10 @@ class KVQuantMode(IntEnum):
     TURBOQUANT_4BIT_NC = 7
     TURBOQUANT_K3V4_NC = 8
     TURBOQUANT_3BIT_NC = 9
+    TURBOQUANT_3BIT_NUQV = 10
+    TURBOQUANT_3BIT_NUQV_SINK32 = 11
+    TURBOQUANT_3BIT_NUQV_OUT1 = 12
+    TURBOQUANT_3BIT_NUQV_OUT1_SINK32 = 13
 
     @property
     def is_per_token_head(self) -> bool:
@@ -76,6 +80,10 @@ class KVQuantMode(IntEnum):
             KVQuantMode.TURBOQUANT_4BIT_NC,
             KVQuantMode.TURBOQUANT_K3V4_NC,
             KVQuantMode.TURBOQUANT_3BIT_NC,
+            KVQuantMode.TURBOQUANT_3BIT_NUQV,
+            KVQuantMode.TURBOQUANT_3BIT_NUQV_SINK32,
+            KVQuantMode.TURBOQUANT_3BIT_NUQV_OUT1,
+            KVQuantMode.TURBOQUANT_3BIT_NUQV_OUT1_SINK32,
         )
 
 
