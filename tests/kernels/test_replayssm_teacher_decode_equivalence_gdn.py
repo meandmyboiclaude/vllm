@@ -31,12 +31,12 @@ ReplaySSM's stored checkpoint is the full final state.
 import pytest
 import torch
 
-from vllm.model_executor.layers.fla.ops import (
+from vllm.third_party.flash_linear_attention.ops import (
     chunk_gated_delta_rule,
     fused_recurrent_gated_delta_rule_packed_decode,
     fused_recurrent_gated_delta_rule_replayssm,
 )
-from vllm.model_executor.layers.fla.ops.fused_gdn_prefill_post_conv import (
+from vllm.third_party.flash_linear_attention.ops.fused_gdn_prefill_post_conv import (
     fused_post_conv_prep,
 )
 from vllm.utils.torch_utils import set_random_seed
