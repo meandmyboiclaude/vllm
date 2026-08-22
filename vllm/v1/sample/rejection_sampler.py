@@ -920,13 +920,17 @@ def compute_target_normalization(
         )
         return target_max, target_inv_sum
 
-    target_max = torch.max(target_logits, dim=-1).values
+    # Match the Triton kernel (and the previous eager softmax, which used
+    # dtype=torch.float32): accumulate the state in float32 even when the
+    # logits arrive in a lower precision.
+    target_logits_f32 = target_logits.float()
+    target_max = torch.max(target_logits_f32, dim=-1).values
     finite_target_max = torch.where(
         torch.isfinite(target_max), target_max, torch.zeros_like(target_max)
     )
-    normalized_sum = torch.exp(target_logits - finite_target_max.unsqueeze(-1)).sum(
-        dim=-1
-    )
+    normalized_sum = torch.exp(
+        target_logits_f32 - finite_target_max.unsqueeze(-1)
+    ).sum(dim=-1)
     return target_max, normalized_sum.reciprocal()
 
 

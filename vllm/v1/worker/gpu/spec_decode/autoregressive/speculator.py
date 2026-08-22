@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from typing import Any
 
-import numpy as np
 import torch
 import torch.nn as nn
 
@@ -39,6 +38,18 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         self.last_token_indices = torch.zeros(
             self.max_num_reqs, dtype=torch.int64, device=device
         )
+
+        # Nonzero rows mask draft KV writes for requests without lookahead
+        # slots (carried #48244). Persistent buffers keep the device pointer
+        # stable for captured fused decode graphs and avoid a per-step pinned
+        # host allocation.
+        self.skip_kv_write_rows = torch.zeros(
+            self.max_num_reqs, dtype=torch.int8, device=device
+        )
+        self.skip_kv_write_rows_cpu = torch.zeros(
+            self.max_num_reqs, dtype=torch.int8, device="cpu", pin_memory=True
+        )
+        self._skip_rows_dirty = False
 
         self.inputs_embeds: torch.Tensor | None = None
 
@@ -156,6 +167,8 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         # dummy runs to cause out-of-bounds indexing during capture.
         self.last_token_indices.zero_()
         self.idx_mapping.zero_()
+        self.skip_kv_write_rows.zero_()
+        self._skip_rows_dirty = False
 
         # Capture the prefill routine (model forward + compute_logits +
         # sample).
@@ -362,33 +375,34 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
 
         self.on_multi_step_decode_begin(num_reqs)
 
-        # Mask draft KV writes for requests without lookahead slots.
-        skip_rows = None
+        # Mask draft KV writes for requests without lookahead slots. Both
+        # decode paths read self.skip_kv_write_rows: captured fused graphs
+        # bake its pointer in at capture time and see fresh values on replay.
+        # Rows are zeroed again once no request needs masking.
         if no_draft_mask is not None and no_draft_mask.any():
-            skip_rows = async_copy_to_gpu(
-                no_draft_mask.astype(np.int8), device=self.device
+            self.skip_kv_write_rows_cpu.numpy()[:num_reqs] = no_draft_mask
+            async_copy_to_gpu(
+                self.skip_kv_write_rows_cpu[:num_reqs],
+                out=self.skip_kv_write_rows[:num_reqs],
             )
+            self._skip_rows_dirty = True
+        elif self._skip_rows_dirty:
+            self.skip_kv_write_rows.zero_()
+            self._skip_rows_dirty = False
 
         # Generate the remaining num_speculative_steps - 1 draft tokens.
-        # The fused implementation has no skip_rows support; steps that must
-        # mask draft KV writes (carried #48244) take the unfused path.
-        if self.use_fused_multi_step_decode and skip_rows is None:
-            self._fused_multi_step_decode(
-                num_reqs,
-                dummy_run and skip_attn_for_dummy_run,
-                decode_batch_desc,
-                num_tokens_across_dp,
-                input_batch.seq_lens_cpu_upper_bound,
-            )
-        else:
-            self._multi_step_decode(
-                num_reqs,
-                dummy_run and skip_attn_for_dummy_run,
-                decode_batch_desc,
-                num_tokens_across_dp,
-                input_batch.seq_lens_cpu_upper_bound,
-                skip_rows=skip_rows,
-            )
+        decode_fn = (
+            self._fused_multi_step_decode
+            if self.use_fused_multi_step_decode
+            else self._multi_step_decode
+        )
+        decode_fn(
+            num_reqs,
+            dummy_run and skip_attn_for_dummy_run,
+            decode_batch_desc,
+            num_tokens_across_dp,
+            input_batch.seq_lens_cpu_upper_bound,
+        )
         self.on_multi_step_decode_end(num_reqs)
 
         return self.draft_tokens[:num_reqs]
@@ -504,7 +518,6 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         batch_desc: BatchExecutionDescriptor,
         num_tokens_across_dp: torch.Tensor | None,
         seq_lens_cpu_upper_bound: torch.Tensor,
-        skip_rows: torch.Tensor | None = None,
     ) -> None:
         positions = self.input_buffers.positions[:num_reqs]
         query_start_loc = self.input_buffers.query_start_loc[: num_reqs + 1]
@@ -521,7 +534,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
                     query_start_loc,
                     positions,
                     batch_desc.num_tokens,
-                    skip_rows=skip_rows,
+                    skip_rows=self.skip_kv_write_rows,
                 )
                 slot_mappings_by_layer = build_slot_mappings_by_layer(
                     slot_mappings, self.kv_cache_config
@@ -569,6 +582,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
                 query_start_loc,
                 positions,
                 batch_desc.num_tokens,
+                skip_rows=self.skip_kv_write_rows,
             )
             if batch_desc.cg_mode != CUDAGraphMode.FULL:
                 slot_mappings_by_layer = build_slot_mappings_by_layer(
@@ -634,6 +648,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
                     query_start_loc,
                     positions,
                     num_tokens_padded,
+                    skip_rows=self.skip_kv_write_rows,
                 )
                 for attn_group in attn_groups:
                     attn_group.update_draft_decode_metadata(attn_metadata)

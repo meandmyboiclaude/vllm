@@ -35,7 +35,9 @@ class MambaBase(AttentionLayerBase):
         pages = kv_cache.squeeze(dim=(1, 2))
         states: list[torch.Tensor] = []
         offset = 0
-        for shape, dtype in zip(self.get_state_shape(), self.get_state_dtype()):
+        for shape, dtype in zip(
+            self.get_state_shape(), self.get_state_dtype(), strict=True
+        ):
             nbytes = prod(shape) * get_dtype_size(dtype)
             state = pages[:, offset : offset + nbytes].view(dtype)
             states.append(state.view(-1, *shape))
@@ -64,9 +66,17 @@ class MambaBase(AttentionLayerBase):
         mamba_block_size = vllm_config.cache_config.mamba_block_size
         assert mamba_block_size is not None
         page_size_padded = vllm_config.cache_config.mamba_page_size_padded
+        shapes = tuple(self.get_state_shape())
+        dtypes = self.get_state_dtype()
+        if len(shapes) != len(dtypes):
+            raise ValueError(
+                f"{type(self).__name__} returned {len(shapes)} state shapes "
+                f"but {len(dtypes)} state dtypes; page sizing would silently "
+                "drop the unmatched states."
+            )
         return MambaSpec(
-            shapes=tuple(self.get_state_shape()),
-            dtypes=self.get_state_dtype(),
+            shapes=shapes,
+            dtypes=dtypes,
             block_size=mamba_block_size,
             page_size_padded=page_size_padded,
             mamba_type=self.mamba_type,

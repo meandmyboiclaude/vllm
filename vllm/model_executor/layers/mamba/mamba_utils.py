@@ -305,10 +305,13 @@ class MambaStateShapeCalculator:
     ) -> tuple[tuple[int, ...], ...]:
         """Append the ReplaySSM ring shapes (x_cache, dt_cache, B_cache) to a
         base ``(conv, ssm)`` tuple. ``base_shapes[1]`` is the ssm shape
-        ``(nheads // tp, head_dim, state_size)``; B_cache uses the un-extended
-        ``n_groups``.
+        ``(nheads // tp, head_dim, state_size)``. B_cache uses the
+        head-shard-extended ``n_groups`` (the group count the decode kernel
+        actually writes per shard); extension is idempotent, so callers may
+        pass the raw or the already-extended value.
         """
         local_nheads, head_dim, state_size = base_shapes[1]
+        n_groups = n_groups + cls.extra_groups_for_head_shards(n_groups, tp_world_size)
         local_ngroups = divide(n_groups, tp_world_size)
         return (
             *base_shapes,
@@ -332,10 +335,9 @@ class MambaStateShapeCalculator:
     ) -> tuple[tuple[int, ...], ...]:
         """Mamba2 ReplaySSM state shapes: baseline ``(conv, ssm)`` plus the
         ring-buffer shapes ``x_cache``/``dt_cache``/``B_cache`` via
-        ``append_replayssm_ring``. Delegates to ``mamba2_state_shape`` for
-        ``(conv, ssm)`` so the ring buffers keep the un-extended ``n_groups``
-        (that method extends n_groups only in its own scope). Call only when
-        use_replayssm is on; must stay in sync with
+        ``append_replayssm_ring`` (which head-shard-extends ``n_groups``
+        idempotently, matching what the decode kernel writes per shard).
+        Call only when use_replayssm is on; must stay in sync with
         ``MambaMixer2.get_state_shape``.
         """
         base_shapes = cls.mamba2_state_shape(

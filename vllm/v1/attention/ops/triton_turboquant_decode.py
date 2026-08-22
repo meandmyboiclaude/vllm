@@ -36,6 +36,14 @@ def _use_fp8_e4b15(device: int = 0) -> int:
     return _FP8_E4B15[device]
 
 
+def _stream_capturing() -> bool:
+    """True while a CUDA graph capture is running on the current stream."""
+    return (
+        current_platform.is_cuda_alike()
+        and torch.cuda.is_current_stream_capturing()
+    )
+
+
 # ---------------------------------------------------------------------------
 # Stage 1: Fused TQ score + value accumulation (BLOCK_KV tiled)
 # ---------------------------------------------------------------------------
@@ -602,13 +610,22 @@ def triton_turboquant_decode_attention(
     n_outliers = int(value_outliers)
 
     _shared = shared_scratch(device.index or 0)
-    if mid_o_buf is None:
+    # CUDA graph capture must bypass the shared cache in both directions: a
+    # cached eager buffer baked into a graph is freed when a later, larger
+    # eager call replaces it (replay then dereferences freed memory), and a
+    # capture-pool allocation cached here would corrupt eager calls after
+    # capture. Capture-time misses allocate from the graph's private pool
+    # (replay-consistent) and are not retained; the FULL-graph path passes
+    # explicit fixed buffers and never reaches these fallbacks.
+    capturing = _stream_capturing()
+    if mid_o_buf is None and not capturing:
         mid_o_buf = getattr(_shared, "_tq_mid_o_buf", None)
     if (
         mid_o_buf is not None
         and mid_o_buf.shape[0] >= B
         and mid_o_buf.shape[2] >= NUM_KV_SPLITS
         and mid_o_buf.shape[1] >= Hq
+        and mid_o_buf.shape[3] >= D + 1
     ):
         mid_o = mid_o_buf[:B, :Hq, :NUM_KV_SPLITS, :]
     else:
@@ -622,7 +639,8 @@ def triton_turboquant_decode_attention(
             dtype=torch.float32,
             device=device,
         )
-        _shared._tq_mid_o_buf = mid_o
+        if not capturing:
+            _shared._tq_mid_o_buf = mid_o
 
     # Stage 1: split-KV tiled attention scoring + value accumulation
     fp8_e4b15 = _use_fp8_e4b15(device.index or 0)
@@ -674,12 +692,14 @@ def triton_turboquant_decode_attention(
     if (
         output_buf is not None
         and output_buf.shape[0] >= B
+        and output_buf.shape[1] >= Hq
+        and output_buf.shape[2] >= D
         and output_buf.dtype == out_dtype
     ):
         output = output_buf[:B, :Hq, :D]
     else:
         # BUG-199: shared per-device cache, dtype-checked (out_dtype can vary).
-        _c = getattr(_shared, "_tq_output_buf", None)
+        _c = None if capturing else getattr(_shared, "_tq_output_buf", None)
         if (
             _c is not None
             and _c.shape[0] >= B
@@ -690,16 +710,18 @@ def triton_turboquant_decode_attention(
             output = _c[:B, :Hq, :D]
         else:
             output = torch.empty(B, Hq, D, dtype=out_dtype, device=device)
-            _shared._tq_output_buf = output
-    if lse_buf is not None and lse_buf.shape[0] >= B:
+            if not capturing:
+                _shared._tq_output_buf = output
+    if lse_buf is not None and lse_buf.shape[0] >= B and lse_buf.shape[1] >= Hq:
         lse = lse_buf[:B, :Hq]
     else:
-        _c = getattr(_shared, "_tq_lse_buf", None)
+        _c = None if capturing else getattr(_shared, "_tq_lse_buf", None)
         if _c is not None and _c.shape[0] >= B and _c.shape[1] >= Hq:
             lse = _c[:B, :Hq]
         else:
             lse = torch.empty(B, Hq, dtype=torch.float32, device=device)
-            _shared._tq_lse_buf = lse
+            if not capturing:
+                _shared._tq_lse_buf = lse
 
     grid2 = (B, Hq)
     _fwd_kernel_stage2[grid2](

@@ -651,6 +651,10 @@ class TQFullAttentionSpec(FullAttentionSpec):
         assert all(s.tq_sink_tokens == specs[0].tq_sink_tokens for s in specs), (
             "All TQ layers in the same KV cache group must use the same sink policy."
         )
+        assert all(s.tq_sink_kv_bytes == specs[0].tq_sink_kv_bytes for s in specs), (
+            "All TQ layers in the same KV cache group must use the same sink "
+            "KV byte width."
+        )
         return replace(
             merged,
             tq_slot_size=specs[0].tq_slot_size,
