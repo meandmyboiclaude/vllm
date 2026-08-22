@@ -838,6 +838,7 @@ def test_draft_model_enables_async_scheduling_by_default():
 
     assert cfg.scheduler_config.async_scheduling is True
 
+
 def _relaxed_thinking_spec_config() -> SpeculativeConfig:
     return SpeculativeConfig(
         method="ngram_gpu",

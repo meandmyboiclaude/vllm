@@ -244,6 +244,7 @@ def test_mamba_align_split_when_block_exceeds_long_prefill_threshold():
 
     assert scheduled_chunks == [384, 128, 384, 128, 276]
 
+
 def test_mamba_align_split_stops_at_replay_boundary():
     """A prompt whose length is an exact multiple of block_size still gets a
     chunk end one block below it. Otherwise the only cached Mamba state sits

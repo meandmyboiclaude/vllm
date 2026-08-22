@@ -17,6 +17,7 @@ from tests.v1.attention.utils import (
 )
 from vllm.config import SpeculativeConfig
 from vllm.config.compilation import CUDAGraphMode
+from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.attention.backends.gdn_attn import (
     GDNAttentionMetadata,
     GDNAttentionMetadataBuilder,
@@ -159,9 +160,11 @@ def _build(
     num_decode_draft_tokens: list[int] | None = None,
     num_accepted_tokens: list[int] | None = None,
     is_prefilling: list[bool] | None = None,
+    common: CommonAttentionMetadata | None = None,
 ) -> GDNAttentionMetadata:
     """Build GDN attention metadata, optionally with spec-decode kwargs."""
-    common = create_common_attn_metadata(batch_spec, BLOCK_SIZE, DEVICE)
+    if common is None:
+        common = create_common_attn_metadata(batch_spec, BLOCK_SIZE, DEVICE)
     if is_prefilling is not None:
         common = common.replace(
             is_prefilling=torch.tensor(is_prefilling, dtype=torch.bool)
@@ -269,12 +272,19 @@ def test_zero_accepted_tokens_nulls_state_slots(full_cuda_graph: bool):
         full_cuda_graph=full_cuda_graph,
     )
     batch = BatchSpec(seq_lens=[80, 96], query_lens=[4, 4])
+    # NULL_BLOCK_ID is 0 and the helper draws random block ids from [0, 1000),
+    # so a live row can contain a genuine 0; pin the block table to non-null
+    # ids to keep the "live row untouched" check deterministic.
+    common = create_common_attn_metadata(batch, BLOCK_SIZE, DEVICE).replace(
+        block_table_tensor=torch.arange(1, 13, dtype=torch.int32).reshape(2, 6)
+    )
     # Row 0 is stale (its sampled tokens were discarded); row 1 is live.
     meta = _build(
         builder,
         batch,
         num_decode_draft_tokens=[3, 3],
         num_accepted_tokens=[0, 2],
+        common=common,
     )
 
     assert meta.spec_state_indices_tensor is not None
@@ -306,11 +316,15 @@ def test_zero_accepted_tokens_does_not_corrupt_block_table():
     common = create_common_attn_metadata(batch, BLOCK_SIZE, DEVICE)
     block_table_before = common.block_table_tensor.clone()
 
-    builder.build(
-        common_prefix_len=0,
-        common_attn_metadata=common,
-        num_decode_draft_tokens_cpu=torch.tensor([3, 3], dtype=torch.int32),
-        num_accepted_tokens=torch.tensor([0, 2], dtype=torch.int32, device=DEVICE),
+    # Go through _build: since #52297 the spec split is precomputed by the
+    # caller, so a bare build() with only the two spec kwargs leaves
+    # spec_sequence_masks None and never reaches the nulling code at all.
+    _build(
+        builder,
+        batch,
+        num_decode_draft_tokens=[3, 3],
+        num_accepted_tokens=[0, 2],
+        common=common,
     )
 
     torch.testing.assert_close(common.block_table_tensor, block_table_before)
@@ -406,7 +420,10 @@ def test_one_token_prefill_excludes_cudagraph_padding():
     assert meta.num_prefills == 1
     assert meta.num_prefill_tokens == 1
     assert meta.has_initial_state is not None
-    assert meta.has_initial_state.tolist() == [True, True, False]
+    # has_initial_state is batch-indexed and rides the staged batch_size-wide
+    # arrays into causal_conv1d_fn, which asserts size == (padded_batch,);
+    # the padding row is state-less, hence the trailing False.
+    assert meta.has_initial_state.tolist() == [True, True, False, False]
     assert meta.prefill_query_start_loc is not None
     assert meta.prefill_query_start_loc.tolist() == [0, 1]
     assert meta.prefill_state_indices is not None

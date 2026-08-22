@@ -16,10 +16,14 @@ def _run_sync(local_want_skip: bool, other_want_skip: bool) -> bool:
     all_reduce contribution simulated."""
 
     def fake_all_reduce(tensor, group=None):
+        # Row order packed by sync_cudagraph_and_dp_padding: num_tokens,
+        # cg_mode, uniform_token_count, max_query_len (-1 means None),
+        # want_skip_drafts. The flag lives in the last row, not row 3.
         tensor[0][1] = 8  # rank 1 num_tokens
         tensor[1][1] = CUDAGraphMode.NONE.value
         tensor[2][1] = 0
-        tensor[3][1] = int(other_want_skip)
+        tensor[3][1] = -1
+        tensor[4][1] = int(other_want_skip)
 
     desc = BatchExecutionDescriptor(
         cg_mode=CUDAGraphMode.NONE, num_tokens=4, num_reqs=2
