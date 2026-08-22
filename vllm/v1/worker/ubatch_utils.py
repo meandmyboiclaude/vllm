@@ -237,6 +237,18 @@ def _make_metadata_with_slice(
     block_table_tensor = attn_metadata.block_table_tensor[request_slice]
     slot_mapping = attn_metadata.slot_mapping[token_slice]
 
+    def slice_reqs(x):
+        return x[request_slice] if x is not None else None
+
+    # Re-key per-request doc ranges to the local row numbering of this slice.
+    mm_req_doc_ranges = None
+    if attn_metadata.mm_req_doc_ranges is not None:
+        mm_req_doc_ranges = {
+            req_idx - first_req: doc_ranges
+            for req_idx, doc_ranges in attn_metadata.mm_req_doc_ranges.items()
+            if first_req <= req_idx < request_slice.stop
+        }
+
     return CommonAttentionMetadata(
         query_start_loc=query_start_loc,
         query_start_loc_cpu=query_start_loc_cpu,
@@ -251,6 +263,19 @@ def _make_metadata_with_slice(
         num_prompt_tokens_cpu=num_prompt_tokens_cpu,
         _seq_lens_cpu=seq_lens_cpu,
         _num_computed_tokens_cpu=num_computed_tokens_cpu,
+        causal=attn_metadata.causal[request_slice]
+        if isinstance(attn_metadata.causal, torch.Tensor)
+        else attn_metadata.causal,
+        encoder_seq_lens=slice_reqs(attn_metadata.encoder_seq_lens),
+        encoder_seq_lens_cpu=slice_reqs(attn_metadata.encoder_seq_lens_cpu),
+        dcp_local_seq_lens=slice_reqs(attn_metadata.dcp_local_seq_lens),
+        dcp_local_seq_lens_cpu=slice_reqs(attn_metadata.dcp_local_seq_lens_cpu),
+        is_prefilling=slice_reqs(attn_metadata.is_prefilling),
+        rswa_prefix_lens=slice_reqs(attn_metadata.rswa_prefix_lens),
+        replayssm_decode_base_cpu=slice_reqs(
+            attn_metadata.replayssm_decode_base_cpu
+        ),
+        mm_req_doc_ranges=mm_req_doc_ranges,
         positions=attn_metadata.positions[token_slice]
         if attn_metadata.positions is not None
         else None,

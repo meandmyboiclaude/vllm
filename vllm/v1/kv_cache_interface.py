@@ -310,12 +310,21 @@ def compute_layout_strides(
     order = layout.stride_order
     padded_page_size = getattr(spec, "page_size_padded", None)
     if padded_page_size is not None:
-        assert kernel_block_size is None or kernel_block_size == spec.block_size, (
-            "Padded KV pages do not support kernel block splitting."
-        )
+        split = 1
+        if kernel_block_size is not None and kernel_block_size != spec.block_size:
+            # Kernel blocks subdivide the padded page; distribute the padding
+            # evenly across them so they stay uniformly strided while every
+            # manager block still starts at its padded page boundary.
+            split = spec.block_size // kernel_block_size
+            assert padded_page_size % split == 0, (
+                f"Padded page size ({padded_page_size} bytes) is not evenly "
+                f"divisible across the {split} kernel blocks of "
+                f"{kernel_block_size} tokens per KV cache block."
+            )
+            padded_page_size //= split
         page_grid_end = max(order.index(_DIM_L), order.index(_DIM_B)) + 1
         page_grid_shape = tuple(shape[dim] for dim in order[:page_grid_end])
-        assert prod(page_grid_shape) == num_layers * num_blocks, (
+        assert prod(page_grid_shape) == num_layers * num_blocks * split, (
             "Page padding requires dimensions outside the page tail to be L, B, "
             f"or singleton; got {layout.name} with shape {shape}."
         )
@@ -355,8 +364,24 @@ def create_kv_cache_views(
         # Kernel blocks subdivide a manager block into `ratio` equal pieces, so
         # they sit a constant stride apart only if a block is one dense page: no
         # padding at its end, and no other layer's page before the next block.
+        # A page-padded spec is the exception: its padding is distributed
+        # evenly across the kernel blocks, so each keeps 1/ratio of the padded
+        # page and manager blocks still start at padded page boundaries.
         dense_page_size = prod(compute_layer_kv_cache_shape_bytes(spec, 1)[1:])
-        if block_stride != dense_page_size:
+        padded_page_size = getattr(spec, "page_size_padded", None)
+        if padded_page_size is not None and block_stride == padded_page_size:
+            if padded_page_size % ratio != 0:
+                raise ValueError(
+                    f"Padded page size ({padded_page_size} bytes) is not "
+                    f"evenly divisible across the {ratio} kernel blocks of "
+                    f"{kernel_block_size} tokens per KV cache block."
+                )
+            assert prod(shape_bytes[1:]) <= padded_page_size // ratio, (
+                f"Kernel block content ({prod(shape_bytes[1:])} bytes) exceeds "
+                f"its share of the padded page ({padded_page_size // ratio} "
+                "bytes)."
+            )
+        elif block_stride != dense_page_size:
             raise ValueError(
                 f"The resolved KV cache layout ({layout.name}) does not store "
                 "blocks as dense, unpadded pages (block stride "

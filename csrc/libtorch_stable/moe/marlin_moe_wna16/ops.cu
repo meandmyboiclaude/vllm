@@ -702,6 +702,14 @@ torch::stable::Tensor moe_wna16_marlin_gemm(
                     ", size_n = ", size_n);
   } else {
     c = torch::stable::new_empty(a, {size_m * top_k, size_n}, c_dtype);
+    // cudagraph-replay safety: with use_atomic_add the kernel atomic-accumulates
+    // into c, so it must start at the additive identity (0). An uninitialized c is
+    // reused dirty across CUDA graph replays -> accumulation onto stale data ->
+    // NaN (same class as the dense marlin fix in
+    // csrc/libtorch_stable/quantization/marlin/marlin.cu).
+    if (use_atomic_add) {
+      torch::stable::zero_(c);
+    }
   }
 
   // Alloc C tmp buffer that is going to be used for the global reduce
@@ -713,6 +721,11 @@ torch::stable::Tensor moe_wna16_marlin_gemm(
         (long)sms * 4 * moe_block_size * MARLIN_NAMESPACE_NAME::max_thread_n);
     if (moe_block_size == 8) max_c_tmp_size *= 2;
     c_tmp = torch::stable::new_empty(a, {max_c_tmp_size}, kFloat);
+    // cudagraph-replay safety (DOMINANT root): the cross-CTA fp32 global reduce
+    // reads c_tmp partial slots; an uninitialized c_tmp is reused dirty across
+    // CUDA graph replays. Isolation on the dense path: dirty c_tmp -> 570
+    // NaN/1961 calls; zeroed -> 5/7762 (see quantization/marlin/marlin.cu).
+    torch::stable::zero_(c_tmp);
   } else {
     c_tmp = torch::stable::new_empty(a, {0}, kFloat);
   }

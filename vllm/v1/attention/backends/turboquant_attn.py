@@ -18,9 +18,9 @@ Per-head per-position slot layout:
 
 import contextlib
 import functools
-from types import SimpleNamespace
 import math
 from dataclasses import dataclass, replace
+from types import SimpleNamespace
 from typing import Any, ClassVar
 
 import torch
@@ -164,6 +164,10 @@ _TQ_SHARED_DECODE_SCRATCH = SimpleNamespace()
 def reset_tq_decode_scratch() -> None:
     """Release the shared decode scratch (called on model-runner teardown)."""
     _DECODE_SCRATCH.clear()
+    # The shared fallback holder retains _tq_mid_o_buf/_tq_output_buf/
+    # _tq_lse_buf GPU tensors (buf_holder writes on the non-cudagraph decode
+    # path); drop them too so shutdown actually frees the scratch.
+    _TQ_SHARED_DECODE_SCRATCH.__dict__.clear()
 
 
 def _build_hadamard(d: int, device_str: str) -> torch.Tensor:

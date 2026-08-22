@@ -767,7 +767,11 @@ def profile_cudagraph_memory(runner: "GPUModelRunner") -> int:
         speculator = getattr(runner, "speculator", None)
         spec_manager_names: list[str] = []
         try:
-            if not manager.needs_capture():
+            needs_encoder_capture = (
+                runner.model_state.supports_mm_inputs
+                and runner.model_state.encoder_runner.has_cudagraph()
+            )
+            if not manager.needs_capture() and not needs_encoder_capture:
                 return 0
             manager.pool = throwaway_pool
             if manager.use_breakable_cg:
@@ -875,9 +879,18 @@ def _teardown_profiling_state(runner: "GPUModelRunner") -> None:
     runner.cudagraph_manager = None
     # Release drafter graphs captured during profiling too; the real
     # capture_model() re-initializes the speculator's manager and re-captures.
+    # Manager attribute names vary by speculator type (DFlash, autoregressive,
+    # multi-module MTP).
     speculator = getattr(runner, "speculator", None)
-    if speculator is not None and hasattr(speculator, "query_cudagraph_manager"):
-        speculator.query_cudagraph_manager = None
+    if speculator is not None:
+        for manager_attr in (
+            "query_cudagraph_manager",
+            "prefill_cudagraph_manager",
+            "decode_cudagraph_manager",
+            "cudagraph_manager",
+        ):
+            if hasattr(speculator, manager_attr):
+                setattr(speculator, manager_attr, None)
     # Release encoder graphs captured during profiling; the real
     # capture_model() re-captures them.
     if runner.model_state.supports_mm_inputs:

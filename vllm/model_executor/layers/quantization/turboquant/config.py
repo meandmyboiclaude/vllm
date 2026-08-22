@@ -17,9 +17,12 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# KVQ-4: per-layer bit allocation. A JSON object mapping full-attention layer
+# KVQ-4: per-layer bit allocation. A JSON object mapping GLOBAL model layer
 # index (string) to a TQ preset name, e.g.
 #   VLLM_TQ_LAYER_BITS='{"0":"turboquant_3bit_nc","4":"turboquant_3bit_nuqv"}'
+# The key is the index parsed from the layer name (the position in
+# config.layer_types for hybrids), NOT the rank among full-attention layers;
+# keys that land on non-attention (e.g. GDN/Mamba) layers are silent no-ops.
 # Unlisted layers fall back to the model-level --kv-cache-dtype preset. An empty
 # / unset value means a uniform map (no behavior change).
 TQ_LAYER_BITS_ENV = "VLLM_TQ_LAYER_BITS"
@@ -413,6 +416,8 @@ def get_tq_layer_bits_map() -> dict[int, str]:
 def resolve_tq_layer_preset(layer_idx: int, default_dtype: str) -> str:
     """Resolve the effective TQ preset for a layer (KVQ-4).
 
+    ``layer_idx`` is the GLOBAL model layer index (``extract_layer_index`` of
+    the layer name), matching the key basis of ``VLLM_TQ_LAYER_BITS``.
     Returns the per-layer override if the layer index is present in the map,
     otherwise ``default_dtype`` (the model-level ``--kv-cache-dtype`` preset).
     With no map set, this is always ``default_dtype`` — a uniform allocation

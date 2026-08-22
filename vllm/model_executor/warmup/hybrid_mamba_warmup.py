@@ -3,17 +3,16 @@
 """Warm up Triton kernels for hybrid Mamba2 models (e.g. NemotronH).
 
 Extends the Qwen Triton warmup (#46750 / #47546) to hybrid models built on
-``MambaMixer2``. Without this, the JIT monitor reports these kernels
-compiling during the first inference request:
+``MambaMixer2``. Without this, the JIT monitor reports
+``_causal_conv1d_fwd_kernel`` compiling during the first inference request:
+the Mamba2 SSD warmup covers only the SSD chunk kernels, and it runs during
+the profile pass before the conv cache exists, so the prefill conv kernel
+cannot be warmed there.
 
-- ``_causal_conv1d_fwd_kernel``: the Mamba2 SSD warmup covers only the SSD
-  chunk kernels, and it runs during the profile pass before the conv cache
-  exists, so the prefill conv kernel cannot be warmed there.
-- ``_zero_kv_blocks_kernel``: only warmed for Qwen model types.
-- ``_compute_slot_mapping_kernel``: the generic block-table warmup misses
-  the ``block_table_stride == 1`` specialization that hybrid models hit
-  because their large mamba-aligned attention block size usually yields a
-  single block per request.
+Earlier revisions also warmed ``_zero_kv_blocks_kernel`` and
+``_compute_slot_mapping_kernel``; upstream #49903 warms both natively
+(``KVBlockZeroer`` and the runner-owned block-table warmup), so those legs
+were dropped.
 """
 
 import itertools

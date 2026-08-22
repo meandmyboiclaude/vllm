@@ -160,6 +160,8 @@ def make_shmem_pruner(
         named_args: dict[str, Any],
         **kwargs: Any,  # noqa: ARG001
     ) -> list[triton.Config]:
+        if not configs:
+            return configs
         budget = infer_shmem_budget() - safety_margin_bytes
         if budget <= 0:
             return configs

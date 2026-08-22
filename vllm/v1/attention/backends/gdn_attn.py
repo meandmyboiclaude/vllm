@@ -475,6 +475,11 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         # The commit/reset run in build() (eager, not in the captured region);
         # the cursors are full (num_gpu_blocks,) fixed-address buffers read by
         # the captured verify kernel.
+        # INVARIANT (cudagraph capture): the commit below also runs during
+        # capture builds, where the runner's dummy batch keeps zeroed block
+        # tables — every row then keys NULL_BLOCK_ID and the commit is a
+        # per-row no-op, so capture never advances real cursors. The reset is
+        # skipped during capture (num_prompt_tokens_cpu is None there).
         if self.use_cache_spec_kernel and num_spec_decodes > 0:
             from vllm.third_party.flash_linear_attention.ops.gdn_replayssm_spec_decode import (  # noqa: E501
                 commit_gdn_replayssm_spec,
@@ -510,6 +515,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 max_cache_len=self.spec_flush_threshold,
                 max_spec_len=self.max_spec_len,
                 cache_buf_len=self.spec_cache_buf_len,
+                null_block_id=NULL_BLOCK_ID,
             )
             # prefill->decode reset for first-decode rows (cursors only; conv
             # context lives in conv_state). A request's first spec verify has
@@ -533,6 +539,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                     sbi,
                     max_cache_len=self.spec_flush_threshold,
                     max_spec_len=self.max_spec_len,
+                    null_block_id=NULL_BLOCK_ID,
                 )
             spec_write_pos_d = self.spec_write_pos
             spec_cache_base_d = self.spec_cache_base

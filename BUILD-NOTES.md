@@ -1,5 +1,12 @@
 # club-dev1474-cherry — wheel build branch (2026-07-25)
 
+> **Historical record.** The sections below describe the 2026-07-25
+> club-dev1474-cherry branch at base 0ba2aa35 and are kept as-is for that
+> branch's audit trail. The current branch is club-tip-0b19ebcac-20260822
+> (upstream main @ 0b19ebcac + carried picks, vendored open-PR picks, and
+> review-fix commits); its authoritative pick-set is the branch commit log
+> (`git log 0b19ebcac..HEAD`), not the tables below.
+
 Base: 0ba2aa35a81dcc3246b26291368b53fa2389c7d7 (nightly-0ba2aa35, main 2026-07-25,
 0.23.1rc1.dev1474). Successor of club-dev1060-cherry (see its BUILD-NOTES).
 

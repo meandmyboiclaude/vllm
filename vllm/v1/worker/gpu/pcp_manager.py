@@ -578,6 +578,11 @@ class PCPManager:
             max_seq_len_np=global_batch.max_seq_len_np[local_to_global_batch_req_idx_np]
             if global_batch.max_seq_len_np is not None
             else None,
+            no_draft_mask_np=global_batch.no_draft_mask_np[
+                local_to_global_batch_req_idx_np
+            ]
+            if global_batch.no_draft_mask_np is not None
+            else None,
             input_ids=input_buffers.input_ids[:num_local_tokens_padded],
             positions=input_buffers.positions[:num_local_tokens_padded],
             is_padding=is_padding,
