@@ -407,6 +407,73 @@ def _rejection_greedy_sample_kernel_impl(
         output_token_ids.copy_(output_token_ids_i64.to(orig_dtype))
 
 
+def _relaxed_thinking_sample_kernel_impl(
+    output_token_ids,
+    cu_num_draft_tokens,
+    draft_token_ids,
+    target_argmax,
+    topk_values,
+    topk_indices,
+    bonus_token_ids,
+    is_greedy,
+    max_spec_len,
+    thinking_states,
+    think_start_token_id,
+    think_end_token_id,
+    log_relax_ratio,
+    K=None,
+    num_warps=None,
+):
+    """Python emulation of relaxed_thinking_sample_kernel (no C++ counterpart).
+
+    During the thinking phase a draft token is accepted when it appears in the
+    target top-K above ``top1_logit + log_relax_ratio``; outside it, plain
+    greedy equality applies. Speculation stops after an accepted thinking
+    boundary token, matching the Triton kernel.
+    """
+    cu = cu_num_draft_tokens.tolist()
+    draft_ids = draft_token_ids.tolist()
+    argmax_ids = target_argmax.tolist()
+    topk_vals = topk_values.tolist()
+    topk_ids = topk_indices.tolist()
+    thinking = thinking_states.tolist()
+    start_idx = 0
+    for req_idx, end_idx in enumerate(cu):
+        num_draft = end_idx - start_idx
+        if is_greedy is not None and not bool(is_greedy[req_idx].item()):
+            start_idx = end_idx
+            continue
+        rejected = False
+        for pos in range(num_draft):
+            token_idx = start_idx + pos
+            draft_id = draft_ids[token_idx]
+            token_id = argmax_ids[token_idx]
+            if thinking[req_idx]:
+                logit_floor = topk_vals[token_idx][0] + log_relax_ratio
+                accepted = any(
+                    cand_id == draft_id and cand_logit >= logit_floor
+                    for cand_logit, cand_id in zip(
+                        topk_vals[token_idx], topk_ids[token_idx]
+                    )
+                )
+            else:
+                accepted = draft_id == token_id
+            if accepted:
+                token_id = draft_id
+            output_token_ids[req_idx, pos] = token_id
+            if not accepted:
+                rejected = True
+                break
+            if draft_id in (think_start_token_id, think_end_token_id):
+                rejected = True
+                break
+        if not rejected:
+            output_token_ids[req_idx, num_draft] = int(
+                bonus_token_ids[req_idx].item()
+            )
+        start_idx = end_idx
+
+
 def _sample_lazy_recovered_tokens(
     draft_token_ids_i64,
     draft_probs,
@@ -601,6 +668,7 @@ eagle_step_slot_mapping_metadata_kernel = _FuncWrapper(
 )
 rejection_greedy_sample_kernel = _FuncWrapper(_rejection_greedy_sample_kernel_impl)
 rejection_random_sample_kernel = _FuncWrapper(_rejection_random_sample_kernel_impl)
+relaxed_thinking_sample_kernel = _FuncWrapper(_relaxed_thinking_sample_kernel_impl)
 expand_kernel = _FuncWrapper(_expand_kernel_impl)
 sample_recovered_tokens_kernel = _FuncWrapper(_sample_recovered_tokens_kernel_impl)
 

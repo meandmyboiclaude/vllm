@@ -1244,6 +1244,15 @@ class VllmConfig:
                     "disable_padded_drafter_batch=True and will be disabled.",
                 )
                 self.scheduler_config.async_scheduling = False
+            elif (
+                self.speculative_config is not None
+                and self.speculative_config.relaxed_thinking
+            ):
+                logger.warning_once(
+                    "Async scheduling is not compatible with relaxed_thinking "
+                    "speculative decoding and will be disabled.",
+                )
+                self.scheduler_config.async_scheduling = False
             elif not executor_supports_async_sched:
                 logger.warning_once(
                     "Async scheduling will be disabled because it is not supported "
@@ -1281,7 +1290,6 @@ class VllmConfig:
                     "skip_tokenizer_init=True because reasoning token IDs "
                     "must be initialized."
                 )
-
 
         if self.parallel_config.disable_nccl_for_dp_synchronization is None:
             if self.scheduler_config.async_scheduling:

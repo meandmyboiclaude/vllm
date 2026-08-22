@@ -39,6 +39,8 @@ class _FakeCudaGraphManager:
             self._capture_descs = {CUDAGraphMode.PIECEWISE: descs}
         else:
             self._capture_descs = {CUDAGraphMode.FULL: descs} if needs_capture else {}
+        # Captured graphs; profiling teardown drops them via graphs.clear().
+        self.graphs: dict[Any, Any] = {}
         # Profiling hooks set by profile_cudagraph_memory.
         self._max_full_descs_to_capture: int | None = None
         self._capture_mem_samples: list[int] | None = None
@@ -63,12 +65,21 @@ def _make_profiling_runner(
         needs_capture, num_full_descs, piecewise_only
     )
     runner.vllm_config = SimpleNamespace()
+    # profile_cudagraph_memory probes the encoder path through model_state;
+    # supports_mm_inputs=False short-circuits before encoder_runner is read.
+    runner.model_state = SimpleNamespace(supports_mm_inputs=False)
 
     events: list[str] = []
     runner.events = events
+    # The profiling hooks are reset in the teardown path, so capture_model
+    # records the value it observed for post-call assertions.
+    runner.observed_max_full_descs = None
 
     def _capture_model() -> int:
         events.append("capture")
+        runner.observed_max_full_descs = (
+            runner.cudagraph_manager._max_full_descs_to_capture
+        )
         # Simulate the manager's per-FULL-graph memory sampling.
         samples = runner.cudagraph_manager._capture_mem_samples
         if samples is not None:
@@ -157,11 +168,11 @@ def test_profile_cudagraph_memory_samples_and_extrapolates(monkeypatch):
     assert runner.events == ["init", "capture", "teardown"]
     # Capture must use a throwaway pool, not the persistent global pool.
     assert runner.cudagraph_manager.pool == THROWAWAY_POOL
-    # FULL capture must be limited to the largest few graphs.
-    assert (
-        runner.cudagraph_manager._max_full_descs_to_capture
-        == cgu._FULL_GRAPH_PROFILING_SAMPLES
-    )
+    # FULL capture must be limited to the largest few graphs while capture
+    # ran (the teardown path resets the hook to None afterwards).
+    assert runner.observed_max_full_descs == cgu._FULL_GRAPH_PROFILING_SAMPLES
+    assert runner.cudagraph_manager._max_full_descs_to_capture is None
+    assert runner.cudagraph_manager._capture_mem_samples is None
 
 
 def test_profile_cudagraph_memory_piecewise_only_returns_measured(monkeypatch):

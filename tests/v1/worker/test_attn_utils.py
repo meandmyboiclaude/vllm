@@ -20,6 +20,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheLayout,
     KVCacheTensor,
     MLAAttentionSpec,
+    SlidingWindowSpec,
     compute_layout_strides,
 )
 from vllm.v1.worker.gpu.attn_utils import (
@@ -139,6 +140,63 @@ def test_reshape_padded_kv_cache_strides_by_padded_page():
     assert kv_cache.stride(0) == spec.page_size_padded // elem_size
     assert kv_cache[1].storage_offset() == spec.page_size_padded // elem_size
     # Within one block the (unpadded) content stays compact.
+    assert kv_cache[0].is_contiguous()
+
+
+def test_reshape_padded_kv_cache_with_kernel_block_split():
+    """Padded pages + kernel-block splitting must distribute the padding.
+
+    A padded spec whose block_size exceeds the kernel block size (e.g. a
+    draft SWA group whose block size was raised for commensurability with the
+    target's groups) is viewed at kernel-block granularity. Striding each
+    kernel block by the full manager padded page overshoots the allocation by
+    the split factor (observed as a storage-size RuntimeError / illegal
+    memory access at init); the padding must be split evenly across the
+    kernel blocks instead.
+    """
+    num_blocks = 4
+    kernel_block_size = 4
+    split = 3
+    spec = SlidingWindowSpec(
+        block_size=split * kernel_block_size,
+        num_kv_heads=1,
+        head_size=2,
+        dtype=torch.float32,
+        sliding_window=8,
+        page_size_padded=288,
+    )
+    # 16 B/token: real page 192 B, padded to 288 B (96 B per kernel block).
+    assert spec.real_page_size_bytes == 192
+
+    raw = torch.zeros(spec.page_size_bytes * num_blocks, dtype=torch.int8)
+    (kv_cache,) = dense_kv_cache_views(
+        raw,
+        spec,
+        num_blocks,
+        1,
+        KVCacheLayout.LBHNC,
+        kernel_block_size=kernel_block_size,
+    )
+
+    elem_size = 4  # float32
+    kernel_page_bytes = spec.page_size_bytes // split  # 96
+    # Content dim packs K and V: 2 * head_size.
+    assert kv_cache.shape == (
+        num_blocks * split,
+        1,
+        kernel_block_size,
+        2 * spec.head_size,
+    )
+    assert kv_cache.dtype == spec.dtype
+    assert kv_cache.stride(0) == kernel_page_bytes // elem_size
+    for kernel_block_id in range(num_blocks * split):
+        assert (
+            kv_cache[kernel_block_id].storage_offset()
+            == kernel_block_id * kernel_page_bytes // elem_size
+        )
+    # Manager block b starts exactly at its padded page boundary.
+    assert kv_cache[split].storage_offset() == spec.page_size_bytes // elem_size
+    # Within one kernel block the (unpadded) content stays compact.
     assert kv_cache[0].is_contiguous()
 
 

@@ -52,7 +52,6 @@ class ThinkingBudgetStateHolder:
         is_pin_memory: bool,
         relaxed_thinking: bool = False,
     ):
-        _ = is_pin_memory  # API parity with logits processors
         max_num_reqs = max_num_seqs
         self.in_spec_mode = num_spec_tokens > 0
         self.num_spec_tokens = num_spec_tokens
@@ -78,6 +77,17 @@ class ThinkingBudgetStateHolder:
             self._mask_capacity = max_num_reqs * (self.num_spec_tokens + 1)
         else:
             self._mask_capacity = max_num_reqs
+
+        # Persistent staging pair for in_think_mask(): fill the pinned host
+        # buffer, async-copy into the device buffer, and hand out a view.
+        # Avoids a per-step list build plus pinned host allocation on the
+        # spec-decode verification path.
+        self._in_think_mask_cpu = torch.zeros(
+            max_num_reqs, dtype=torch.bool, pin_memory=is_pin_memory
+        )
+        self._in_think_mask_gpu = torch.zeros(
+            max_num_reqs, dtype=torch.bool, device=device
+        )
 
     def has_tracked_requests(self) -> bool:
         """True when ``sync_batch`` holds state for any tracked row.
@@ -193,13 +203,28 @@ class ThinkingBudgetStateHolder:
             self._update_in_think(state)
 
     def in_think_mask(self, num_reqs: int, device: torch.device) -> torch.Tensor:
-        """Batch-row-aligned bool tensor of ``in_think`` for the first rows."""
-        mask = [False] * num_reqs
-        for i in range(num_reqs):
-            state = self._state.get(i)
-            if state is not None and state.get("in_think", False):
-                mask[i] = True
-        return async_tensor_h2d(mask, device=device, dtype=torch.bool)
+        """Batch-row-aligned bool tensor of ``in_think`` for the first rows.
+
+        Returns a view of a persistent device buffer refreshed through a
+        pinned staging copy; the view is valid until the next call.
+        """
+        cpu_mask = self._in_think_mask_cpu
+        if num_reqs > cpu_mask.shape[0] or device != self._in_think_mask_gpu.device:
+            # Fallback for foreign devices or oversized batches (not hit in
+            # serving: num_reqs <= max_num_seqs on the holder's own device).
+            mask = [False] * num_reqs
+            for i, state in self._state.items():
+                if i < num_reqs and state.get("in_think", False):
+                    mask[i] = True
+            return async_tensor_h2d(mask, device=device, dtype=torch.bool)
+        cpu_np = cpu_mask.numpy()
+        cpu_np[:num_reqs] = False
+        for i, state in self._state.items():
+            if i < num_reqs and state.get("in_think", False):
+                cpu_np[i] = True
+        gpu_mask = self._in_think_mask_gpu[:num_reqs]
+        gpu_mask.copy_(cpu_mask[:num_reqs], non_blocking=True)
+        return gpu_mask
 
     @staticmethod
     def _find_last_sequence_index(target_list: list[int], token_ids: list[int]) -> int:

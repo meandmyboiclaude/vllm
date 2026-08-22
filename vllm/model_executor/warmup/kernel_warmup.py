@@ -144,9 +144,10 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
     compilation_config = worker.vllm_config.compilation_config
     cudagraph_capture_sizes = list(compilation_config.cudagraph_capture_sizes or [])
 
-    # Hybrid Mamba2 models (e.g. NemotronH): warm the prefill causal-conv1d,
-    # zero-kv-blocks, and slot-mapping kernels the JIT monitor reports on the
-    # first request. No-op for models without MambaMixer2 layers.
+    # Hybrid Mamba2 models (e.g. NemotronH): warm the prefill causal-conv1d
+    # kernel the JIT monitor reports on the first request (zero-kv-blocks and
+    # slot-mapping are warmed natively since #49903). No-op for models
+    # without MambaMixer2 layers.
     hybrid_mamba_triton_warmup(worker.model_runner, worker.vllm_config.model_config)
 
     # DSv4 mHC TileLang kernels (hc_pre/hc_post/hc_head_op) run every decoder

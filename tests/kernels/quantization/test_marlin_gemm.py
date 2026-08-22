@@ -715,3 +715,91 @@ def test_marlin_gemm_output_buffer_zero_init(size_m, size_n, size_k):
             "(NaN leaked through the use_atomic_add path under a dirty allocator)"
         )
         torch.testing.assert_close(out, reference, rtol=1e-2, atol=1e-2)
+
+
+@pytest.mark.skipif(
+    not is_quant_method_supported("gptq_marlin"),
+    reason="Marlin is not supported on this GPU type.",
+)
+@pytest.mark.parametrize("size_m, size_n, size_k", [(16, 256, 4096), (32, 512, 8192)])
+def test_marlin_gemm_fp32_reduce_buffer_zero_init(size_m, size_n, size_k):
+    """Companion to test_marlin_gemm_output_buffer_zero_init for the fp32
+    global-reduce temp ``c_tmp`` (the dominant root of the CUDA-graph NaN
+    corruption), on a config every Marlin-capable GPU can run.
+
+    The NVFP4 atomic-add leg above requires sm_100+, so on older parts (e.g.
+    sm_89 serving GPTQ int4 W4A8 through this very use_fp32_reduce path) it
+    always skips. Here the GEMM is uint4b8/g128 with ``c=None`` and
+    ``use_fp32_reduce=True``: marlin allocates both ``c`` and ``c_tmp``
+    internally, the cross-CTA reduce reads ``c_tmp`` partial slots, and a
+    dirty caching-allocator block must not leak into the output. Same
+    allocator-poisoning scheme as the atomic-add leg.
+    """
+    quant_type = scalar_types.uint4b8
+    group_size = 128
+
+    a_input = rand_data((size_m, size_k))
+    b_weight = rand_data((size_k, size_n))
+    w_ref, marlin_q_w, marlin_s, g_idx, sort_indices, _ = marlin_quantize(
+        b_weight, quant_type, group_size, False
+    )
+    marlin_zp = marlin_make_empty_g_idx(marlin_s.device)
+    workspace = marlin_make_workspace_new(a_input.device)
+
+    def run():
+        return ops.marlin_gemm(
+            a_input,
+            None,
+            marlin_q_w,
+            None,
+            marlin_s,
+            None,
+            None,
+            marlin_zp,
+            g_idx,
+            sort_indices,
+            workspace,
+            quant_type,
+            size_m,
+            size_n,
+            size_k,
+            is_k_full=True,
+            use_atomic_add=False,
+            use_fp32_reduce=True,
+            is_zp_float=False,
+        )
+
+    reference = run().clone()
+    assert torch.isfinite(reference).all()
+    output_ref = torch.matmul(a_input, w_ref)
+    assert compute_max_diff(reference, output_ref) < 0.04
+
+    for _ in range(5):
+        # Poison both caching-allocator pools with NaN and free them: the fp16
+        # pool covers the internal ``c`` and the fp32 pool covers ``c_tmp``.
+        junk = [
+            torch.full(
+                (size_m * size_n,),
+                float("nan"),
+                dtype=a_input.dtype,
+                device=a_input.device,
+            )
+            for _ in range(32)
+        ]
+        junk += [
+            torch.full(
+                (4 * 1024 * 1024,),
+                float("nan"),
+                dtype=torch.float32,
+                device=a_input.device,
+            )
+            for _ in range(4)
+        ]
+        del junk
+        out = run()
+        assert torch.isfinite(out).all(), (
+            "marlin_gemm read an uninitialized fp32 global-reduce buffer "
+            "(NaN leaked through the use_fp32_reduce path under a dirty "
+            "allocator)"
+        )
+        torch.testing.assert_close(out, reference, rtol=1e-2, atol=1e-2)

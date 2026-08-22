@@ -184,7 +184,10 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         self.use_cached_kernel: bool = vllm_config.cache_config.use_replayssm
         self.max_cache_len: int = vllm_config.cache_config.replayssm_buffer_len
         if self.use_cached_kernel:
-            self.decode_write_pos_d: torch.Tensor = torch.empty(
+            # zeros, not empty: capture runs before any real decode batch has
+            # staged positions, and the captured kernel executes once with
+            # whatever this buffer holds.
+            self.decode_write_pos_d: torch.Tensor = torch.zeros(
                 (self.decode_cudagraph_max_bs,),
                 dtype=torch.int32,
                 device=device,
@@ -284,6 +287,44 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             self.kv_cache_spec,
             self.vllm_config.cache_config.mamba_cache_mode,
         )
+
+        if (
+            spec_sequence_masks is None
+            and non_spec_query_start_loc is None
+            and num_decode_draft_tokens_cpu is not None
+            and (self.use_spec_decode or self.use_cache_spec_kernel)
+        ):
+            # V1-runner callers pass only the raw draft/accepted counts; the
+            # V2 runner (and build_for_cudagraph_capture) precompute the spec
+            # split once per step and always hand over non_spec_query_start_loc,
+            # so this fallback never fires there. Without it every spec-verify
+            # row would silently take the non-spec path.
+            (
+                num_prefills,
+                num_prefill_tokens,
+                num_decodes,
+                num_decode_tokens,
+                num_spec_decodes,
+                num_spec_decode_tokens,
+                spec_query_start_loc,
+                non_spec_query_start_loc,
+                non_spec_query_start_loc_cpu,
+                spec_sequence_masks_cpu,
+                spec_sequence_masks,
+                non_spec_sequence_masks_cpu,
+                spec_token_indx,
+                non_spec_token_indx,
+                num_accepted_tokens,
+                stale_spec_reqs,
+            ) = compute_common_gdn_attn_metadata(
+                num_decode_draft_tokens_cpu,
+                num_accepted_tokens,
+                query_start_loc,
+                query_start_loc_cpu,
+                self.num_spec,
+                use_cache_spec_kernel=self.use_cache_spec_kernel,
+                is_prefilling_cpu=m.is_prefilling,
+            )
 
         if spec_sequence_masks is None:
             query_lens_cpu = query_start_loc_cpu.diff()

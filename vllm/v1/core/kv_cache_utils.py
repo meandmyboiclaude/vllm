@@ -1075,11 +1075,25 @@ def _commensurate_padded_block_size(
     ``max_page_size``. ``None`` if no such size exists."""
     # Same basis as the padded-spec validity check (unpadded page bytes), so
     # a TQ-style spec whose real and unpadded page sizes diverge can never
-    # pick a block whose dense page overflows the shared page.
+    # pick a block whose dense page overflows the shared page. The cap floors
+    # per-token bytes, so it only over-approximates; the exact fit is checked
+    # per candidate below.
     per_token_bytes = layer_spec.unpadded_page_size_bytes // layer_spec.block_size
     cap = min(base_block_lcm, max_page_size // per_token_bytes)
     for candidate in range(cap, 0, -1):
-        if base_block_lcm % candidate == 0 and candidate % layer_spec.block_size == 0:
+        if base_block_lcm % candidate != 0 or candidate % layer_spec.block_size != 0:
+            continue
+        # Kernel blocks of the layer's aligned block size subdivide the padded
+        # page (``compute_layout_strides`` distributes the padding evenly
+        # across them), so the padded page must split into that many equal
+        # pieces or view creation asserts at boot.
+        if max_page_size % (candidate // layer_spec.block_size) != 0:
+            continue
+        num_states = layer_spec.get_num_kernel_states(candidate)
+        page_bytes = (
+            layer_spec.num_heads * num_states * layer_spec.state_content_size_bytes
+        )
+        if page_bytes <= max_page_size:
             return candidate
     return None
 

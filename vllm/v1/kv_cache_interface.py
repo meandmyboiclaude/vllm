@@ -416,7 +416,15 @@ def create_kv_cache_views(
         # read anyway. Byte-wide storage dtypes divide by 1, so packed specs
         # that already declare uint8 are unaffected.
         elem_size = get_dtype_size(dtype)
-        if any(v % elem_size for v in (*strides, shape_bytes[-1], storage_offset)):
+        # torch's Tensor.view(dtype) needs the innermost byte-stride to be
+        # exactly 1 (a contiguous last dim), and everything else -- outer
+        # strides, the last dim's byte size, the storage offset -- to divide
+        # evenly into whole elements.
+        innermost_dim = layout.stride_order[-1]
+        outer_strides = (strides[dim] for dim in layout.stride_order[:-1])
+        if strides[innermost_dim] != 1 or any(
+            v % elem_size for v in (*outer_strides, shape_bytes[-1], storage_offset)
+        ):
             dtype = torch.uint8
 
     view_5d = torch.as_strided(

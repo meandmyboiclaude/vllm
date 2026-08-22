@@ -363,8 +363,8 @@ def compute_mm_prefix_ranges(
 
 
 def compute_common_gdn_attn_metadata(
-    num_decode_draft_tokens_cpu: torch.Tensor,
-    num_accepted_tokens: torch.Tensor,
+    num_decode_draft_tokens_cpu: torch.Tensor | None,
+    num_accepted_tokens: torch.Tensor | None,
     query_start_loc: torch.Tensor,
     query_start_loc_cpu: torch.Tensor,
     num_spec: int,
