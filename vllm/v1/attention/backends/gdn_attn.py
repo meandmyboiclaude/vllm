@@ -203,6 +203,11 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         self.spec_cache_base: torch.Tensor | None = None
         self.spec_is_flush: torch.Tensor | None = None
 
+        # build() is shared with cudagraph capture, which carries no CPU
+        # prompt/computed-token counts (the runner populates them off the
+        # capture path only) and never replays a capture-time write position.
+        self._capturing: bool = False
+
     def _build_chunk_metadata(
         self,
         prefill_query_start_loc: torch.Tensor,
@@ -422,7 +427,14 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         spec_write_pos_d = None
         spec_cache_base_d = None
         spec_is_flush_d = None
-        if self.use_cached_kernel and spec_sequence_masks is None and num_decodes > 0:
+        # Capture is skipped: the graph only records the staged buffer's
+        # address, and every replay rebuilds the positions from a real batch.
+        if (
+            self.use_cached_kernel
+            and spec_sequence_masks is None
+            and num_decodes > 0
+            and not self._capturing
+        ):
             num_prompt_tokens_cpu = m.num_prompt_tokens_cpu
             num_computed_tokens_cpu = m._num_computed_tokens_cpu
             if num_prompt_tokens_cpu is None or num_computed_tokens_cpu is None:
@@ -621,8 +633,10 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                         write_pos_d, non_blocking=True
                     )
                 write_pos_d = self.decode_write_pos_d[:batch_size]
-                # Padded rows map to NULL_BLOCK_ID and hit the kernel's early
-                # return, so their write position is never read; zero is fine.
+                # The cached decode kernel only runs on all-decode batches
+                # (num_prefills == 0, so num_decodes == batch_size); the rows
+                # past num_decodes are never read, zero just keeps the staged
+                # buffer deterministic.
                 write_pos_d[num_decodes:].fill_(0)
 
         attn_metadata = GDNAttentionMetadata(
@@ -710,24 +724,28 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             is_prefilling_cpu=m.is_prefilling,
         )
 
-        return self.build(
-            0,
-            m,
-            num_accepted_tokens,
-            num_decode_draft_tokens_cpu,
-            num_prefills=num_prefills,
-            num_prefill_tokens=num_prefill_tokens,
-            num_decodes=num_decodes,
-            num_decode_tokens=num_decode_tokens,
-            num_spec_decodes=num_spec_decodes,
-            num_spec_decode_tokens=num_spec_decode_tokens,
-            spec_query_start_loc=spec_query_start_loc,
-            non_spec_query_start_loc=non_spec_query_start_loc,
-            non_spec_query_start_loc_cpu=non_spec_query_start_loc_cpu,
-            spec_sequence_masks_cpu=spec_sequence_masks_cpu,
-            spec_sequence_masks=spec_sequence_masks,
-            non_spec_sequence_masks_cpu=non_spec_sequence_masks_cpu,
-            spec_token_indx=spec_token_indx,
-            non_spec_token_indx=non_spec_token_indx,
-            stale_spec_reqs=stale_spec_reqs,
-        )
+        self._capturing = True
+        try:
+            return self.build(
+                0,
+                m,
+                num_accepted_tokens,
+                num_decode_draft_tokens_cpu,
+                num_prefills=num_prefills,
+                num_prefill_tokens=num_prefill_tokens,
+                num_decodes=num_decodes,
+                num_decode_tokens=num_decode_tokens,
+                num_spec_decodes=num_spec_decodes,
+                num_spec_decode_tokens=num_spec_decode_tokens,
+                spec_query_start_loc=spec_query_start_loc,
+                non_spec_query_start_loc=non_spec_query_start_loc,
+                non_spec_query_start_loc_cpu=non_spec_query_start_loc_cpu,
+                spec_sequence_masks_cpu=spec_sequence_masks_cpu,
+                spec_sequence_masks=spec_sequence_masks,
+                non_spec_sequence_masks_cpu=non_spec_sequence_masks_cpu,
+                spec_token_indx=spec_token_indx,
+                non_spec_token_indx=non_spec_token_indx,
+                stale_spec_reqs=stale_spec_reqs,
+            )
+        finally:
+            self._capturing = False

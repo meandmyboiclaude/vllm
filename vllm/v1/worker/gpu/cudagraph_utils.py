@@ -840,6 +840,15 @@ def _teardown_profiling_state(runner: "GPUModelRunner") -> None:
             layer.kv_cache = (
                 torch.tensor([]) if isinstance(kv_cache, torch.Tensor) else []
             )
+        # Per-token-head quant scale caches are memoized strided views over the
+        # KV cache storage. Leaving them set pins the profiling allocation and,
+        # because _ensure_scale_caches short-circuits on a non-None view, makes
+        # the real KV cache read/write its scales in the profiling allocation.
+        if hasattr(layer, "impl"):
+            if hasattr(layer.impl, "_k_scale_cache"):
+                layer.impl._k_scale_cache = None
+            if hasattr(layer.impl, "_v_scale_cache"):
+                layer.impl._v_scale_cache = None
     runner.cache_config.num_gpu_blocks = None
     runner.maybe_remove_all_loras(runner.lora_config)
     gc.collect()

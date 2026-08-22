@@ -208,7 +208,17 @@ class TurboQuantAttentionBackend(AttentionBackend):
     @classmethod
     def customize_spec(cls, spec: AttentionSpec) -> AttentionSpec:
         """TurboQuant packs K+V into one slot per head."""
-        if spec.state_content_bytes is not None or not spec.kv_quant_mode.is_turboquant:
+        if spec.state_content_bytes is not None:
+            return spec
+        # A TQ spec keeps the packed layout even when kv_quant_mode reads NONE:
+        # --kv-cache-dtype-skip-layers resets the mode, but tq_slot_size still
+        # describes the packed page. Honour it rather than re-deriving a preset
+        # from a mode that no longer names one, else the generic page math
+        # falls back to the dense formula and mis-sizes the allocation.
+        tq_slot_size = getattr(spec, "tq_slot_size", 0)
+        if tq_slot_size > 0:
+            return replace(spec, state_content_bytes=tq_slot_size)
+        if not spec.kv_quant_mode.is_turboquant:
             return spec
         from vllm.model_executor.layers.quantization.turboquant.config import (
             TurboQuantConfig,

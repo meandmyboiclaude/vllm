@@ -668,6 +668,12 @@ class Attention(nn.Module, AttentionLayerBase):
                 dtype=self.kv_cache_torch_dtype,
                 kv_quant_mode=quant_mode,
                 tq_slot_size=tq_config.slot_size_aligned,
+                # Generic page math multiplies num_heads * num_states *
+                # state_content_size_bytes; without this it would fall back to
+                # the dense (head_size + head_size_v) * dtype formula and size
+                # allocation off a preset this layer does not use. tq_slot_size
+                # is per-layer, so the content bytes must be too.
+                state_content_bytes=tq_config.slot_size_aligned,
                 tq_sink_tokens=tq_config.sink_tokens,
                 tq_sink_kv_bytes=tq_config.sink_kv_bytes_per_token,
             )

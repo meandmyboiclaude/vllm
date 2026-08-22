@@ -191,7 +191,7 @@ class MultiModuleMTPSpeculator(DraftModelSpeculator):
         uniform_token_count = get_uniform_decode_token_count(
             num_reqs, num_tokens, max_query_len, input_batch.has_prefill
         )
-        batch_desc, num_tokens_across_dp = dispatch_cg_and_sync_dp(
+        batch_desc, num_tokens_across_dp, _ = dispatch_cg_and_sync_dp(
             self.cudagraph_manager,
             num_reqs,
             input_batch.num_tokens_after_padding,
