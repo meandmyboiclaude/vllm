@@ -664,7 +664,7 @@ class Attention(nn.Module, AttentionLayerBase):
                 block_size=block_size,
                 num_kv_heads=self.num_kv_heads,
                 head_size=self.head_size,
-                head_size_v=self.head_size,
+                head_size_v=self.head_size_v,
                 dtype=self.kv_cache_torch_dtype,
                 # The spec self-describes the layer's EFFECTIVE preset: with a
                 # VLLM_TQ_LAYER_BITS override the model-level quant_mode would

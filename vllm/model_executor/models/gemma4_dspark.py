@@ -215,23 +215,26 @@ class Gemma4DSparkModel(DFlashQwen3Model):
         self, layers_attn: list[nn.Module], has_bias: bool
     ) -> None:
         self._hidden_norm_weight = self.hidden_norm.weight.data
-        # Dequantize quantized k_proj weights to the activation dtype (the
-        # canonical helper returns the weights in [out, in] layout) so the
-        # fused ``F.linear`` in ``_project_context_kv`` works for quantized
-        # drafters.  The buffers are built lazily on first use (after
+        # Dequantize quantized k_proj weights to the model's activation dtype
+        # (derived from the unquantized norm weight, so bf16 models stay bf16
+        # and fp16 models stay fp16; the canonical helper returns the weights
+        # in [out, in] layout) so the fused ``F.linear`` in
+        # ``_project_context_kv`` works for quantized drafters.  The buffers
+        # are built lazily on first use (after
         # ``process_weights_after_loading``), so quantized weights are in
         # their final layout and every quant scheme is supported.
+        kv_dtype = self._hidden_norm_weight.dtype
         self._fused_k_weight = torch.cat(
             [
-                get_and_maybe_dequant_weights(
-                    a.k_proj, out_dtype=torch.bfloat16
-                )
+                get_and_maybe_dequant_weights(a.k_proj, out_dtype=kv_dtype)
                 for a in layers_attn
             ],
             dim=0,
         )
         self._fused_k_bias: torch.Tensor | None = (
-            torch.cat([a.k_proj.bias for a in layers_attn], dim=0) if has_bias else None
+            torch.cat([a.k_proj.bias.to(kv_dtype) for a in layers_attn], dim=0)
+            if has_bias
+            else None
         )
         self._k_norm_weights = torch.stack(
             [a.k_norm.weight.data for a in layers_attn], dim=0

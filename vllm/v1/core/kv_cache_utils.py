@@ -1079,6 +1079,11 @@ def _commensurate_padded_block_size(
     # per-token bytes, so it only over-approximates; the exact fit is checked
     # per candidate below.
     per_token_bytes = layer_spec.unpadded_page_size_bytes // layer_spec.block_size
+    if per_token_bytes == 0:
+        # tokens_per_state > block-size-per-state packing can floor the
+        # per-token basis to zero; no commensurate candidate is derivable,
+        # so fall back to upstream's byte-exact page scaling.
+        return None
     cap = min(base_block_lcm, max_page_size // per_token_bytes)
     for candidate in range(cap, 0, -1):
         if base_block_lcm % candidate != 0 or candidate % layer_spec.block_size != 0:
@@ -1133,11 +1138,17 @@ def unify_kv_cache_spec_page_size(
     # size is the LCM of all group block sizes and prefix-cache hits align to
     # it, so an incommensurate block size (e.g. a draft model's SWA layers
     # over an MLA + mamba target) multiplies the hit granularity.
+    # Include every layer that will KEEP its block size below: those already
+    # at the max page, Mamba layers (padded, never scaled), and layers whose
+    # page does not divide the max (padded in the elif). All of them
+    # contribute to the final scheduler LCM the candidate must divide into.
     max_page_block_lcm = math.lcm(
         *(
             spec.block_size
             for spec in kv_cache_spec.values()
             if spec.page_size_bytes == max_page_size
+            or isinstance(spec, MambaSpec)
+            or max_page_size % spec.page_size_bytes != 0
         )
     )
     new_kv_cache_spec = {}
@@ -1197,7 +1208,20 @@ def unify_kv_cache_spec_page_size(
                 if padded_spec is not None:
                     new_spec = padded_spec
                 else:
-                    new_spec = replace(layer_spec, block_size=new_block_size)
+                    new_spec = replace(
+                        layer_spec,
+                        block_size=new_block_size,
+                        # Scaling block_size multiplies the unpadded page by
+                        # ratio; a retained smaller padded page would violate
+                        # padded >= unpadded (and the == max_page_size check
+                        # below), so an already-padded layer pads to the
+                        # shared page.
+                        page_size_padded=(
+                            max_page_size
+                            if layer_spec.page_size_padded is not None
+                            else None
+                        ),
+                    )
             elif isinstance(layer_spec, AttentionSpec) and not isinstance(
                 layer_spec, MLAAttentionSpec
             ):

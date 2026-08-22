@@ -159,24 +159,28 @@ class DFlashLagunaModel(DFlashQwen3Model, EagleModelMixin):
         has_bias: bool,
     ) -> None:
         # KV projection weights: [num_layers, 2 * kv_size, hidden_size].
-        # Dequantize quantized qkv weights to the activation dtype (the
-        # canonical helper returns the weights in [out, in] layout) so the
-        # fused ``torch.bmm`` in ``_project_context_kv`` works for quantized
-        # drafters.  The buffers are built lazily on first use (after
+        # Dequantize quantized qkv weights to the model's activation dtype
+        # (derived from the unquantized norm weight, so bf16 models stay bf16
+        # and fp16 models stay fp16; the canonical helper returns the weights
+        # in [out, in] layout) so the fused ``torch.bmm`` in
+        # ``_project_context_kv`` works for quantized drafters.  The buffers
+        # are built lazily on first use (after
         # ``process_weights_after_loading``), so quantized weights are in
         # their final layout and every quant scheme is supported.
+        kv_dtype = self.hidden_norm.weight.data.dtype
         self._kv_weights = torch.stack(
             [
-                get_and_maybe_dequant_weights(
-                    a.qkv_proj, out_dtype=torch.bfloat16
-                )[a.q_size :]
+                get_and_maybe_dequant_weights(a.qkv_proj, out_dtype=kv_dtype)[
+                    a.q_size :
+                ]
                 for a in layers_attn
             ],
             dim=0,
         ).contiguous()
         if has_bias:
             self._kv_biases: torch.Tensor | None = torch.stack(
-                [a.qkv_proj.bias[a.q_size :] for a in layers_attn], dim=0
+                [a.qkv_proj.bias[a.q_size :].to(kv_dtype) for a in layers_attn],
+                dim=0,
             ).contiguous()
         else:
             self._kv_biases = None
