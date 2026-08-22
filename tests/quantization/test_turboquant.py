@@ -329,20 +329,24 @@ class TestTurboQuantKVCacheSpec:
             head_size_v=128,
             num_kv_heads=4,
             sliding_window=None,
+            # KVQ-4 resolves a per-layer preset, so the layer index is read.
+            layer_name="model.layers.0.self_attn.attn",
             get_attn_backend=lambda: TurboQuantAttentionBackend,
         )
         vllm_config = SimpleNamespace(cache_config=SimpleNamespace(block_size=32))
 
-        # The layer builds an unpacked spec; the worker's spec-collection
-        # loop applies TQ slot packing via the backend's customize_spec hook.
+        # A turboquant layer builds its own self-describing (packed) spec:
+        # per-layer bit allocation means only the layer can resolve its preset,
+        # so the slot packing no longer waits for the backend's customize_spec.
         spec = Attention.get_kv_cache_spec(layer, vllm_config)
         assert isinstance(spec, FullAttentionSpec)
         assert spec.kv_quant_mode.is_turboquant
-        assert spec.state_content_bytes is None
-
-        spec = TurboQuantAttentionBackend.customize_spec(spec)
         expected_slot = TurboQuantConfig.from_cache_dtype(preset, 128).slot_size_aligned
         assert spec.state_content_bytes == expected_slot
+
+        # customize_spec must stay idempotent: the worker's spec-collection
+        # loop still runs it over every spec, packed or not.
+        assert TurboQuantAttentionBackend.customize_spec(spec) is spec
 
 
 class TestTurboQuantWorkspaceReservation:

@@ -392,13 +392,11 @@ def test_trim_reasoning_for_advance():
     assert manager.trim_reasoning_for_advance(request, next_step) == next_step
 
 
-
- 
 @pytest.mark.parametrize("backend", ["xgrammar", "guidance"])
 def test_accept_tokens_syncs_terminated_after_overshoot(backend):
     """accept_tokens must keep the terminated flag in sync when a batch
     overshoots the stop token.
- 
+
     Speculative decoding can hand accept_tokens a batch containing a token
     *after* EOS. accept_tokens rejects that trailing token, but it must still
     record that the grammar has terminated -- otherwise vLLM believes a
@@ -407,16 +405,16 @@ def test_accept_tokens_syncs_terminated_after_overshoot(backend):
     """
     tokenizer, manager, request, prompt = _make_manager_and_request(backend)
     grammar = request.structured_output_request.grammar
- 
+
     # Drive the grammar through a complete JSON object. Completing the
     # structure alone does not terminate the grammar; it also needs EOS.
     assert grammar.accept_tokens(request.request_id, prompt)
- 
+
     # Mimic a speculative-decode batch that overshoots the stop token.
     eos = tokenizer.eos_token_id
     stray = tokenizer.encode("\n")[0]
     grammar.accept_tokens(request.request_id, [eos, stray])
- 
+
     # Core invariant: vLLM's view now agrees the request is finished.
     # (Pre-fix this is False for xgrammar -> livelock / later bitmask crash.)
     assert grammar.is_terminated()
