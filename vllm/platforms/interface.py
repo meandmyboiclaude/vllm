@@ -701,7 +701,13 @@ class Platform:
                 kv_quant_mode=get_kv_quant_mode(cache_dtype),
             )
             # The backend owns its packing
-            return backend_cls.customize_spec(spec).page_size_bytes // probe_block
+            page = backend_cls.customize_spec(spec).page_size_bytes
+            assert page % probe_block == 0, (
+                f"page_size_bytes ({page}) is not divisible by the probe "
+                f"block size ({probe_block}); the backend's packing must "
+                "scale linearly with block_size for per-token page math."
+            )
+            return page // probe_block
 
         primary_dtype = (
             STR_DTYPE_TO_TORCH_DTYPE[cache_config.cache_dtype]

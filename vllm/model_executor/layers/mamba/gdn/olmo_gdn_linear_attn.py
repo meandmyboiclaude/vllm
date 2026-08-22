@@ -52,9 +52,33 @@ class OlmoHybridGatedDeltaNetAttention(GatedDeltaNetAttention):
     attention in the hybrid architecture.
     """
 
-    def get_state_shape(
-        self,
-    ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
+    def get_state_shape(self) -> tuple[tuple[int, ...], ...]:
+        # ReplaySSM branches mirror QwenGatedDeltaNetAttention so the shape
+        # tuple always matches the dtype tuple from the inherited
+        # get_state_dtype. The cached decode kernels themselves are not
+        # wired into this layer's forward; __init__ rejects the spec flag.
+        if self.cache_config.use_replayssm_spec:
+            return MambaStateShapeCalculator.gated_delta_net_replayssm_spec_state_shape(
+                self.tp_size,
+                self.num_k_heads,
+                self.num_v_heads,
+                self.head_k_dim,
+                self.head_v_dim,
+                self.conv_kernel_size,
+                self.cache_config.replayssm_buffer_len,
+                self.num_spec,
+            )
+        elif self.cache_config.use_replayssm:
+            return MambaStateShapeCalculator.gated_delta_net_replayssm_state_shape(
+                self.tp_size,
+                self.num_k_heads,
+                self.num_v_heads,
+                self.head_k_dim,
+                self.head_v_dim,
+                self.conv_kernel_size,
+                self.cache_config.replayssm_buffer_len,
+                self.num_spec,
+            )
         return MambaStateShapeCalculator.gated_delta_net_state_shape(
             self.tp_size,
             self.num_k_heads,
@@ -72,6 +96,17 @@ class OlmoHybridGatedDeltaNetAttention(GatedDeltaNetAttention):
         prefix: str = "",
     ) -> None:
         super().__init__(config, vllm_config, prefix=prefix)
+
+        if vllm_config.cache_config.use_replayssm_spec:
+            # The spec verify path below writes per-draft-token state slots,
+            # but --use-replayssm-spec removes them (num_speculative_blocks=0)
+            # and expects the cached-spec kernel, which this layer does not
+            # implement. Refuse loudly instead of corrupting state.
+            raise ValueError(
+                "OlmoHybridGatedDeltaNetAttention does not implement the "
+                "cached-spec (ReplaySSM) decode kernel; run this model "
+                "without --use-replayssm-spec"
+            )
 
         assert getattr(config, "linear_use_gate", True), (
             "OlmoHybridGatedDeltaNet requires linear_use_gate=True"

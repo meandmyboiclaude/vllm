@@ -433,7 +433,11 @@ def _sample_lazy_recovered_tokens(
         token_target = target_probs[token_idx]
         if no_draft_probs:
             prob = token_target.clone()
-            prob[draft_token_ids_i64[token_idx]] = 0.0
+            draft_id = int(draft_token_ids_i64[token_idx].item())
+            if draft_id >= 0:
+                # Padded (-1) ids are force-rejected by the caller; the Triton
+                # kernel leaves their full target distribution intact.
+                prob[draft_id] = 0.0
         else:
             prob = (token_target - draft_probs[token_idx].float()).clamp_(min=0.0)
         generator.manual_seed(int(recovery_seeds[token_idx].item()))
@@ -485,6 +489,17 @@ def _rejection_random_sample_kernel_impl(
     draft_token_ids_i64 = _ensure_int64(draft_token_ids)
     target_probs = _reconstruct_target_probs(target_logits, target_max, target_inv_sum)
     uniform_probs_f32 = uniform_probs.to(torch.float32)
+    # Recovery must see the original ids: the Triton kernel never masks the
+    # target probability of a padded (-1) draft id.
+    recovered_token_ids = _sample_lazy_recovered_tokens(
+        draft_token_ids_i64,
+        draft_probs,
+        target_probs,
+        recovery_seeds,
+        vocab_size,
+        NO_DRAFT_PROBS,
+        USE_FP64_GUMBEL,
+    )
     padded = draft_token_ids_i64 < 0
     if bool(padded.any()):
         # The Triton kernel rejects padded (-1) draft ids outright; the C++
@@ -496,15 +511,6 @@ def _rejection_random_sample_kernel_impl(
         if uniform_probs_f32 is uniform_probs:
             uniform_probs_f32 = uniform_probs_f32.clone()
         uniform_probs_f32[padded] = float("inf")
-    recovered_token_ids = _sample_lazy_recovered_tokens(
-        draft_token_ids_i64,
-        draft_probs,
-        target_probs,
-        recovery_seeds,
-        vocab_size,
-        NO_DRAFT_PROBS,
-        USE_FP64_GUMBEL,
-    )
     torch.ops._C.rejection_random_sample_kernel_impl(
         output_token_ids_i64,
         _ensure_int64(cu_num_draft_tokens),

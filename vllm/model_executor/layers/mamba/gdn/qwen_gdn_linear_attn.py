@@ -1509,10 +1509,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         # 2.1: Process the multi-query part
         if spec_sequence_masks is not None and self.use_cache_spec_kernel:
             # Cached circular spec verify: reuse the post-conv packed
-            # ``mixed_qkv_spec`` (q|k|v) + raw ``a``/``b`` (read per-request via
-            # spec_query_start_loc, same as the baseline kernel). The d/k/g ring
-            # caches + fp32 checkpoint live in the grown 5-tuple page; cursors
-            # are block-keyed in the metadata.
+            # ``mixed_qkv_spec`` (q|k|v) + the spec-compacted ``a_spec``/
+            # ``b_spec`` (read per-request via spec_query_start_loc, same as
+            # the baseline kernel). The d/k/g ring caches + fp32 checkpoint
+            # live in the grown 5-tuple page; cursors are block-keyed in the
+            # metadata.
             from vllm.third_party.flash_linear_attention.ops.gdn_replayssm_spec_decode import (  # noqa: E501
                 gdn_replayssm_spec_decode,
             )
@@ -1532,8 +1533,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             )
             gdn_replayssm_spec_decode(
                 mixed_qkv=mixed_qkv_spec,
-                a=a,
-                b=b,
+                a=a_spec,
+                b=b_spec,
                 A_log=self.A_log,
                 dt_bias=self.dt_bias,
                 checkpoint_state=ssm_state,
