@@ -356,5 +356,8 @@ class DFlashLagunaForCausalLM(nn.Module, SupportsEagle3):
         loaded_weight_names.add("model.embed_tokens.weight")
         # The fused-KV buffers are built lazily on first use (after the loader
         # has called ``process_weights_after_loading``), so quantized weights
-        # are in their final layout.
+        # are in their final layout.  A weight reload must drop any previously
+        # built buffers so the next use rebuilds them from the fresh weights.
+        if hasattr(self.model, "_num_attn_layers"):
+            del self.model._num_attn_layers
         return loaded_weight_names

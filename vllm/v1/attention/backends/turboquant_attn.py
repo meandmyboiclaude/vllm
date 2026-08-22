@@ -1223,11 +1223,9 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 kv_cache,
                 block_table,
                 centroids,
-                # KVQ-1 value codebook; the key centroids are a harmless
-                # placeholder when VALUE_NUQ=0 (never dereferenced).
                 getattr(layer, "_tq_val_centroids", None)
                 if self.tq_config.value_nuq
-                else centroids,
+                else None,  # [TQ-FDQ-VALCENT]
                 k_cached,
                 v_cached,
                 k_cached.stride(0),

@@ -654,6 +654,14 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             non_spec_state_indices_tensor = self.non_spec_state_indices_tensor[
                 :batch_size
             ]
+            # Rows past the real requests are cudagraph padding: their block
+            # table entries are stale on the V1 runner (only num_reqs rows are
+            # committed), and the captured kernels run over the full staged
+            # width, so null them or a padded row writes state through a live
+            # block id. Real prefill-classified rows keep their own ids.
+            non_spec_state_indices_tensor[num_decodes + num_prefills :].fill_(
+                NULL_BLOCK_ID
+            )
 
             self.non_spec_query_start_loc[: batch_size + 1].copy_(
                 query_start_loc, non_blocking=True

@@ -314,12 +314,19 @@ class TestHybridAttentionIndices:
 
 class TestTurboQuantKVCacheSpec:
     @pytest.mark.parametrize("preset", ALL_PRESETS)
-    def test_kv_cache_spec_sets_kv_quant_mode(self, preset):
+    def test_kv_cache_spec_sets_kv_quant_mode(self, preset, monkeypatch):
         from vllm.model_executor.layers.attention.attention import Attention
+        from vllm.model_executor.layers.quantization.turboquant.config import (
+            TQ_LAYER_BITS_ENV,
+        )
         from vllm.v1.attention.backends.turboquant_attn import (
             TurboQuantAttentionBackend,
         )
         from vllm.v1.kv_cache_interface import FullAttentionSpec
+
+        # The spec now resolves its preset per layer, so an ambient
+        # VLLM_TQ_LAYER_BITS map would override layer 0's slot size.
+        monkeypatch.delenv(TQ_LAYER_BITS_ENV, raising=False)
 
         layer = SimpleNamespace(
             attn_type="decoder",
