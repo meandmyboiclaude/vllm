@@ -272,9 +272,7 @@ def _make_metadata_with_slice(
         dcp_local_seq_lens_cpu=slice_reqs(attn_metadata.dcp_local_seq_lens_cpu),
         is_prefilling=slice_reqs(attn_metadata.is_prefilling),
         rswa_prefix_lens=slice_reqs(attn_metadata.rswa_prefix_lens),
-        replayssm_decode_base_cpu=slice_reqs(
-            attn_metadata.replayssm_decode_base_cpu
-        ),
+        replayssm_decode_base_cpu=slice_reqs(attn_metadata.replayssm_decode_base_cpu),
         mm_req_doc_ranges=mm_req_doc_ranges,
         positions=attn_metadata.positions[token_slice]
         if attn_metadata.positions is not None
