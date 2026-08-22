@@ -680,9 +680,15 @@ def postprocess_mamba_none_normalize_kernel(
     state_dim_row_stride_ptr,
     # Output: normalized accepted-token counts (1 where normalized)
     num_accepted_tokens_out_ptr,
+    # Optional: batch_idx -> req-state-slot mapping (V2 model runner). The
+    # accepted-token counts are slot-indexed; the block table is batch-order,
+    # so HAS_IDX_MAPPING splits the two indexings (same contract as
+    # postprocess_mamba_fused_kernel).
+    idx_mapping_ptr,
     num_reqs,
     COPY_BLOCK_SIZE: tl.constexpr,
     CONV_STATE_DIM_FIRST: tl.constexpr,
+    HAS_IDX_MAPPING: tl.constexpr = False,
 ):
     """Normalize mamba states after sampling in "none" cache mode.
 
@@ -705,11 +711,21 @@ def postprocess_mamba_none_normalize_kernel(
 
     Grid: (num_reqs, num_layers * num_state_types)
     """
-    req_idx = tl.program_id(0)
+    batch_idx = tl.program_id(0)
     state_idx = tl.program_id(1)
+    # Runtime zero for 2D grids; a Python literal would reach the shared copy
+    # body as a constexpr int, which has no .to() at JIT codegen.
+    tile_idx = tl.program_id(2)
 
-    if req_idx >= num_reqs:
+    if batch_idx >= num_reqs:
         return
+
+    if HAS_IDX_MAPPING:
+        req_idx = tl.load(idx_mapping_ptr + batch_idx)
+        if req_idx < 0:
+            return
+    else:
+        req_idx = batch_idx
 
     num_accepted = tl.load(num_accepted_tokens_ptr + req_idx)
     if num_accepted <= 1:
@@ -726,7 +742,7 @@ def postprocess_mamba_none_normalize_kernel(
     # distinct blocks.
     _copy_mamba_state_block(
         state_idx,
-        req_idx,
+        batch_idx,
         0,
         0,
         num_accepted - 1,
@@ -740,7 +756,7 @@ def postprocess_mamba_none_normalize_kernel(
         state_group_indices_ptr,
         state_dim_row_count_ptr,
         state_dim_row_stride_ptr,
-        0,
+        tile_idx,
         COPY_BLOCK_SIZE,
         CONV_STATE_DIM_FIRST,
         1,
@@ -1229,6 +1245,7 @@ class MambaSpecDecodeGPUContext:
         self,
         num_reqs: int,
         num_accepted_tokens_gpu: torch.Tensor,
+        idx_mapping: torch.Tensor | None = None,
     ) -> None:
         """Normalize "none"-mode mamba states after sampling.
 
@@ -1244,17 +1261,29 @@ class MambaSpecDecodeGPUContext:
         if num_reqs == 0 or not self.is_initialized:
             return
 
-        # Pre-fill output with the true counts; the kernel overwrites entries
-        # to 1 for normalized requests only.
-        self.num_accepted_tokens_out[:num_reqs].copy_(
-            num_accepted_tokens_gpu[:num_reqs]
-        )
+        if idx_mapping is None:
+            # V1: batch row == req-state slot. Pre-fill the out buffer with the
+            # true counts; the kernel overwrites entries to 1 for normalized
+            # requests only.
+            self.num_accepted_tokens_out[:num_reqs].copy_(
+                num_accepted_tokens_gpu[:num_reqs]
+            )
+            read_counts = num_accepted_tokens_gpu
+            out_counts = self.num_accepted_tokens_out
+        else:
+            # V2: counts are req-state-slot-indexed and normalized IN PLACE.
+            # The kernel reads from a full snapshot (idx_mapping rows are
+            # non-contiguous) and writes 1 back into the live buffer — the
+            # same snapshot discipline as run_fused_postprocess_align.
+            self.num_accepted_tokens_out.copy_(num_accepted_tokens_gpu)
+            read_counts = self.num_accepted_tokens_out
+            out_counts = num_accepted_tokens_gpu
 
         total_states = self.num_layers * self.num_state_types
         grid = (num_reqs, total_states)
 
         postprocess_mamba_none_normalize_kernel[grid](
-            num_accepted_tokens_gpu,
+            read_counts,
             self.block_table_ptrs,
             self.block_table_stride_req,
             self.state_base_addrs,
@@ -1265,10 +1294,12 @@ class MambaSpecDecodeGPUContext:
             self.state_group_indices,
             self.state_dim_row_count,
             self.state_dim_row_stride,
-            self.num_accepted_tokens_out,
+            out_counts,
+            idx_mapping if idx_mapping is not None else read_counts,
             num_reqs,
             COPY_BLOCK_SIZE=1024,
             CONV_STATE_DIM_FIRST=is_conv_state_dim_first(),
+            HAS_IDX_MAPPING=idx_mapping is not None,
         )
 
     def run_fused_precopy(

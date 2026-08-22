@@ -134,6 +134,11 @@ class MambaHybridModelState(DefaultModelState):
         self.recoverssm = (
             RecoverSSMState() if self.cache_config.use_kda_recoverssm else None
         )
+        # The fused-kernel context is shared by the align postprocess and the
+        # "none"-mode normalize, so it exists in both modes.
+        self._mamba_ctx: MambaSpecDecodeGPUContext | None = None
+        self._mamba_group_ids: list[int] = []
+        self._mamba_spec: MambaSpec | None = None
         if self._align_mode:
             self._mamba_state_idx_gpu = torch.zeros(
                 self.max_num_reqs, dtype=torch.int32, device=self.device
@@ -144,9 +149,6 @@ class MambaHybridModelState(DefaultModelState):
             self._mamba_src_off_gpu = torch.zeros(
                 self.max_num_reqs, dtype=torch.int32, device=self.device
             )
-            self._mamba_ctx: MambaSpecDecodeGPUContext | None = None
-            self._mamba_group_ids: list[int] = []
-            self._mamba_spec: MambaSpec | None = None
 
     def add_request(self, req_index: int, new_req_data: NewRequestData) -> None:
         super().add_request(req_index, new_req_data)
@@ -234,6 +236,19 @@ class MambaHybridModelState(DefaultModelState):
         is visible to the forward kernels.
         """
         if not self._align_mode:
+            # "none" mode still needs the fused-kernel context for the
+            # post-sampling state normalization (vendored #52942, V2 port):
+            # bind it here where block_tables are in hand; postprocess_state
+            # launches the normalize kernel through it.
+            if (
+                self.vllm_config.cache_config.mamba_cache_mode == "none"
+                and self.vllm_config.num_speculative_tokens > 0
+                and input_batch.num_reqs > 0
+            ):
+                mamba_group_ids, _ = self._get_mamba_group_info(kv_cache_config)
+                self._ensure_align_ctx(
+                    kv_cache_config, mamba_group_ids, block_tables
+                )
             return
         num_reqs = input_batch.num_reqs
         if num_reqs == 0:
@@ -497,6 +512,21 @@ class MambaHybridModelState(DefaultModelState):
                 self._mamba_state_idx_gpu,
                 num_computed_tokens,
                 idx_mapping,
+            )
+        elif (
+            not self._align_mode
+            and self._mamba_ctx is not None
+            and self.vllm_config.cache_config.mamba_cache_mode == "none"
+        ):
+            # "none" mode: the spec-decode GDN/mamba kernels leave the accepted
+            # state at block-table column num_accepted-1 while the non-spec
+            # decode path always reads column 0 — normalize after each sampling
+            # step so a later draft-less step cannot resume from a stale state
+            # (V1-parity port of the vendored #52942 fix).
+            self._mamba_ctx.run_fused_none_normalize(
+                num_reqs=num_reqs,
+                num_accepted_tokens_gpu=self.num_accepted_tokens_gpu,
+                idx_mapping=idx_mapping,
             )
 
 
