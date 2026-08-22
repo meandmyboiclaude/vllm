@@ -245,7 +245,14 @@ class TurboQuantAttentionBackend(AttentionBackend):
 
     @classmethod
     def supported_kv_cache_layouts(cls) -> tuple[KVCacheLayout, ...]:
-        return (KVCacheLayout.LBNHC,)
+        # Both are truthful: every kvarn/TQ kernel takes explicit strides from
+        # the views (the pn214 launcher passes stride args; the tilestore
+        # addresses by slot byte offsets), so both layouts are equally
+        # expressible.  LBNHC first = single-page preference.  BLHNC is
+        # required by the #51718 layout validator whenever this config's
+        # by-design mixed page sizes are present (hybrid + kvarn packed
+        # pages + arena regions).
+        return (KVCacheLayout.LBNHC, KVCacheLayout.BLHNC)
 
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
