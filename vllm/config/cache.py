@@ -53,6 +53,32 @@ CacheDType = Literal[
     "turboquant_3bit_nuqv_sink32",
     "turboquant_3bit_nuqv_out1",
     "turboquant_3bit_nuqv_out1_sink32",
+    # KVarN native-core presets (fixes/kvarn_native_presets.py `family()`),
+    # in-tree since #51718 removed the hooks the out-of-tree chain patched.
+    # The trailing markers are the chain's own insert text: keeping them
+    # byte-identical is what makes patch_kvarn_k4v2.py's per-line idempotence
+    # test see these as already applied instead of appending duplicates.
+    "kvarn_k4v2_g128",  # [KVARN-K4V2 2026-08-05]
+    "kvarn_k4v4_g128",  # [KVARN-K4V2 2026-08-05]
+    "kvarn_k3v2_g128",  # [KVARN-K4V2 2026-08-05]
+    "kvarn_k3v2_g128_mf",  # [KVARN-K4V2 2026-08-05]
+    "kvarn_k3v3_g128",  # [KVARN-K4V2 2026-08-05]
+    "kvarn_k3v3_g128_mf",  # [KVARN-K4V2 2026-08-05]
+    "kvarn_k3v4_g128",  # [KVARN-K4V2 2026-08-05]
+    "kvarn_k3v4_g128_mf",  # [KVARN-K4V2 2026-08-05]
+    "kvarn_k4v2_g128_mf",  # [KVARN-K4V2 2026-08-05]
+    "kvarn_k4v3_g128",  # [KVARN-K4V2 2026-08-05]
+    "kvarn_k4v3_g128_mf",  # [KVARN-K4V2 2026-08-05]
+    "kvarn_k4v4_g128_mf",  # [KVARN-K4V2 2026-08-05]
+    "kvarn_k8v2_g128",  # [KVARN-K4V2 2026-08-05]
+    "kvarn_k8v2_g128_mf",  # [KVARN-K4V2 2026-08-05]
+    "kvarn_k8v3_g128",  # [KVARN-K4V2 2026-08-05]
+    "kvarn_k8v3_g128_mf",  # [KVARN-K4V2 2026-08-05]
+    "kvarn_k8v4_g128",  # [KVARN-K4V2 2026-08-05]
+    "kvarn_k8v4_g128_mf",  # [KVARN-K4V2 2026-08-05]
+    "kvarn_k3pv4_g128_native",  # [KVARN-K4V2 2026-08-05]
+    "kvarn_k4pv4_g128_native",  # [KVARN-K4V2 2026-08-05]
+    "kvarn_k8pv4_g128_native",  # [KVARN-K4V2 2026-08-05]
     "int4_per_token_head",
     "int8_per_token_head",
     "fp8_per_token_head",

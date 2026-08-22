@@ -417,6 +417,10 @@ def compute_common_gdn_attn_metadata(
             num_spec_decodes == 0
             or num_decode_draft_tokens_cpu[spec_sequence_masks_cpu].sum().item() == 0
         ):
+            # The count must fall with the mask: GDN build() asserts decode and
+            # spec-decode rows are mutually exclusive, and a stale non-zero
+            # count also suppresses its FULL-graph decode staging.
+            num_spec_decodes = 0
             spec_sequence_masks = None
             spec_sequence_masks_cpu = None
         else:

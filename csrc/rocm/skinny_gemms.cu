@@ -848,8 +848,9 @@ __global__ void __launch_bounds__(WvPrGrp* THRDS)
   // Reserving 64/160 KB of LDS to have 1 WG / CU
   // Goal is to bring the activation matrix A to the LDS
   // and use it across the lifetime of the work group.
-  // The caller dispatches to this kernel only when the
-  // activation fits in LDS (see WVSPLITK_CFG).
+  // This is the no-fit dispatch branch (see WVSPLITK_CFG),
+  // so A can exceed LDS: the PCML path below refills s[]
+  // in kFit-sized chunks as the k loop advances.
   //----------------------------------------------------
   __shared__ scalar_t s[max_lds_len];
 

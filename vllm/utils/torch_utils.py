@@ -53,6 +53,31 @@ STR_DTYPE_TO_TORCH_DTYPE = {
     "turboquant_3bit_nuqv_sink32": torch.uint8,
     "turboquant_3bit_nuqv_out1": torch.uint8,
     "turboquant_3bit_nuqv_out1_sink32": torch.uint8,
+    # KVarN native-core presets: packed [K|V] tile records, so the storage
+    # dtype is uint8 for every member (the codec owns the bit widths). Same
+    # set and same insert text as fixes/patch_kvarn_k4v2.py, so that patch
+    # skips these as already applied rather than duplicating the keys.
+    "kvarn_k4v2_g128": torch.uint8,  # [KVARN-K4V2 2026-08-05]
+    "kvarn_k4v4_g128": torch.uint8,  # [KVARN-K4V2 2026-08-05]
+    "kvarn_k3v2_g128": torch.uint8,  # [KVARN-K4V2 2026-08-05]
+    "kvarn_k3v2_g128_mf": torch.uint8,  # [KVARN-K4V2 2026-08-05]
+    "kvarn_k3v3_g128": torch.uint8,  # [KVARN-K4V2 2026-08-05]
+    "kvarn_k3v3_g128_mf": torch.uint8,  # [KVARN-K4V2 2026-08-05]
+    "kvarn_k3v4_g128": torch.uint8,  # [KVARN-K4V2 2026-08-05]
+    "kvarn_k3v4_g128_mf": torch.uint8,  # [KVARN-K4V2 2026-08-05]
+    "kvarn_k4v2_g128_mf": torch.uint8,  # [KVARN-K4V2 2026-08-05]
+    "kvarn_k4v3_g128": torch.uint8,  # [KVARN-K4V2 2026-08-05]
+    "kvarn_k4v3_g128_mf": torch.uint8,  # [KVARN-K4V2 2026-08-05]
+    "kvarn_k4v4_g128_mf": torch.uint8,  # [KVARN-K4V2 2026-08-05]
+    "kvarn_k8v2_g128": torch.uint8,  # [KVARN-K4V2 2026-08-05]
+    "kvarn_k8v2_g128_mf": torch.uint8,  # [KVARN-K4V2 2026-08-05]
+    "kvarn_k8v3_g128": torch.uint8,  # [KVARN-K4V2 2026-08-05]
+    "kvarn_k8v3_g128_mf": torch.uint8,  # [KVARN-K4V2 2026-08-05]
+    "kvarn_k8v4_g128": torch.uint8,  # [KVARN-K4V2 2026-08-05]
+    "kvarn_k8v4_g128_mf": torch.uint8,  # [KVARN-K4V2 2026-08-05]
+    "kvarn_k3pv4_g128_native": torch.uint8,  # [KVARN-K4V2 2026-08-05]
+    "kvarn_k4pv4_g128_native": torch.uint8,  # [KVARN-K4V2 2026-08-05]
+    "kvarn_k8pv4_g128_native": torch.uint8,  # [KVARN-K4V2 2026-08-05]
     "nvfp4": torch.uint8,
     "nvfp4_4over6": torch.uint8,
 }

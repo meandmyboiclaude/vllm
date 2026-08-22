@@ -24,6 +24,10 @@ from vllm.v1.attention.backends.utils import NULL_BLOCK_ID, PAD_SLOT_ID
         "block_idx_last_scheduled_token",
         "initial_state_idx",
         "num_computed_tokens",
+        # Pre-existing upstream entry: keep the cache-line count out of the
+        # alignment key so a new divisibility class never forces a JIT
+        # recompile on a live (possibly graph-captured) launch.
+        "num_cache_lines",
     ]
 )
 def _causal_conv1d_fwd_kernel(  # continuous batching
@@ -778,6 +782,8 @@ def causal_conv1d_fn(
         "query_start_loc_ptr",
         "block_idx_last_scheduled_token",
         "initial_state_idx",
+        # Pre-existing upstream entry (see the fwd kernel above).
+        "num_cache_lines",
     ]
 )
 def _causal_conv1d_update_kernel(

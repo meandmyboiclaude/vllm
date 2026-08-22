@@ -54,13 +54,24 @@ class MambaHybridAttnMetadata(ModelSpecificAttnMetadata):
     # Spec-row-shaped (len num_spec_decodes) stale zero-accept mask; GDN
     # build() nulls those rows' state slots (carried #51508 + #40756 guard).
     stale_spec_reqs: torch.Tensor | None = None
+    # Batch-row CPU int32 counts consumed by the ReplaySSM ring bookkeeping in
+    # gdn_attn/mamba_attn build(). Non-request rows carry -1 (see prepare_attn).
+    num_prompt_tokens_cpu: torch.Tensor | None = None
+    num_computed_tokens_cpu: torch.Tensor | None = None
 
     def get_extra_common_attn_kwargs(
         self,
         kv_cache_group_id: int,
         num_reqs: int,
     ) -> dict[str, Any]:
-        return {"is_prefilling": self.is_prefilling[:num_reqs]}
+        extra: dict[str, Any] = {"is_prefilling": self.is_prefilling[:num_reqs]}
+        if self.num_prompt_tokens_cpu is not None:
+            extra["num_prompt_tokens_cpu"] = self.num_prompt_tokens_cpu[:num_reqs]
+        if self.num_computed_tokens_cpu is not None:
+            # CommonAttentionMetadata keeps the computed-token count under the
+            # deprecated private name; ReplaySSM reads it from there.
+            extra["_num_computed_tokens_cpu"] = self.num_computed_tokens_cpu[:num_reqs]
+        return extra
 
     def get_extra_attn_kwargs(
         self,
@@ -242,6 +253,7 @@ class MambaHybridModelState(DefaultModelState):
             # launches the normalize kernel through it.
             if (
                 self.vllm_config.cache_config.mamba_cache_mode == "none"
+                and not self.cache_config.use_replayssm_spec
                 and self.vllm_config.num_speculative_tokens > 0
                 and input_batch.num_reqs > 0
             ):
@@ -318,6 +330,45 @@ class MambaHybridModelState(DefaultModelState):
         is_prefilling[: input_batch.num_reqs] = torch.from_numpy(
             input_batch.is_prefilling_np
         )
+
+        # ReplaySSM derives its ring write positions (gdn_attn/mamba_attn build())
+        # and the prefill->decode cursor reset from these CPU counts. Nothing else
+        # populates them on the V2 path, so both consumers were silently inert.
+        # Never on the capture path: the reset writes persistent block-keyed cursor
+        # buffers and a capture dummy carries real (zeroed) block ids.
+        num_prompt_tokens_cpu = None
+        num_computed_tokens_cpu = None
+        if not for_capture and (
+            self.cache_config.use_replayssm or self.cache_config.use_replayssm_spec
+        ):
+            prefill_len_np = input_batch.prefill_len_np
+            # -1, not 0, on rows that carry no request (graph padding, and the
+            # zero-length dummy batch of a non-FULL dummy run): those rows have
+            # context_len 0, which against a zero prompt length reads as "first
+            # decode" and would reset a live block's cursors.
+            has_req = prefill_len_np > 0
+            prompt_lens_np = np.full(num_reqs, -1, dtype=np.int32)
+            # prefill_len, not prompt_len: the ring is anchored at the first
+            # generated token, and a preemption-resumed request re-prefills its
+            # earlier output tokens before generating again.
+            prompt_lens_np[: input_batch.num_reqs] = np.where(
+                has_req, prefill_len_np, -1
+            )
+            num_prompt_tokens_cpu = torch.from_numpy(prompt_lens_np)
+            if (
+                self.cache_config.use_replayssm
+                and self.vllm_config.num_speculative_tokens == 0
+            ):
+                # num_computed_tokens_np is an optimistic mirror once drafts can be
+                # rejected (V1 nulls this field under async spec decode for the same
+                # reason), so only the draft-free ring lane may read it. The spec
+                # lane uses the device-side count instead.
+                computed_np = np.full(num_reqs, -1, dtype=np.int32)
+                computed_np[: input_batch.num_reqs] = np.where(
+                    has_req, input_batch.num_computed_tokens_np, -1
+                )
+                num_computed_tokens_cpu = torch.from_numpy(computed_np)
+
         # During CUDAGraph capture, num_decode_draft_tokens_cpu and num_accepted_tokens
         # are created by attn_metadata_builder.build_for_cudagraph_capture, so we only
         # compute them during actual (non-capture) forward execution.
@@ -433,6 +484,8 @@ class MambaHybridModelState(DefaultModelState):
             spec_token_indx=spec_token_indx,
             non_spec_token_indx=non_spec_token_indx,
             stale_spec_reqs=stale_spec_reqs,
+            num_prompt_tokens_cpu=num_prompt_tokens_cpu,
+            num_computed_tokens_cpu=num_computed_tokens_cpu,
         )
         attn_metadata = build_attn_metadata(
             attn_groups=attn_groups,
@@ -517,7 +570,12 @@ class MambaHybridModelState(DefaultModelState):
             not self._align_mode
             and self._mamba_ctx is not None
             and self.vllm_config.cache_config.mamba_cache_mode == "none"
+            and not self.cache_config.use_replayssm_spec
         ):
+            # ReplaySSM-spec keeps accepted state canonical in its ring and
+            # feeds num_accepted_tokens_gpu into commit_gdn_replayssm_spec;
+            # normalizing (and resetting counts to 1) there would desync the
+            # cursors. The #52942 normalize is for the BASELINE spec kernels.
             # "none" mode: the spec-decode GDN/mamba kernels leave the accepted
             # state at block-table column num_accepted-1 while the non-spec
             # decode path always reads column 0 — normalize after each sampling

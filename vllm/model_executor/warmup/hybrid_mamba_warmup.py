@@ -16,6 +16,7 @@ compiling during the first inference request:
   single block per request.
 """
 
+import itertools
 from typing import TYPE_CHECKING
 
 import torch
@@ -54,8 +55,6 @@ def _get_conv_state(layer: object) -> torch.Tensor | None:
         return None
     return conv_cache if is_conv_state_dim_first() else conv_cache.transpose(-1, -2)
 
-
-import itertools
 
 # In production the prefill tensors (query_start_loc_p, cache_indices_p,
 # has_initial_state_p) are slices offset by num_decodes of the per-step

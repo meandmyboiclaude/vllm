@@ -689,15 +689,19 @@ class Platform:
 
         def per_token_page_bytes(dtype: "torch.dtype", cache_dtype: str) -> int:
             """Bytes one token occupies in one layer, for the given dtype."""
+            # Probe with the configured block size, not 1: group-quantized
+            # codecs (kvarn G=128) reject specs whose block size is not a
+            # group multiple, and page bytes divide back out exactly.
+            probe_block = vllm_config.cache_config.block_size or 1
             spec = FullAttentionSpec(
-                block_size=1,
+                block_size=probe_block,
                 num_kv_heads=model_config.get_num_kv_heads(parallel_config),
                 head_size=model_config.get_head_size(),
                 dtype=dtype,
                 kv_quant_mode=get_kv_quant_mode(cache_dtype),
             )
             # The backend owns its packing
-            return backend_cls.customize_spec(spec).page_size_bytes
+            return backend_cls.customize_spec(spec).page_size_bytes // probe_block
 
         primary_dtype = (
             STR_DTYPE_TO_TORCH_DTYPE[cache_config.cache_dtype]

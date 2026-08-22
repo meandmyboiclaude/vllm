@@ -58,6 +58,13 @@ class KVQuantMode(IntEnum):
     TURBOQUANT_3BIT_NUQV_SINK32 = 11
     TURBOQUANT_3BIT_NUQV_OUT1 = 12
     TURBOQUANT_3BIT_NUQV_OUT1_SINK32 = 13
+    # [KVARN-V2-DTYPE-MODE] Native KVarN tile-record codec family (kvarn_*).
+    # Its OWN family, not a TurboQuant preset: the preset-name round-trip in
+    # get_kv_quant_mode has no member for a kvarn name, and the family's slot
+    # bytes come from the tile descriptor, not from a TQ preset table. It is
+    # classed with the TQ modes by is_turboquant only because it rides the
+    # same byte-page backend.
+    KVARN = 14
 
     @property
     def is_per_token_head(self) -> bool:
@@ -75,7 +82,7 @@ class KVQuantMode(IntEnum):
 
     @property
     def is_turboquant(self) -> bool:
-        """True for any turboquant quantization mode."""
+        """True for any mode stored as TurboQuant-shaped byte pages."""
         return self in (
             KVQuantMode.TURBOQUANT_K8V4,
             KVQuantMode.TURBOQUANT_4BIT_NC,
@@ -85,6 +92,11 @@ class KVQuantMode(IntEnum):
             KVQuantMode.TURBOQUANT_3BIT_NUQV_SINK32,
             KVQuantMode.TURBOQUANT_3BIT_NUQV_OUT1,
             KVQuantMode.TURBOQUANT_3BIT_NUQV_OUT1_SINK32,
+            # [KVARN-V2-DTYPE-MODE] KVarN is a distinct codec family that
+            # rides the same byte-page backend, so it must pass this gate --
+            # that backend's customize_spec is what publishes the packed slot
+            # bytes onto the spec. Family identity stays KVARN everywhere else.
+            KVQuantMode.KVARN,
         )
 
 
@@ -98,6 +110,13 @@ def get_kv_quant_mode(kv_cache_dtype: str) -> KVQuantMode:
         return KVQuantMode.FP8_PER_TOKEN_HEAD
     if kv_cache_dtype.startswith("nvfp4"):
         return KVQuantMode.NVFP4
+    # [KVARN-V2-DTYPE-MODE] Before the turboquant ladder below: that ladder
+    # resolves KVQuantMode[name.upper()], which has no member for a kvarn
+    # preset (KeyError), and falling through to NONE would build dense pages
+    # under kvarn labels -- the backend only publishes the codec's packed slot
+    # bytes for a mode that answers is_turboquant.
+    if isinstance(kv_cache_dtype, str) and kv_cache_dtype.startswith("kvarn_"):
+        return KVQuantMode.KVARN
     if isinstance(kv_cache_dtype, str) and kv_cache_dtype.startswith("turboquant_"):
         return KVQuantMode[kv_cache_dtype.upper()]
     if isinstance(kv_cache_dtype, str) and kv_cache_dtype.startswith("fp8"):
@@ -362,12 +381,24 @@ def create_kv_cache_views(
         fixed_strides=(layer_stride, block_stride, None, None, None),
     )
     dtype = getattr(spec, "dtype", None)
+    storage_offset = raw.storage_offset() + kv_cache_tensor.offset
+    if dtype is not None:
+        # A spec that publishes packed content states its page in BYTES: a
+        # codec slot carries data plus inline metadata, so neither the content
+        # nor the byte strides walking it need be a whole number of `dtype`
+        # elements. Reinterpret only when the whole layout divides evenly --
+        # otherwise torch refuses the view, and the bytes are the codec's to
+        # read anyway. Byte-wide storage dtypes divide by 1, so packed specs
+        # that already declare uint8 are unaffected.
+        elem_size = get_dtype_size(dtype)
+        if any(v % elem_size for v in (*strides, shape_bytes[-1], storage_offset)):
+            dtype = torch.uint8
 
     view_5d = torch.as_strided(
         raw,
         size=logical_shape,
         stride=strides,
-        storage_offset=raw.storage_offset() + kv_cache_tensor.offset,
+        storage_offset=storage_offset,
     )
 
     views = []
@@ -550,9 +581,10 @@ def _apply_alignment_padding(spec: MLAAttentionSpec | SlidingWindowMLASpec):
 class TQFullAttentionSpec(FullAttentionSpec):
     """FullAttentionSpec with TQ-aware page size.
 
-    Python equivalent of the C++ TQ4FullAttentionSpec. Overrides
-    real_page_size_bytes to use TQ slot bytes instead of the raw
-    head_size * dtype formula.
+    Python equivalent of the C++ TQ4FullAttentionSpec. Publishes the packed TQ
+    slot as the spec's content bytes instead of the raw head_size * dtype
+    formula, so every page consumer reads the TQ size from the one place the
+    generic math already looks.
     """
 
     tq_slot_size: int = 0
@@ -564,10 +596,20 @@ class TQFullAttentionSpec(FullAttentionSpec):
     tq_sink_kv_bytes: int = 0  # fp16 K+V bytes per sink token per KV head
 
     @property
-    def real_page_size_bytes(self) -> int:
-        if self.tq_slot_size > 0:
-            return self.block_size * self.num_kv_heads * self.tq_slot_size
-        return super().real_page_size_bytes
+    def state_content_size_bytes(self) -> int:
+        """TQ packs K+V into one ``tq_slot_size`` byte slot per (head, token).
+
+        Published here rather than only on ``real_page_size_bytes``: page
+        sizing, padded-page sizing and ``create_kv_cache_views`` all go
+        through ``state_content_size_bytes``, so a spec carrying only
+        ``tq_slot_size`` used to allocate and view *dense* pages while
+        ``real_page_size_bytes`` alone reported the TQ page. A backend that
+        published ``state_content_bytes`` (the self-describing path) wins:
+        those are the bytes the allocation was sized with.
+        """
+        if self.state_content_bytes is None and self.tq_slot_size > 0:
+            return self.tq_slot_size
+        return super().state_content_size_bytes
 
     @property
     def tq_sink_side_bytes_per_seq(self) -> int:

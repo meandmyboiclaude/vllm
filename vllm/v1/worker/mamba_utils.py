@@ -1250,13 +1250,20 @@ class MambaSpecDecodeGPUContext:
         """Normalize "none"-mode mamba states after sampling.
 
         Migrates every request's accepted state to block-table column 0 and
-        exposes the matching (reset-to-1) accepted-token counts via
-        ``num_accepted_tokens_out``. See
+        exposes the matching (reset-to-1) accepted-token counts. See
         ``postprocess_mamba_none_normalize_kernel`` for why this is needed.
 
         Args:
-            num_reqs: Number of active requests
-            num_accepted_tokens_gpu: [num_reqs] accepted token counts
+            num_reqs: Number of active requests (block-table rows)
+            num_accepted_tokens_gpu: accepted token counts, [max_num_reqs].
+                Must be the whole persistent buffer, not a [:num_reqs] view:
+                with ``idx_mapping`` the kernel indexes it by req-state slot,
+                which is not bounded by ``num_reqs``, and the snapshot copy
+                below is full-width.
+            idx_mapping: V2 batch_idx -> req-state slot ([num_reqs], -1 to
+                skip). When given, the normalized counts are written back
+                into ``num_accepted_tokens_gpu`` in place; when None (V1),
+                they land in ``self.num_accepted_tokens_out`` instead.
         """
         if num_reqs == 0 or not self.is_initialized:
             return
