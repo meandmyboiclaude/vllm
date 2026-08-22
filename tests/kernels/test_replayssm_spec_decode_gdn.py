@@ -35,11 +35,11 @@ packed kernels use the sequential recurrence, so even at fp32 they differ by
 import pytest
 import torch
 
-from vllm.model_executor.layers.fla.ops import (
+from vllm.third_party.flash_linear_attention.ops import (
     fused_recurrent_gated_delta_rule_packed_decode,
     fused_recurrent_gated_delta_rule_replayssm,
 )
-from vllm.model_executor.layers.fla.ops.gdn_replayssm_spec_decode import (
+from vllm.third_party.flash_linear_attention.ops.gdn_replayssm_spec_decode import (
     commit_gdn_replayssm_spec,
     gdn_replayssm_spec_decode,
     reset_gdn_replayssm_spec_cursors,

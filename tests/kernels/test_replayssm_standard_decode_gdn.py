@@ -19,7 +19,7 @@ bf16 state is also supported. ``g_cache`` is always fp32.
 import pytest
 import torch
 
-from vllm.model_executor.layers.fla.ops import (
+from vllm.third_party.flash_linear_attention.ops import (
     fused_recurrent_gated_delta_rule_packed_decode,
     fused_recurrent_gated_delta_rule_replayssm,
 )

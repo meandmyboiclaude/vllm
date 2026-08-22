@@ -190,6 +190,7 @@ def _build(
             spec_token_indx,
             non_spec_token_indx,
             num_accepted_tokens,
+            stale_spec_reqs,
         ) = compute_common_gdn_attn_metadata(
             num_decode_draft_tokens_cpu,
             num_accepted_tokens,
@@ -213,6 +214,7 @@ def _build(
         kwargs["non_spec_sequence_masks_cpu"] = non_spec_sequence_masks_cpu
         kwargs["spec_token_indx"] = spec_token_indx
         kwargs["non_spec_token_indx"] = non_spec_token_indx
+        kwargs["stale_spec_reqs"] = stale_spec_reqs
     return builder.build(common_prefix_len=0, common_attn_metadata=common, **kwargs)
 
 
