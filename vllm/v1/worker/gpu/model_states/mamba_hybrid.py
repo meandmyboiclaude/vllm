@@ -339,6 +339,11 @@ class MambaHybridModelState(DefaultModelState):
                 is_decode = (~input_batch.is_prefilling_np) & (
                     input_batch.num_scheduled_tokens > 0
                 )
+                spec_decode_mask = (num_draft_tokens_per_req > 0) & is_decode
+                num_decode_draft_tokens_np[: input_batch.num_reqs] = np.where(
+                    spec_decode_mask, num_draft_tokens_per_req, -1
+                )
+            num_decode_draft_tokens_cpu = torch.from_numpy(num_decode_draft_tokens_np)
 
             # Compute GDN common metadata
             if self.is_gdn(attn_groups):

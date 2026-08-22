@@ -281,6 +281,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         )
 
         if spec_sequence_masks is None:
+            query_lens_cpu = query_start_loc_cpu.diff()
             if self.use_cached_kernel:
                 # ReplaySSM cached decode: single-token prefill-as-decode rows
                 # route to prefill (step-continuity assumption of the ring).
@@ -291,7 +292,6 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 # prefill path, which masks recycled state pages. Resumed short
                 # prefills already own state and can stay on the decode path.
                 assert m.seq_lens_cpu_upper_bound is not None
-                query_lens_cpu = query_start_loc_cpu.diff()
                 no_prior_state = (query_lens_cpu > 0) & (
                     m.seq_lens_cpu_upper_bound <= query_lens_cpu
                 )
@@ -601,10 +601,13 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             non_spec_query_start_loc = self.non_spec_query_start_loc[: batch_size + 1]
 
             if self.use_cached_kernel:
-                assert write_pos_d is not None
-                self.decode_write_pos_d[:num_decodes].copy_(
-                    write_pos_d, non_blocking=True
-                )
+                # write_pos_d is None when the batch has no live decode rows
+                # (num_decodes == 0, e.g. every row reclassified as prefill or
+                # padding); stage an all-zero buffer in that case.
+                if write_pos_d is not None:
+                    self.decode_write_pos_d[:num_decodes].copy_(
+                        write_pos_d, non_blocking=True
+                    )
                 write_pos_d = self.decode_write_pos_d[:batch_size]
                 # Padded rows map to NULL_BLOCK_ID and hit the kernel's early
                 # return, so their write position is never read; zero is fine.
