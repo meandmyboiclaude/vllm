@@ -1370,6 +1370,11 @@ class EngineCoreProc(EngineCore):
             )
             raise
         except Exception as e:
+            try:  # [FLIGHTREC] durable crash dump before anything else
+                from vllm import _flightrec as _fr
+                _fr.crash(e, where="run_engine_core")
+            except Exception:
+                pass
             if engine_core is None:
                 logger.exception("EngineCore failed to start.")
             else:

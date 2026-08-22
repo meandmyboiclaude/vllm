@@ -73,6 +73,15 @@ class WeightsMapper:
             orig_to_new_suffix={**self.orig_to_new_suffix, **other.orig_to_new_suffix},
         )
 
+    def get_unstacked_mapper(self) -> "WeightsMapper":
+        """Mapper variant that drops stacked maps, keeping all genuine renames/prefixes.
+
+        Consumers that reference the checkpoint's *unstacked* module names (LoRA name
+        parsing and the quantization config's layer lists) need the constituent names
+        (e.g. `q_proj`) to survive rather than being rewritten to the stacked vLLM name
+        (`qkv_proj`)."""
+        return replace(self, orig_to_new_stacked={})
+
     def _map_name(self, key: str) -> str | None:
         """Map a weight name (backward-compatible wrapper that discards shard_id)."""
         result = self._map_name_with_shard(key)

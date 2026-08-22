@@ -397,6 +397,13 @@ class CudaGraphManager:
                             torch.accelerator.synchronize()
                             free_after = torch.accelerator.get_memory_info()[0]
                             self._capture_mem_samples.append(free_before - free_after)
+                        try:  # [FLIGHTREC] per-graph memory curve
+                            from vllm import _flightrec as _fr
+                            _fr.ev("cg.captured", desc=str(desc),
+                                   alloc=torch.cuda.memory_allocated(),
+                                   reserved=torch.cuda.memory_reserved())
+                        except Exception:
+                            pass
                         self.graphs[desc] = graph
                         compilation_counter.num_cudagraph_captured += 1
         self._graphs_captured = True

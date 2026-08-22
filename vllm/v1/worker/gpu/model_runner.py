@@ -366,6 +366,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         return tuple(tasks)
 
     def load_model(self, load_dummy_weights: bool = False, *args, **kwargs) -> None:
+        from vllm import _flightrec as _fr  # [FLIGHTREC]
+        _fr.ev("runner.load_model.enter", dummy=load_dummy_weights)
         time_before_load = time.perf_counter()
         if load_dummy_weights:
             self.load_config.load_format = "dummy"
@@ -389,6 +391,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             if isinstance(self.speculator, DraftModelSpeculator):
                 with use_workspace_lane(self._draft_workspace_lane):
                     self.speculator.load_model(self.model)
+                    from vllm import _flightrec as _fr  # [FLIGHTREC-BRACKET]
+                    import torch as _t
+                    _fr.ev('speculator.loaded', alloc=_t.cuda.memory_allocated(), reserved=_t.cuda.memory_reserved())
                     eplb_models_added = self.eplb.maybe_register_speculator(
                         self.speculator, self.speculative_config, load_dummy_weights
                     )
@@ -885,6 +890,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
     @torch.inference_mode()
     def capture_model(self) -> int:
+        from vllm import _flightrec as _fr  # [FLIGHTREC]
+        _fr.ev("runner.capture_model.enter", alloc=__import__('torch').cuda.memory_allocated(), reserved=__import__('torch').cuda.memory_reserved())
         assert self.cudagraph_manager is not None
         capture_encoder = (
             self.model_state.supports_mm_inputs
