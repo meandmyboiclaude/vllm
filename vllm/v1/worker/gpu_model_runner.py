@@ -1943,7 +1943,9 @@ class GPUModelRunner(
         )
 
         # Scatter the draft tokens after the sampled tokens are scattered.
-        if self._draft_token_ids is None or not spec_flattened_indices:
+        if not torch.is_tensor(self._draft_token_ids) or not spec_flattened_indices:
+            # None, or the per-request empty-list form set by
+            # _set_empty_draft_token_ids (#52762): nothing to stage.
             return
 
         assert isinstance(self._draft_token_ids, torch.Tensor)

@@ -600,6 +600,18 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             )
             non_spec_query_start_loc = self.non_spec_query_start_loc[: batch_size + 1]
 
+            # The staged arrays are batch_size-wide; keep has_initial_state the
+            # same length (padded rows have no state and zero-length queries).
+            if has_initial_state is not None and has_initial_state.size(0) < batch_size:
+                has_initial_state = torch.cat(
+                    [
+                        has_initial_state,
+                        has_initial_state.new_zeros(
+                            batch_size - has_initial_state.size(0)
+                        ),
+                    ]
+                )
+
             if self.use_cached_kernel:
                 # write_pos_d is None when the batch has no live decode rows
                 # (num_decodes == 0, e.g. every row reclassified as prefill or

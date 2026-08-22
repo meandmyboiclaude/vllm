@@ -171,9 +171,14 @@ def _build(
         num_decode_draft_tokens_cpu = torch.tensor(
             num_decode_draft_tokens, dtype=torch.int32
         )
-        num_accepted_tokens = torch.ones(
-            batch_spec.batch_size, dtype=torch.int32, device=DEVICE
-        )
+        if num_accepted_tokens is None:
+            num_accepted_tokens = torch.ones(
+                batch_spec.batch_size, dtype=torch.int32, device=DEVICE
+            )
+        else:
+            num_accepted_tokens = torch.tensor(
+                num_accepted_tokens, dtype=torch.int32, device=DEVICE
+            )
         (
             num_prefills,
             num_prefill_tokens,
