@@ -309,7 +309,11 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             dispatch_cg_and_sync_dp(
                 self.prefill_cudagraph_manager,
                 num_reqs,
-                num_tokens,
+                # The draft prefill reuses the target model's attn_metadata and
+                # slot mappings, which are built for the padded count; upstream
+                # #47352 dispatches on it so the draft graph can never select a
+                # size below the target's padding.
+                num_tokens_padded,
                 uniform_token_count,
                 dp_size=self.dp_size,
                 dp_rank=self.dp_rank,

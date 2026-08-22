@@ -567,6 +567,9 @@ class CommonAttentionMetadata:
             positions=self.positions[:num_actual_tokens]
             if self.positions is not None
             else None,
+            # Keyed by real request index (padding rows never appear), so the
+            # dict passes through unchanged on an unpadded rebuild.
+            mm_req_doc_ranges=self.mm_req_doc_ranges,
         )
 
 

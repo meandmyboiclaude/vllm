@@ -378,6 +378,13 @@ class CacheConfig:
                 "Dynamic per-token-head scales will be computed at runtime.",
                 str(cache_dtype),
             )
+        elif str(cache_dtype).startswith(("kvarn_", "turboquant_")):
+            logger.info(
+                "Using %s packed-codec data type to store kv cache. Slot "
+                "layout and dequantization are self-described by the codec "
+                "preset; no runtime scaling factors are involved.",
+                str(cache_dtype),
+            )
         elif is_quantized_kv_cache(cache_dtype):
             logger.info(
                 "Using %s data type to store kv cache. It reduces the GPU "

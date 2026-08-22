@@ -2494,6 +2494,11 @@ class GPUModelRunner(
         # Zero out padded rows so stale data from condense() doesn't
         # misclassify padding as prefill in CUDA graph mode.
         is_prefilling[num_reqs:] = False
+        # Padded rows also carry stale prompt lengths from condense(); the
+        # mamba cached-spec dummy-row guard keys on num_prompt_tokens > 0,
+        # so zero them or a stale positive length leaves a padding row
+        # treated as live. Vacant slots are rewritten when reoccupied.
+        num_prompt_tokens_cpu[num_reqs:] = 0
 
         if self.use_async_spec_decode:
             # GPU tensors are authoritative in async mode.
@@ -6968,6 +6973,12 @@ class GPUModelRunner(
                         free_after = torch.accelerator.get_memory_info()[0]
                         mem_samples.append(mem_before - free_after)
 
+                    if not mem_samples:
+                        # No graphs to capture for this mode; estimate nothing
+                        # rather than indexing an empty sample list.
+                        shared_memory_estimate[mode] = 0
+                        per_graph_estimate[mode] = 0
+                        continue
                     first_capture = mem_samples[0]
                     # Use at least 1 MiB per graph for driver overhead
                     per_graph = max(

@@ -170,9 +170,15 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
 
         # keep the states for multi-query tokens
         if INPLACE_FINAL_STATE:
-            # Load state index and check for invalid entries
+            # Load state index and check for invalid entries. Mask the load
+            # to the row (i_t can exceed the per-request column count, the
+            # same class #50021 bounded on the initial-state load) and let
+            # ``other=0`` fall into the invalid-state skip below.
+            idx_in_row = (i_t >= 0) & (i_t < stride_indices_seq)
             final_state_idx = tl.load(
-                ssm_state_indices + i_n * stride_indices_seq + i_t
+                ssm_state_indices + i_n * stride_indices_seq + i_t,
+                mask=idx_in_row,
+                other=0,
             ).to(tl.int64)
             # Only store if state index is valid (not NULL_BLOCK_ID=0)
             if final_state_idx > 0:
