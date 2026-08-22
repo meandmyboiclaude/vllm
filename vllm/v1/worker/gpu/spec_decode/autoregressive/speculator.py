@@ -370,19 +370,25 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             )
 
         # Generate the remaining num_speculative_steps - 1 draft tokens.
-        decode_fn = (
-            self._fused_multi_step_decode
-            if self.use_fused_multi_step_decode
-            else self._multi_step_decode
-        )
-        decode_fn(
-            num_reqs,
-            dummy_run and skip_attn_for_dummy_run,
-            decode_batch_desc,
-            num_tokens_across_dp,
-            input_batch.seq_lens_cpu_upper_bound,
-            skip_rows=skip_rows,
-        )
+        # The fused implementation has no skip_rows support; steps that must
+        # mask draft KV writes (carried #48244) take the unfused path.
+        if self.use_fused_multi_step_decode and skip_rows is None:
+            self._fused_multi_step_decode(
+                num_reqs,
+                dummy_run and skip_attn_for_dummy_run,
+                decode_batch_desc,
+                num_tokens_across_dp,
+                input_batch.seq_lens_cpu_upper_bound,
+            )
+        else:
+            self._multi_step_decode(
+                num_reqs,
+                dummy_run and skip_attn_for_dummy_run,
+                decode_batch_desc,
+                num_tokens_across_dp,
+                input_batch.seq_lens_cpu_upper_bound,
+                skip_rows=skip_rows,
+            )
         self.on_multi_step_decode_end(num_reqs)
 
         return self.draft_tokens[:num_reqs]
