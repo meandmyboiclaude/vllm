@@ -3080,7 +3080,6 @@ def test_unify_kv_cache_spec_page_size_keeps_block_sizes_commensurate():
         head_size=128,
         dtype=torch.bfloat16,
         sliding_window=2048,
-        indexes_kv_by_block_stride=True,
     )
 
     unified = kv_cache_utils.unify_kv_cache_spec_page_size(
@@ -3097,16 +3096,10 @@ def test_unify_kv_cache_spec_page_size_keeps_block_sizes_commensurate():
     block_sizes = [spec.block_size for spec in unified.values()]
     assert math.lcm(*block_sizes) == 1536
 
-    # Without padded-page backend support, byte-exact scaling is kept.
-    draft_swa_no_stride = replace(draft_swa_spec, indexes_kv_by_block_stride=False)
-    unified = kv_cache_utils.unify_kv_cache_spec_page_size(
-        {
-            "mla_layer": mla_spec,
-            "mamba_layer": mamba_spec,
-            "draft_swa_layer": draft_swa_no_stride,
-        }
-    )
-    assert unified["draft_swa_layer"].block_size == 3456
+    # NOTE(rebase6): the PR's indexes_kv_by_block_stride capability flag does
+    # not exist on this base — the adapted gate keys on AttentionSpec-and-not-
+    # MLA instead — so the PR's "no padded-page backend support" leg has no
+    # expressible setup here and is not carried.
 
     # Commensurate byte-exact scaling (e.g. Gemma-style 2:1 pages) is
     # preferred over padding even when the backend supports it.
@@ -3119,7 +3112,6 @@ def test_unify_kv_cache_spec_page_size_keeps_block_sizes_commensurate():
         head_size=128,
         dtype=torch.bfloat16,
         sliding_window=1024,
-        indexes_kv_by_block_stride=True,
     )
     unified = kv_cache_utils.unify_kv_cache_spec_page_size(
         {"full_layer": full_spec, "swa_layer": swa_spec}

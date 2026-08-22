@@ -835,7 +835,6 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
     @torch.inference_mode()
     def profile_run(self) -> None:
-        should_skip_attn = not self.model_config.is_hybrid
         if self.supports_mm_inputs and self.is_first_pp_rank:
             mm_config = self.model_config.multimodal_config
             if mm_config is not None and not mm_config.skip_mm_profiling:
@@ -853,7 +852,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                 )
 
         hidden_states, sample_hidden_states = self._dummy_run(
-            self.max_num_tokens, skip_attn=should_skip_attn, is_profile=True
+            self.max_num_tokens, skip_attn=True, is_profile=True
         )
 
         # Only run sampler/pooler on last PP rank (non-last ranks return None).
@@ -1308,7 +1307,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         no_draft_req_ids = scheduler_output.no_draft_req_ids
         if no_draft_req_ids:
             mask_iter = (req_id in no_draft_req_ids for req_id in req_ids)
-            no_draft_mask_np = np.fromiter(mask_iter, dtype=np.bool, count=num_reqs)
+            no_draft_mask_np = np.fromiter(mask_iter, dtype=np.bool_, count=num_reqs)
 
         input_batch = InputBatch(
             req_ids=req_ids,
