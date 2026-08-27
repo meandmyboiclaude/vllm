@@ -66,6 +66,12 @@ def _store_quantized_value(
             v_var = tl.sum(v_cen * v_cen, axis=0) / D
             v_scale = tl.sqrt(v_var)
             v_scale = tl.where(v_scale > 1e-8, v_scale, 1e-8)
+            # Same fp16-storage hazard as the uniform branch below: (std, mean)
+            # are the stored pair, so clamp them into the fp16 finite range
+            # before companding, keeping the companding constants identical to
+            # the ones written to the cache.
+            v_scale = tl.minimum(v_scale, 65504.0)
+            v_mean = tl.maximum(tl.minimum(v_mean, 65504.0), -65504.0)
             v_zero = v_mean
             z = (val_vec - v_mean) / v_scale
             q_vals = tl.zeros([BLOCK_D], dtype=tl.int32)
@@ -76,6 +82,16 @@ def _store_quantized_value(
         else:
             val_min = tl.min(tl.where(d_mask, val_vec, float("inf")), axis=0)
             val_max = tl.max(tl.where(d_mask, val_vec, -float("inf")), axis=0)
+            # The per-vector scale and zero point are stored as fp16 further
+            # down. Clamp the observed range into fp16's finite limits *before*
+            # deriving the scale and quantizing, so the zero point used to
+            # quantize is the same one that is stored and later used to
+            # reconstruct. A bf16 value outlier (an attention sink of
+            # |min| > 65504 has been measured in real checkpoints) would
+            # otherwise cast to -inf at store time and poison every element of
+            # the vector on reconstruction.
+            val_min = tl.maximum(val_min, -65504.0)
+            val_max = tl.minimum(val_max, 65504.0)
             v_scale = (val_max - val_min) / 7.0
             v_scale = tl.where(v_scale > 1e-8, v_scale, 1e-8)
             v_zero = val_min
@@ -129,6 +145,11 @@ def _store_quantized_value(
         )
         val_min = tl.min(tl.where(d_mask, val_vec, float("inf")), axis=0)
         val_max = tl.max(tl.where(d_mask, val_vec, -float("inf")), axis=0)
+        # See the VQB == 3 branch: clamp into the fp16 finite range before the
+        # scale/zero are derived, since both are stored as fp16 below and the
+        # zero point used to quantize must equal the one used to reconstruct.
+        val_min = tl.maximum(val_min, -65504.0)
+        val_max = tl.minimum(val_max, 65504.0)
         v_scale = (val_max - val_min) / 15.0
         v_scale = tl.where(v_scale > 1e-8, v_scale, 1e-8)
 
@@ -174,6 +195,12 @@ def _store_quantized_value(
             oi = tl.load(Outlier_idx_ptr + outlier_row * N_OUTLIERS + _j).to(tl.uint8)
             tl.store(KV_cache_ptr + slot_base + out_off + _j, oi)
             ov = tl.load(Outlier_val_ptr + outlier_row * N_OUTLIERS + _j)
+            # Same fp16-storage hazard as the scale/zero pair: this channel
+            # exists to carry the largest magnitudes in the vector, so it is the
+            # most likely to leave the fp16 finite range. A saturated outlier is
+            # inexact for |v| > 65504; a stored inf poisons the reconstructed
+            # element and everything downstream of it.
+            ov = tl.maximum(tl.minimum(ov, 65504.0), -65504.0)
             ov_u16 = ov.to(tl.float16).to(tl.uint16, bitcast=True)
             vpos = out_off + N_OUTLIERS + 2 * _j
             tl.store(KV_cache_ptr + slot_base + vpos, (ov_u16 & 0xFF).to(tl.uint8))

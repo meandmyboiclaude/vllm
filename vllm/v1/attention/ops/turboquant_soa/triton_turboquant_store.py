@@ -52,6 +52,15 @@ def _store_quantized_value(
         )
         val_min = tl.min(tl.where(d_mask, val_vec, float("inf")), axis=0)
         val_max = tl.max(tl.where(d_mask, val_vec, -float("inf")), axis=0)
+        # The per-vector scale and zero point are written as fp16 into the SoA
+        # metadata region below. Clamp the observed range into fp16's finite
+        # limits *before* deriving the scale and quantizing, so the zero point
+        # used to quantize is the same one that is stored and later used to
+        # reconstruct. A bf16 value outlier (an attention sink of |min| > 65504
+        # has been measured in real checkpoints) would otherwise bitcast to the
+        # fp16 -inf pattern and poison every element of the vector on decode.
+        val_min = tl.maximum(val_min, -65504.0)
+        val_max = tl.minimum(val_max, 65504.0)
         v_scale = (val_max - val_min) / 7.0
         v_scale = tl.where(v_scale > 1e-8, v_scale, 1e-8)
 
@@ -88,6 +97,12 @@ def _store_quantized_value(
         )
         val_min = tl.min(tl.where(d_mask, val_vec, float("inf")), axis=0)
         val_max = tl.max(tl.where(d_mask, val_vec, -float("inf")), axis=0)
+        # See the VQB == 3 branch: clamp into the fp16 finite range before the
+        # scale/zero are derived, since both are bitcast to fp16 in the SoA
+        # metadata store below and the zero point used to quantize must equal
+        # the one used to reconstruct.
+        val_min = tl.maximum(val_min, -65504.0)
+        val_max = tl.minimum(val_max, 65504.0)
         v_scale = (val_max - val_min) / 15.0
         v_scale = tl.where(v_scale > 1e-8, v_scale, 1e-8)
 
