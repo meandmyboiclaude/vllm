@@ -33,7 +33,7 @@ def _run_sync(local_want_skip: bool, other_want_skip: bool) -> bool:
         mock.patch.object(dp_utils.dist, "all_reduce", fake_all_reduce),
     ):
         mock_group.return_value.cpu_group = None
-        _, _, skip_drafts = dp_utils.sync_cudagraph_and_dp_padding(
+        _, sync = dp_utils.sync_cudagraph_and_dp_padding(
             cudagraph_manager=None,
             desired_batch_desc=desc,
             num_tokens=4,
@@ -43,7 +43,8 @@ def _run_sync(local_want_skip: bool, other_want_skip: bool) -> bool:
             dp_rank=0,
             want_skip_drafts=local_want_skip,
         )
-    return skip_drafts
+    assert sync is not None
+    return sync.skip_drafts
 
 
 def test_skip_drafts_requires_all_ranks():

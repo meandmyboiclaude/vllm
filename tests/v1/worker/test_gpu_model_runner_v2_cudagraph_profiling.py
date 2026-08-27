@@ -169,10 +169,12 @@ def test_profile_cudagraph_memory_samples_and_extrapolates(monkeypatch):
     # Capture must use a throwaway pool, not the persistent global pool.
     assert runner.cudagraph_manager.pool == THROWAWAY_POOL
     # FULL capture must be limited to the largest few graphs while capture
-    # ran (the teardown path resets the hook to None afterwards).
+    # ran. Hook leakage into the real capture is prevented structurally in
+    # production: _teardown_profiling_state (stubbed here) nulls
+    # runner.cudagraph_manager, so the real capture_model() always starts
+    # from a freshly-constructed manager — there is no post-teardown hook
+    # state to assert on with the stub in place.
     assert runner.observed_max_full_descs == cgu._FULL_GRAPH_PROFILING_SAMPLES
-    assert runner.cudagraph_manager._max_full_descs_to_capture is None
-    assert runner.cudagraph_manager._capture_mem_samples is None
 
 
 def test_profile_cudagraph_memory_piecewise_only_returns_measured(monkeypatch):

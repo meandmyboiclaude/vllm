@@ -85,6 +85,9 @@ def sync_cudagraph_and_dp_padding(
         synced_desc = BatchExecutionDescriptor(
             cg_mode=CUDAGraphMode.NONE, num_tokens=0, num_reqs=0
         )
+        # skip_drafts is intentionally not propagated here: sync=None means
+        # no rank has work, so there is no draft work to skip either way
+        # (the dispatch wrapper maps a None sync to skip_drafts=False).
         return synced_desc, None
 
     synced_cg_mode = CUDAGraphMode(int(cg_mode_across_dp.min().item()))

@@ -264,6 +264,14 @@ class BatchSharder:
             input_batch,
             req_ids=local_req_ids,
             num_reqs=num_local_reqs,
+            # Carried #48244 field is [num_reqs]-shaped; re-slice it like
+            # pcp_manager does, so a sharded batch never carries a
+            # global-length mask next to a smaller num_reqs.
+            no_draft_mask_np=(
+                input_batch.no_draft_mask_np[local_req_indices_np]
+                if input_batch.no_draft_mask_np is not None
+                else None
+            ),
             idx_mapping=local_idx_mapping,
             idx_mapping_np=local_idx_mapping_np,
             expanded_idx_mapping=local_expanded_idx_mapping,
