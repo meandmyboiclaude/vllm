@@ -83,7 +83,7 @@ def fused_recurrent_gated_delta_rule_replayssm_kernel(
     softplus_x = tl.where(x <= SOFTPLUS_THRESHOLD, tl.log(1.0 + tl.exp(x)), x)
     g_val = -tl.exp(A_log_val) * softplus_x
     alpha_val = tl.exp(g_val)
-    beta_val = tl.sigmoid(b_val).to(b.dtype.element_ty).to(tl.float32)
+    beta_val = tl.sigmoid(b_val)
 
     # Replay decay over the committed cache, from the cached per-step gates g.
     p_g_main = g_cache + state_idx * stride_g_slot + i_hv * MAX_CACHE_LEN + o_c
