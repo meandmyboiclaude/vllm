@@ -550,6 +550,7 @@ def _prepare_dflash_inputs_kernel(
     # Outputs
     out_input_ids_ptr,
     out_query_positions_ptr,
+    out_is_padding_ptr,
     out_query_start_loc_ptr,
     out_seq_lens_ptr,
     out_query_slot_mapping_ptr,
@@ -682,6 +683,7 @@ def _prepare_dflash_inputs_kernel(
     tl.store(out_input_ids_ptr + query_idx, input_id, mask=is_query)
     clamped_query_pos = tl.minimum(query_pos, max_model_len - 1)
     tl.store(out_query_positions_ptr + query_idx, clamped_query_pos, mask=is_query)
+    tl.store(out_is_padding_ptr + query_idx, False, mask=is_query)
     tl.store(out_query_slot_mapping_ptr + query_idx, q_slot, mask=is_query)
 
     # --- Sample indices / positions / idx_mapping ---
@@ -735,13 +737,19 @@ def _prepare_dflash_inputs_kernel(
                 tl.store(out_sample_indices_ptr + block, 0, mask=mask)
                 tl.store(out_sample_pos_ptr + block, 0, mask=mask)
                 tl.store(out_sample_idx_mapping_ptr + block, -1, mask=mask)
-            # Pad query slot mappings past num_query_tokens with PAD so the
-            # captured CG sees PAD slots (no K/V write) for replay sizes
-            # larger than the current request count.
+            # Pad query rows past num_query_tokens so the captured CG sees
+            # deterministic, inert rows for replay sizes larger than the
+            # current request count: token id 0 and position 0 instead of
+            # whatever a previous step left behind (a stale id can be the -1
+            # sentinel, which reaches the embedding and the DFlash2 selector
+            # codebook gathers), and PAD slots so no K/V is written.
             q_pad_start = num_reqs * num_query_per_req
             for i in range(q_pad_start, max_num_tokens, BLOCK_SIZE):
                 block = i + tl.arange(0, BLOCK_SIZE)
                 mask = block < max_num_tokens
+                tl.store(out_input_ids_ptr + block, 0, mask=mask)
+                tl.store(out_query_positions_ptr + block, 0, mask=mask)
+                tl.store(out_is_padding_ptr + block, True, mask=mask)
                 tl.store(out_query_slot_mapping_ptr + block, PAD_SLOT_ID, mask=mask)
 
 
@@ -793,6 +801,7 @@ def prepare_dflash_inputs(
     _prepare_dflash_inputs_kernel[(num_reqs, num_blocks)](
         input_buffers.input_ids,
         input_buffers.positions,
+        input_buffers.is_padding,
         input_buffers.query_start_loc,
         input_buffers.seq_lens,
         query_slot_mapping,
