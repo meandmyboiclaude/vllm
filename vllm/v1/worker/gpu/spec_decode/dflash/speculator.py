@@ -41,6 +41,23 @@ class DFlashSpeculator(DraftModelSpeculator):
             self.max_num_tokens, self.hidden_size, dtype=self.dtype, device=device
         )
 
+        # Persistent, CUDA-graph-stable buffer for the draft ids' embeddings.
+        # The draft ids are embedded OUTSIDE the compiled drafter forward into
+        # this buffer (see _run_model): embedding in-compile trips a
+        # data-dependent local_scalar_dense in F.embedding -> orphan unbacked
+        # SymInt (PendingUnbackedSymbolNotFound {u0}) at the drafter's AOT
+        # compile, blocking graph mode. Mirrors the base speculator's buffer
+        # discipline.
+        # NOTE(vendor): sized from the draft config's own hidden size, NOT
+        # self.hidden_size — the latter is widened by hc_mult for HC-multiplexed
+        # residuals (DSpark), while embed_input_ids always returns [T, hidden].
+        self.inputs_embeds = torch.zeros(
+            self.max_num_tokens,
+            self.draft_model_config.get_hidden_size(),
+            dtype=self.dtype,
+            device=device,
+        )
+
         # Multimodal inputs not currently supported.
         self.supports_mm_inputs = False
 
@@ -243,10 +260,29 @@ class DFlashSpeculator(DraftModelSpeculator):
             slot_mapping=slot_mappings,
             batch_descriptor=batch_descriptor,
         ):
+            # Embed the draft ids outside the compiled forward into the
+            # CUDA-graph-stable buffer, then hand the model inputs_embeds.
+            # Numerically identical to embedding in-compile: the model's forward
+            # would call the same embed_input_ids (incl. DFlash2's
+            # input_embedding_scale override and the separate-mask-embedding
+            # substitution); only WHERE it runs changes. Keeps F.embedding out
+            # of the @support_torch_compile graph, where it trips a
+            # data-dependent local_scalar_dense -> orphan unbacked SymInt
+            # (PendingUnbackedSymbolNotFound {u0}) at AOT compile, and where the
+            # warmup -1 sentinel ids reach an inductor-lowered bounds assert.
+            # NOTE(vendor): upstream passes input_ids=None here. We keep passing
+            # input_ids because DSparkSpeculator shares this _run_model and its
+            # model still consumes input_ids (sp_shard + per-layer markov head)
+            # even when inputs_embeds is supplied. The DFlash/DFlash2 models
+            # ignore input_ids once input_embeds is not None, so the embedding
+            # is still out of the compiled region for them.
+            self.inputs_embeds[:num_tokens] = self.model.embed_input_ids(
+                self.input_buffers.input_ids[:num_tokens]
+            )
             last_hidden_states = self.model(
                 input_ids=self.input_buffers.input_ids[:num_tokens],
                 positions=self.input_buffers.positions[:num_tokens],
-                inputs_embeds=None,
+                inputs_embeds=self.inputs_embeds[:num_tokens],
             )
         return last_hidden_states
 
