@@ -8,7 +8,7 @@ import math
 import os
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Iterator, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, fields, replace
 from functools import partial
 from typing import Any, NamedTuple, NewType, TypeAlias, overload
 
@@ -1690,12 +1690,21 @@ def _promote_local_kv_cache_specs(
                 continue
             assert isinstance(spec, AttentionSpec)
             block_size = full_attention_block_size or spec.block_size
+            # Promoted specs allocate blocks for all tokens and never free
+            # below the window, so the trailing-edge extension is moot.
+            dropped = ["extra_retained_tokens"]
+            if "non_causal_multi_token_decode" not in {
+                f.name for f in fields(target_cls)
+            }:
+                # MLAAttentionSpec carries the draft marker and keeps it;
+                # FullAttentionSpec has no such field. Promotion folds the
+                # draft into the target's single full-attention group, where
+                # the coordinator's flag-all covers the last-block drop.
+                dropped.append("non_causal_multi_token_decode")
             promoted_specs[layer_name] = replace_as(
                 spec,
                 target_cls,
-                # Promoted specs allocate blocks for all tokens and never free
-                # below the window, so the trailing-edge extension is moot.
-                drop=("extra_retained_tokens",),
+                drop=tuple(dropped),
                 block_size=block_size,
                 page_size_padded=promoted_page_size_padded(spec, block_size),
             )
@@ -1956,6 +1965,22 @@ def _annotate_eagle_groups_deepseek_v4(
             break
 
 
+def _annotate_eagle_groups_from_spec(
+    kv_cache_groups: list[KVCacheGroupSpec],
+) -> None:
+    """Flag groups whose spec publishes a draft multi-token decode marker.
+
+    Complements `_annotate_eagle_groups_deepseek_v4`, which uses last-layer
+    position on the DeepseekV4 path. This covers the general hybrid grouping
+    path (e.g. Qwen3.8 + DFlash2 SWA draft), where flagging nothing makes the
+    coordinator fall back to flagging every group, including the target's full
+    attention and Mamba groups.
+    """
+    for group in kv_cache_groups:
+        if getattr(group.kv_cache_spec, "non_causal_multi_token_decode", False):
+            group.is_eagle_group = True
+
+
 def _largest_divisor_at_most(value: int, limit: int) -> int:
     for candidate in range(min(value, limit), 0, -1):
         if value % candidate == 0:
@@ -2045,6 +2070,7 @@ def get_kv_cache_groups(
             aligned = replace(spec, block_size=new_bs, page_size_padded=common_page)
             groups.append(KVCacheGroupSpec([name], aligned))
 
+    _annotate_eagle_groups_from_spec(groups)
     return groups
 
 

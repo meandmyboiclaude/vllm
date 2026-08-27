@@ -827,6 +827,10 @@ class SlidingWindowSpec(AttentionSpec):
     # re-prefill the last num_spec_prefill_tokens - 1 tokens from the end
     # of the sequence, and thus needs to delay freeing/caching of blocks.
     extra_retained_tokens: int = 0
+    # Same name as MLAAttentionSpec: marks a speculative draft SWA group so
+    # the general hybrid grouping path can set KVCacheGroupSpec.is_eagle_group.
+    # Does not set AttentionSpec.non_causal (that disables prefix caching).
+    non_causal_multi_token_decode: bool = False
 
     def max_admission_blocks_per_request(
         self, max_in_flight_tokens: int, max_model_len: int
@@ -906,16 +910,19 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
         model_version_set = set(spec.model_version for spec in specs)
         sliding_window_set = set(spec.sliding_window for spec in specs)
         extra_retained_set = set(spec.extra_retained_tokens for spec in specs)
+        non_causal_mtd_set = set(spec.non_causal_multi_token_decode for spec in specs)
         assert (
             len(cache_dtype_str_set) == 1
             and len(tokens_per_state_set) == 1
             and len(model_version_set) == 1
             and len(sliding_window_set) == 1
             and len(extra_retained_set) == 1
+            and len(non_causal_mtd_set) == 1
         ), (
             "All attention layers in the same KV cache group must use the same "
             "quantization method, tokens per state, model version, sliding "
-            "window size, and retained token count."
+            "window size, retained token count, and draft multi-token decode "
+            "marker."
         )
         return cls(
             block_size=specs[0].block_size,
@@ -927,6 +934,7 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
             state_content_bytes=specs[0].state_content_bytes,
             sliding_window=sliding_window_set.pop(),
             extra_retained_tokens=extra_retained_set.pop(),
+            non_causal_multi_token_decode=non_causal_mtd_set.pop(),
             cache_dtype_str=cache_dtype_str_set.pop(),
             tokens_per_state=tokens_per_state_set.pop(),
             model_version=model_version_set.pop(),
