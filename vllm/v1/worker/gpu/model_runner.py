@@ -87,7 +87,7 @@ from vllm.v1.worker.gpu.attn_utils import (
 )
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.buffer_utils import (
-    async_copy_to_gpu,
+    CpuGpuBuffer,
     set_default_max_concurrency,
 )
 from vllm.v1.worker.gpu.cp_utils import prepare_dcp_local_seq_lens
@@ -331,6 +331,18 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         # KV Connector if configured.
         self.kv_connector: KVConnector = NO_OP_KV_CONNECTOR
+
+        # Pre-allocated tensors for reuse. The CPU-side ring depth comes from
+        # _DEFAULT_MAX_CONCURRENCY, already set from max_concurrent_batches above.
+        int32_buf_kwargs = dict(dtype=torch.int32, device=self.device)
+        self.idx_mapping = CpuGpuBuffer(self.max_num_reqs, **int32_buf_kwargs)
+        self.cu_num_logits = CpuGpuBuffer(self.max_num_reqs + 1, **int32_buf_kwargs)
+        self.query_start_loc = CpuGpuBuffer(gpu=self.input_buffers.query_start_loc)
+
+        # Pre-allocated read-only buffers.
+        self.arange_np = np.arange(self.max_num_reqs + 1, dtype=np.int32)
+        self.arange_gpu = torch.arange(self.max_num_reqs + 1, **int32_buf_kwargs)
+        self.zeros_gpu = torch.zeros(self.max_num_reqs, **int32_buf_kwargs)
 
         # For transferring state from execute_model to subsequent sample_tokens call.
         self.execute_model_state: ExecuteModelState | None = None
@@ -1168,8 +1180,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         req_ids = batch_req_state.req_ids
         num_scheduled_tokens_np = batch_req_state.num_scheduled_tokens
         idx_mapping_np = batch_req_state.idx_mapping_np
-        idx_mapping = async_copy_to_gpu(idx_mapping_np, device=self.device)
         num_reqs = len(req_ids)
+        self.idx_mapping.np[:num_reqs] = idx_mapping_np
+        idx_mapping = self.idx_mapping.copy_to_gpu(num_reqs)
 
         # Get the number of draft tokens for each request.
         draft_tokens = scheduler_output.scheduled_spec_decode_tokens
@@ -1178,14 +1191,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # No draft token scheduled (common case).
             total_num_draft_tokens = 0
             total_num_logits = num_reqs
-            cu_num_logits_np = np.arange(num_reqs + 1, dtype=np.int32)
-            cu_num_logits = torch.arange(
-                num_reqs + 1, device=self.device, dtype=torch.int32
-            )
+            cu_num_logits_np = self.arange_np[: num_reqs + 1]
+            cu_num_logits = self.arange_gpu[: num_reqs + 1]
             expanded_idx_mapping = idx_mapping
-            expanded_local_pos = torch.zeros(
-                num_reqs, dtype=torch.int32, device=self.device
-            )
+            expanded_local_pos = self.zeros_gpu[:num_reqs]
         else:
             num_draft_tokens_per_req = np.fromiter(
                 (len(draft_tokens.get(req_id, ())) for req_id in req_ids),
@@ -1196,10 +1205,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             total_num_draft_tokens = int(num_draft_tokens_per_req.sum())
             total_num_logits = num_reqs * num_bonus_tokens + total_num_draft_tokens
             num_logits = num_draft_tokens_per_req + num_bonus_tokens
-            cu_num_logits_np = np.empty(num_reqs + 1, dtype=np.int32)
+            cu_num_logits_np = self.cu_num_logits.np[: num_reqs + 1]
             cu_num_logits_np[0] = 0
             np.cumsum(num_logits, out=cu_num_logits_np[1:])
-            cu_num_logits = async_copy_to_gpu(cu_num_logits_np, device=self.device)
+            cu_num_logits = self.cu_num_logits.copy_to_gpu(num_reqs + 1)
 
         adaptive_verification = (
             self.adaptive_verification if num_draft_tokens_per_req is not None else None
@@ -1220,14 +1229,13 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Get query_start_loc.
         # num_reqs_padded is None for PIECEWISE graphs (no request padding needed)
         num_reqs_padded = batch_desc.num_reqs or num_reqs
-        query_start_loc_np = np.empty(self.max_num_reqs + 1, dtype=np.int32)
+        query_start_loc_np = self.query_start_loc.np
         query_start_loc_np[0] = 0
         np.cumsum(num_scheduled_tokens_np, out=query_start_loc_np[1 : num_reqs + 1])
         # Pad for full CUDA graph mode.
         # Some attention backends like FA3 require query_start_loc to be non-decreasing.
         query_start_loc_np[num_reqs + 1 :] = num_tokens
-        query_start_loc = self.input_buffers.query_start_loc
-        async_copy_to_gpu(query_start_loc_np, out=query_start_loc)
+        query_start_loc = self.query_start_loc.copy_to_gpu()
         if adaptive_verification is not None:
             cu_num_logits, query_start_loc, total_num_draft_tokens = (
                 adaptive_verification.reallocate_drafts(req_ids, idx_mapping)
