@@ -1103,6 +1103,65 @@ def _commensurate_padded_block_size(
     return None
 
 
+def _unify_branch_page_size_bytes(layer_spec: KVCacheSpec) -> int:
+    """Page size the branch choice and the scaling ratio are taken from.
+
+    Non-MLA attention uses its natural (unpadded) page: a spec that already
+    carries ``page_size_padded`` would otherwise pick its branch and its ratio
+    from the stale padding, under-scale, and trip the
+    ``page_size_padded >= unpadded`` assertion once the grown natural page
+    outruns that padding. MLA is excluded because its padding is not stale but
+    the product of its own ``alignment``, reapplied by ``__post_init__`` on
+    every ``replace``, so the aligned page is the correct base (and clearing it
+    would simply be undone).
+    """
+    if isinstance(layer_spec, AttentionSpec) and not isinstance(
+        layer_spec, MLAAttentionSpec
+    ):
+        return layer_spec.unpadded_page_size_bytes
+    return layer_spec.page_size_bytes
+
+
+def _scale_block_size_before_padding(
+    layer_spec: AttentionSpec, max_page_size: int
+) -> AttentionSpec:
+    """Grow a to-be-padded layer's block size by the whole part of the ratio.
+
+    Padding alone leaves the layer holding its original (small) token count in
+    a page sized for the group maximum, while per-request block demand is
+    charged at the pool page size: a spec-decode draft head next to a quantized
+    primary lands at ``block_size=16`` against a multi-MiB page and claims tens
+    of times the blocks it needs, which fails the capacity check outright.
+    Scaling the block first keeps block accounting proportional and leaves only
+    the remainder to pad. The scaled block is a whole multiple of the original,
+    so kernel block alignment is preserved, and any pre-existing padding is
+    dropped from the candidate (see ``_unify_branch_page_size_bytes``).
+
+    Returns ``layer_spec`` unchanged when no scale is available.
+    """
+    natural_page_size = layer_spec.unpadded_page_size_bytes
+    whole_ratio = max_page_size // natural_page_size
+    for ratio in range(whole_ratio, 1, -1):
+        # Kernel blocks of the layer's current (pre-scale) block size subdivide
+        # the padded page and ``compute_layout_strides`` distributes the
+        # padding evenly across them, so the padded page must split into
+        # ``ratio`` equal pieces or view creation asserts at boot. Same guard as
+        # ``_commensurate_padded_block_size``; it is a worst case, since a
+        # backend that supports the scaled block directly never splits at all.
+        if max_page_size % ratio != 0:
+            continue
+        scaled = replace(
+            layer_spec,
+            block_size=layer_spec.block_size * ratio,
+            page_size_padded=None,
+        )
+        # Not every spec's page is linear in block_size (states can be floored
+        # from a tokens-per-state packing), so check the grown page by hand.
+        if scaled.page_size_bytes <= max_page_size:
+            return scaled
+    return layer_spec
+
+
 def unify_kv_cache_spec_page_size(
     kv_cache_spec: dict[str, KVCacheSpec],
 ) -> dict[str, KVCacheSpec]:
@@ -1117,7 +1176,10 @@ def unify_kv_cache_spec_page_size(
     strided view). MLA is excluded because sparse MLA indexes the cache in
     whole token rows (see ``flat_kv_row_view``), so its block stride can only
     be padded by its own row-aligned ``alignment``, not to an arbitrary page
-    size. Raise NotImplementedError if failed to unify the page size;
+    size. A padded non-MLA attention layer still grows its block size by the
+    whole part of the ratio first (see ``_scale_block_size_before_padding``),
+    so it does not pay a max-size page for a block that holds its original
+    token count. Raise NotImplementedError if failed to unify the page size;
     ``get_kv_cache_groups`` catches it to try the full-allocation fallback
     (e.g. MLA next to an incompatible sliding-window draft).
 
@@ -1138,17 +1200,38 @@ def unify_kv_cache_spec_page_size(
     # size is the LCM of all group block sizes and prefix-cache hits align to
     # it, so an incommensurate block size (e.g. a draft model's SWA layers
     # over an MLA + mamba target) multiplies the hit granularity.
-    # Include every layer that will KEEP its block size below: those already
-    # at the max page, Mamba layers (padded, never scaled), and layers whose
-    # page does not divide the max (padded in the elif). All of them
-    # contribute to the final scheduler LCM the candidate must divide into.
+    # Include every layer that does NOT take the byte-exact scaling path
+    # below: those already at the max page, Mamba layers (padded, never
+    # scaled), and layers whose page does not divide the max (padded in the
+    # elif). All of them contribute to the final scheduler LCM the candidate
+    # must divide into.
+    # The padded layers no longer keep their block size unconditionally --
+    # ``_scale_block_size_before_padding`` grows it by the whole part of the
+    # ratio -- so the LCM has to be built from the SCALED block sizes, or
+    # ``_commensurate_padded_block_size`` would cap its candidates against a
+    # stale LCM that no group ends up using. The scale depends only on
+    # ``max_page_size``, so it can be resolved before the LCM.
+    scaled_pad_specs: dict[str, AttentionSpec] = {}
+    for layer_name, layer_spec in kv_cache_spec.items():
+        if layer_spec.page_size_bytes == max_page_size or isinstance(
+            layer_spec, MambaSpec
+        ):
+            continue
+        if max_page_size % _unify_branch_page_size_bytes(layer_spec) == 0:
+            continue
+        if isinstance(layer_spec, AttentionSpec) and not isinstance(
+            layer_spec, MLAAttentionSpec
+        ):
+            scaled_pad_specs[layer_name] = _scale_block_size_before_padding(
+                layer_spec, max_page_size
+            )
     max_page_block_lcm = math.lcm(
         *(
-            spec.block_size
-            for spec in kv_cache_spec.values()
+            scaled_pad_specs.get(layer_name, spec).block_size
+            for layer_name, spec in kv_cache_spec.items()
             if spec.page_size_bytes == max_page_size
             or isinstance(spec, MambaSpec)
-            or max_page_size % spec.page_size_bytes != 0
+            or max_page_size % _unify_branch_page_size_bytes(spec) != 0
         )
     )
     new_kv_cache_spec = {}
@@ -1166,7 +1249,7 @@ def unify_kv_cache_spec_page_size(
             assert new_spec.page_size_bytes == max_page_size
             new_kv_cache_spec[layer_name] = new_spec
         else:
-            layer_page_size = layer_spec.page_size_bytes
+            layer_page_size = _unify_branch_page_size_bytes(layer_spec)
             if max_page_size % layer_page_size == 0:
                 ratio = max_page_size // layer_page_size
                 new_block_size = layer_spec.block_size * ratio
@@ -1207,24 +1290,32 @@ def unify_kv_cache_spec_page_size(
                         )
                 if padded_spec is not None:
                     new_spec = padded_spec
-                else:
+                elif isinstance(layer_spec, AttentionSpec) and not isinstance(
+                    layer_spec, MLAAttentionSpec
+                ):
+                    # The ratio came from the natural page, so the scaled
+                    # natural page lands exactly on the shared page: any
+                    # pre-existing padding is stale and must be dropped, or it
+                    # would violate padded >= unpadded once the grown natural
+                    # page outruns it.
                     new_spec = replace(
                         layer_spec,
                         block_size=new_block_size,
-                        # Scaling block_size multiplies the unpadded page by
-                        # ratio; a retained smaller padded page would violate
-                        # padded >= unpadded (and the == max_page_size check
-                        # below), so an already-padded layer pads to the
-                        # shared page.
-                        page_size_padded=(
-                            max_page_size
-                            if layer_spec.page_size_padded is not None
-                            else None
-                        ),
+                        page_size_padded=None,
                     )
+                else:
+                    # MLA (and any non-attention spec that reaches here) keeps
+                    # its own padding: ``__post_init__`` reapplies the
+                    # alignment padding on every ``replace``.
+                    new_spec = replace(layer_spec, block_size=new_block_size)
             elif isinstance(layer_spec, AttentionSpec) and not isinstance(
                 layer_spec, MLAAttentionSpec
             ):
+                # The page does not divide the maximum, so it has to be padded.
+                # Scale the block size by the whole part of the ratio first so
+                # the layer does not pay a full max-size page for a block that
+                # still holds its original token count.
+                layer_spec = scaled_pad_specs.get(layer_name, layer_spec)
                 new_spec = replace(layer_spec, page_size_padded=max_page_size)
             else:
                 raise NotImplementedError(
