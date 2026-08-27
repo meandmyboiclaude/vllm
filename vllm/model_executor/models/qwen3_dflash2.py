@@ -246,6 +246,12 @@ class CandidateSelector(nn.Module):
 class DFlash2Qwen3Model(DFlashQwen3Model):
     decoder_layer_cls = DFlash2Qwen3DecoderLayer
 
+    # DFlash2 checkpoints do not carry vocabulary weights. These are replaced
+    # with the target modules in load_dflash_model after checkpoint loading,
+    # so allocating a full [vocab, hidden] embedding here only to throw it
+    # away wastes a peak allocation the size of the target's embedding table.
+    transient_vocab_size = 1
+
     def __init__(
         self,
         *,
@@ -280,7 +286,16 @@ class DFlash2Qwen3Model(DFlashQwen3Model):
 class DFlash2Qwen3ForCausalLM(DFlashQwen3ForCausalLM):
     model_cls = DFlash2Qwen3Model
 
+    # The checkpoint ships neither; both are aliased to the target's modules.
+    has_own_embed_tokens = False
+    has_own_lm_head = False
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
+        if vllm_config.parallel_config.pipeline_parallel_size > 1:
+            raise ValueError(
+                "DFlash2 does not support pipeline parallelism because its "
+                "embedding is shared with the target model."
+            )
         super().__init__(vllm_config=vllm_config, prefix=prefix)
         draft_config = self.config.dflash_config
         softcap = float(draft_config.get("final_logit_softcapping") or 0.0)

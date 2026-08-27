@@ -381,6 +381,9 @@ class DFlashQwen3DecoderLayer(nn.Module):
 @support_torch_compile
 class DFlashQwen3Model(nn.Module):
     decoder_layer_cls = DFlashQwen3DecoderLayer
+    # A DFlash variant that always shares its vocabulary modules with the
+    # target can override this to avoid allocating an unused full vocabulary.
+    transient_vocab_size: int | None = None
 
     hf_to_vllm_mapper = WeightsMapper(
         orig_to_new_substr={
@@ -409,7 +412,12 @@ class DFlashQwen3Model(nn.Module):
     ) -> None:
         super().__init__()
         self.config = vllm_config.speculative_config.draft_model_config.hf_config
-        self.vocab_size = self.config.vocab_size
+        self.vocab_size = (
+            self.transient_vocab_size
+            if self.transient_vocab_size is not None
+            and vllm_config.parallel_config.pipeline_parallel_size == 1
+            else self.config.vocab_size
+        )
         self.quant_config = get_draft_quant_config(vllm_config)
 
         drafter_config = getattr(self.config, "eagle_config", {})
@@ -423,7 +431,7 @@ class DFlashQwen3Model(nn.Module):
         current_vllm_config = get_current_vllm_config()
 
         self.embed_tokens = VocabParallelEmbedding(
-            self.config.vocab_size,
+            self.vocab_size,
             self.config.hidden_size,
             prefix=maybe_prefix(prefix, "embed_tokens"),
         )
@@ -755,12 +763,28 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
             start_layer_id=target_layer_num,
         )
 
+        # A variant that always aliases its lm_head to the target's after
+        # loading (DFlash2) only needs a placeholder until that handoff.
+        transient_vocab_size = self.model.transient_vocab_size
+        lm_head_vocab_size = (
+            transient_vocab_size
+            if transient_vocab_size is not None
+            else self.config.draft_vocab_size
+        )
         logit_scale = getattr(self.config, "logit_scale", 1.0)
         self.lm_head = ParallelLMHead(
-            self.config.draft_vocab_size,
+            lm_head_vocab_size,
             self.config.hidden_size,
             prefix=maybe_prefix(prefix, "lm_head"),
         )
+        # NOTE(vendor): the logits processor keeps the real draft vocab size
+        # even when the head is a placeholder. Upstream sizes it with the
+        # transient value; _get_logits then slices logits to org_vocab_size,
+        # which after the aliasing (lm_head becomes the target's full-vocab
+        # head) would truncate to a single column. It is dead code for DFlash2
+        # today (DFlash2Speculator samples via compute_candidates + the
+        # selector, never compute_logits), so upstream does not hit it, but a
+        # silent 1-wide truncation is not worth carrying.
         self.logits_processor = LogitsProcessor(
             self.config.draft_vocab_size, scale=logit_scale
         )
