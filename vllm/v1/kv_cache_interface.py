@@ -929,6 +929,13 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
         model_version_set = set(spec.model_version for spec in specs)
         sliding_window_set = set(spec.sliding_window for spec in specs)
         extra_retained_set = set(spec.extra_retained_tokens for spec in specs)
+        # Inherited from SlidingWindowSpec, but no producer sets it on a
+        # SlidingWindowMLASpec today: MLAAttention.get_kv_cache_spec passes the
+        # marker only on its non-sliding branch, and the DeepseekV4 compressor
+        # and sparse-SWA backends never pass it, so this set is always {False}.
+        # Kept in the carry so a future producer is merged rather than silently
+        # dropped; on the DeepseekV4 path the eagle group is flagged by layer
+        # position instead (_annotate_eagle_groups_deepseek_v4).
         non_causal_mtd_set = set(spec.non_causal_multi_token_decode for spec in specs)
         assert (
             len(cache_dtype_str_set) == 1
