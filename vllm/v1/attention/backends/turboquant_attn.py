@@ -278,6 +278,25 @@ class TurboQuantAttentionBackend(AttentionBackend):
     def supports_kv_cache_dtype(cls, kv_cache_dtype: CacheDType | None) -> bool:
         if kv_cache_dtype is None:
             return False
+        # This prefix test — not supported_kv_cache_dtypes above — is the real
+        # gate, and the exclusion of the kvarn_* family is deliberate. KVarN is
+        # its OWN codec family (KVQuantMode.KVARN, kv_cache_interface.py:61-67);
+        # its packed slot bytes come from the tile descriptor, not from the TQ
+        # preset table, so TurboQuantConfig.from_cache_dtype refuses a kvarn
+        # name by construction ("Unknown TurboQuant cache dtype"). The house
+        # chain gives kvarn its own backend identity, KVARN_NATIVE, which
+        # overrides this method and claims the armed kvarn_* presets; the
+        # frankenstein-era TQ-ified rungs (turboquant_kvarn_*) keep riding TQ
+        # by their own prefix.
+        #
+        # On a stock tree that means nothing claims kvarn_*, and the boot is
+        # refused at backend selection — CudaPlatformBase.get_attn_backend_cls
+        # raises "No valid attention backend found", listing "kv_cache_dtype
+        # not supported" against TURBOQUANT — before any KV spec is built or
+        # any memory is allocated. Do NOT raise from here to make that message
+        # louder: get_valid_backends() calls this on every candidate and
+        # catches only ImportError/OSError, so a raise would also kill the
+        # armed boots where KVARN_NATIVE is the valid candidate.
         return kv_cache_dtype.startswith("turboquant_")
 
     @classmethod
