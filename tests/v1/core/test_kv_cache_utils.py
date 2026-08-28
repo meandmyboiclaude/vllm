@@ -3616,6 +3616,67 @@ def test_dflash_swa_draft_marks_only_eagle_group():
     )
 
 
+def _qwen38_dflash2_mixed_specs() -> dict[str, KVCacheSpec]:
+    """DFlash2 drafter whose ``layer_types`` mixes sliding and full attention.
+
+    The draft's full-attention layers carry the same marker as its SWA layers;
+    without it they merge into the target's full-attention group unmarked,
+    and the partial marking suppresses the coordinator's flag-all fallback.
+    """
+    full = new_kv_cache_spec(block_size=16)
+    mamba = new_mamba_spec(block_size=64, mamba_cache_mode="align")
+    draft_swa = new_sliding_window_spec(
+        block_size=16,
+        sliding_window=2048,
+        non_causal_multi_token_decode=True,
+    )
+    draft_full = FullAttentionSpec(
+        block_size=16,
+        num_kv_heads=2,
+        head_size=64,
+        dtype=torch.float32,
+        non_causal_multi_token_decode=True,
+    )
+    assert draft_full.page_size_bytes == full.page_size_bytes
+    specs: dict[str, KVCacheSpec] = {}
+    specs.update({f"model.layers.{i}.linear_attn": mamba for i in range(48)})
+    specs.update({f"model.layers.{i}.self_attn": full for i in range(48, 64)})
+    specs.update({f"draft.layers.{i}.self_attn": draft_swa for i in range(3)})
+    specs.update({f"draft.layers.{i}.self_attn": draft_full for i in range(3, 5)})
+    return specs
+
+
+def test_dflash_mixed_layer_types_marks_every_draft_group():
+    """A partially marked drafter must not lose the last-block drop.
+
+    The draft's full-attention layers merge into the target's full-attention
+    group; the marker must survive that merge, or those draft layers end up in
+    an unflagged group while the SWA marker keeps the coordinator's flag-all
+    fallback from covering them.
+    """
+    specs = _qwen38_dflash2_mixed_specs()
+    groups = get_kv_cache_groups(_grouping_config(), specs)
+
+    draft_groups = [
+        g for g in groups if any(n.startswith("draft.layers.") for n in g.layer_names)
+    ]
+    assert len(draft_groups) >= 2
+    assert all(g.is_eagle_group for g in draft_groups)
+    # The Mamba groups are still the reason the annotator exists.
+    assert all(
+        not g.is_eagle_group for g in groups if isinstance(g.kv_cache_spec, MambaSpec)
+    )
+
+    coord = _hybrid_coord(groups)
+    draft_idx = {
+        i
+        for i, g in enumerate(groups)
+        if any(n.startswith("draft.layers.") for n in g.layer_names)
+    }
+    assert draft_idx <= coord.eagle_group_ids
+    assert coord.eagle_group_ids != set(range(len(groups)))
+
+
 def test_dflash_unmarked_swa_flag_all_hybrid_groups():
     """Main-tree baseline: no draft marker -> coordinator flags every group."""
     groups = get_kv_cache_groups(

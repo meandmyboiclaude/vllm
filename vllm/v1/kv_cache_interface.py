@@ -529,6 +529,18 @@ class FullAttentionSpec(AttentionSpec):
     cache layout itself.
     """
 
+    non_causal_multi_token_decode: bool = False
+    """
+    Same name and meaning as on ``MLAAttentionSpec`` / ``SlidingWindowSpec``:
+    marks a speculative draft group so the hybrid grouping path can set
+    ``KVCacheGroupSpec.is_eagle_group``. Declared here as well because a draft
+    model with mixed ``layer_types`` (e.g. DFlash) publishes full-attention
+    layers next to sliding-window ones; without the field the marker landed on
+    the SWA layers only, and that partial marking suppressed the coordinator's
+    flag-all fallback for the unmarked draft layers. Does not set
+    ``AttentionSpec.non_causal`` (that disables prefix caching).
+    """
+
     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
         max_model_len = vllm_config.model_config.max_model_len
         dcp_world_size = vllm_config.parallel_config.decode_context_parallel_size
@@ -585,6 +597,12 @@ class FullAttentionSpec(AttentionSpec):
             # If any layer in the group is non-causal, treat the group as
             # non-causal so the engine core disables incompatible scheduling.
             non_causal=any(spec.non_causal for spec in specs),
+            # Same rule as MLAAttentionSpec.merge: a group holding any draft
+            # layer needs the EAGLE last-block drop, so the marker survives the
+            # merge instead of being dropped by omission.
+            non_causal_multi_token_decode=any(
+                spec.non_causal_multi_token_decode for spec in specs
+            ),
         )
         for spec in specs:
             for f in fields(AttentionSpec):
@@ -774,6 +792,7 @@ class RSWASpec(FullAttentionSpec):
             sliding_window=base.sliding_window,
             attention_chunk_size=base.attention_chunk_size,
             non_causal=base.non_causal,
+            non_causal_multi_token_decode=base.non_causal_multi_token_decode,
             rswa_window=rswa_windows.pop(),
         )
 
@@ -1075,6 +1094,9 @@ class SinkFullAttentionSpec(FullAttentionSpec):
             sliding_window=cls.merge_window_sizes(sliding_window),
             attention_chunk_size=cls.merge_window_sizes(attention_chunk_size),
             non_causal=any(spec.non_causal for spec in specs),
+            non_causal_multi_token_decode=any(
+                spec.non_causal_multi_token_decode for spec in specs
+            ),
         )
         for spec in specs:
             for f in fields(AttentionSpec):

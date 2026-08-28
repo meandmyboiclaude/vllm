@@ -1733,11 +1733,14 @@ def _promote_local_kv_cache_specs(
             dropped = ["extra_retained_tokens"]
             if "non_causal_multi_token_decode" not in {
                 f.name for f in fields(target_cls)
-            }:
-                # MLAAttentionSpec carries the draft marker and keeps it;
-                # FullAttentionSpec has no such field. Promotion folds the
-                # draft into the target's single full-attention group, where
-                # the coordinator's flag-all covers the last-block drop.
+            } or not issubclass(target_cls, MLAAttentionSpec):
+                # MLAAttentionSpec carries the draft marker and keeps it.
+                # FullAttentionSpec carries it too, but promotion folds the
+                # draft into the target's single full-attention group: keeping
+                # the marker there would leave the promoted draft spec unequal
+                # to the target's full-attention specs, and the fallback wants
+                # one uniform spec. The coordinator's flag-all covers the
+                # last-block drop for that group.
                 dropped.append("non_causal_multi_token_decode")
             promoted_specs[layer_name] = replace_as(
                 spec,

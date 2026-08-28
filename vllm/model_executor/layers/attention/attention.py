@@ -686,6 +686,9 @@ class Attention(nn.Module, AttentionLayerBase):
                 state_content_bytes=tq_config.slot_size_aligned,
                 tq_sink_tokens=tq_config.sink_tokens,
                 tq_sink_kv_bytes=tq_config.sink_kv_bytes_per_token,
+                # Same draft-layer marker as the plain full-attention branch: a
+                # packed-codec draft layer must not lose it either.
+                non_causal_multi_token_decode=self.non_causal_multi_token_decode,
             )
         else:
             return FullAttentionSpec(
@@ -695,6 +698,11 @@ class Attention(nn.Module, AttentionLayerBase):
                 head_size_v=self.head_size_v,
                 dtype=self.kv_cache_torch_dtype,
                 kv_quant_mode=quant_mode,
+                # A draft model with mixed layer_types (DFlash) reaches this
+                # branch for its full-attention layers; without the marker only
+                # its SWA layers get flagged and the partial marking suppresses
+                # the coordinator's flag-all fallback for these ones.
+                non_causal_multi_token_decode=self.non_causal_multi_token_decode,
             )
 
 
