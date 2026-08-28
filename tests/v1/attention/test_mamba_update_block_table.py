@@ -44,6 +44,9 @@ def _make_vllm_config(
             mamba_cache_mode="all",
             use_replayssm=False,
             replayssm_buffer_len=16,
+            # Read unconditionally by BaseMambaAttentionMetadataBuilder
+            # (mamba_attn.py:119); CacheConfig defaults it to False.
+            use_replayssm_spec=False,
         ),
         compilation_config=SimpleNamespace(
             cudagraph_mode=CUDAGraphMode.FULL,
