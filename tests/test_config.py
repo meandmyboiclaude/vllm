@@ -285,6 +285,7 @@ def test_v2_model_runner_supports_extract_hidden_states():
             method="extract_hidden_states",
             parallel_drafting=False,
             enable_adaptive_verification=False,
+            relaxed_thinking=False,
         ),
     )
 
