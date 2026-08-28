@@ -522,6 +522,9 @@ class MambaMixer2(MambaBase, PluggableLayer):
         self.use_cache_spec_kernel = (
             cache_config.use_replayssm_spec if cache_config is not None else False
         )
+        # num_decode_tokens -> which SSM-update arm was captured at that shape.
+        # See the capture guard in conv_ssm_forward's decode branch.
+        self._captured_ssm_route: dict[int, bool] = {}
         self.mamba_config = vllm_config.mamba_config
         if (
             self.use_cache_kernel or self.use_cache_spec_kernel
@@ -1099,10 +1102,41 @@ class MambaMixer2(MambaBase, PluggableLayer):
             preallocated_ssm_out_d = preallocated_ssm_out_d.view(
                 num_decode_tokens, -1, self.head_dim
             )
-            if (
+            _use_spec_arm = (
                 self.use_cache_spec_kernel
                 and attn_metadata.spec_write_pos_d is not None
-            ):
+            )
+            if self.use_cache_spec_kernel:
+                # Capture safety. The arm below is chosen by a PYTHON branch on
+                # batch CONTENT (are the spec cursors present?), not on the
+                # tensor shape the cudagraph dispatcher keys on. Whichever arm
+                # runs while a graph is being captured is the only arm that
+                # graph will ever run, so two batches that dispatch to the SAME
+                # captured shape but want DIFFERENT arms would make the replay
+                # silently execute the wrong SSM update.
+                #
+                # Different capture shapes legitimately take different arms
+                # (a uniform K+1 verify shape vs a plain decode shape), so pin
+                # per shape and only refuse when one shape captures both.
+                #
+                # This mixer is not the serving layer type on this stack (GDN
+                # is), so a guard is the scope here rather than a re-route.
+                if torch.cuda.is_current_stream_capturing():
+                    _pinned = self._captured_ssm_route.get(num_decode_tokens)
+                    if _pinned is None:
+                        self._captured_ssm_route[num_decode_tokens] = _use_spec_arm
+                    elif _pinned != _use_spec_arm:
+                        raise RuntimeError(
+                            "Mamba2 mixer captured both the cached-spec and the "
+                            "baseline SSM-update arm at num_decode_tokens="
+                            f"{num_decode_tokens}. Graph replay would run "
+                            "whichever arm was captured last for every batch of "
+                            "that shape, silently producing the wrong state "
+                            "update. Give the two arms distinct capture shapes, "
+                            "or route them to distinct graphs, before enabling "
+                            "--use-replayssm-spec with full CUDA graphs."
+                        )
+            if _use_spec_arm:
                 # Fires only on speculative-verify batches (spec cursors set in
                 # build()). Rare non-spec decode rows under the spec flag (e.g. a
                 # single-token prefill chunk replayed as decode) have no cursors
