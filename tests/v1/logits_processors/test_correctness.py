@@ -1822,7 +1822,9 @@ class TestThinkingBudgetSpecVerifyRows:
             BatchUpdate(
                 batch_size=1,
                 removed=(),
-                added=[(0, SamplingParams(thinking_token_budget=self.BUDGET), None, [])],
+                added=[
+                    (0, SamplingParams(thinking_token_budget=self.BUDGET), None, [])
+                ],
                 moved=(),
             )
         )
