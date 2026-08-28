@@ -2009,12 +2009,16 @@ class Scheduler(SchedulerInterface):
             # (input_batch.py _post_update_kernel; update_requests() only
             # refreshes the optimistic CPU mirror). A rollback the runner does
             # not see leaves it `rejected` tokens ahead of the scheduler for
-            # the rest of the request: its context keeps the rejected tokens,
-            # the grammar masks are built for the shorter history, and every
-            # later step's KV writes run `rejected` slots past the allocation
-            # the scheduler made (lookahead slack is num_spec+1 for DFlash, so
-            # the overrun lands in a neighbour's block once a boundary falls in
-            # it). Until the runner grows a resync protocol the pre-#52452 path
+            # the rest of the request. MRV1 has no such gap: gpu_model_runner.py
+            # re-reads the scheduler's value (:1412) and truncates its own token
+            # history to the scheduler's num_output_tokens (:1439) every step,
+            # which is exactly the resync MRV2 does not perform. On MRV2 the
+            # runner's context keeps the rejected tokens, the grammar masks are
+            # built for the shorter scheduler history, and every later step's KV
+            # writes run `rejected` slots past the allocation the scheduler
+            # made (lookahead slack is num_spec+1 for DFlash, so the overrun
+            # lands in a neighbour's block once a boundary falls in it).
+            # Until the runner grows a resync protocol the pre-#52452 path
             # stays in force on V2: the block is committed as sampled and an
             # invalid suffix fails the request in the accept_tokens branch
             # below, which is a clean FINISHED_ERROR rather than a divergence.
