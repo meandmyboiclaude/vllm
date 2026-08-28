@@ -621,16 +621,18 @@ def _sample_recovered_tokens_kernel_impl(
     target_logits,
     target_max,
     target_inv_sum,
-    inv_q,
+    q,
     vocab_size,
     BLOCK_SIZE=None,
     NO_DRAFT_PROBS=False,
     USE_FP64_GUMBEL=False,
 ):
     # USE_FP64_GUMBEL only controls the gumbel-noise precision, which the caller
-    # has already applied to `inv_q` (fp64 vs fp32). The CPU kernel consumes
-    # `inv_q` directly, so the flag is accepted for interface parity and the
-    # value is read at its existing dtype.
+    # has already applied to `q` (fp64 vs fp32); the flag is accepted for
+    # interface parity and the value is read at its existing dtype.
+    # The Triton kernel takes the raw exponential noise `q` and divides by it
+    # (#41258). The C++ op predates that and multiplies by a reciprocal, so the
+    # reciprocal is taken here rather than changing the compiled signature.
     # C++ reads integer tensors as int64_t*; ensure correct dtype. The C++
     # kernel also predates the online-softmax state, so materialize dense
     # target probabilities from it.
@@ -642,8 +644,8 @@ def _sample_recovered_tokens_kernel_impl(
         _ensure_int64(draft_token_ids),
         draft_probs,
         _reconstruct_target_probs(target_logits, target_max, target_inv_sum),
-        # C++ kernel reads inv_q as float32.
-        inv_q.to(torch.float32),
+        # C++ kernel reads the reciprocal as float32.
+        q.reciprocal().to(torch.float32),
         vocab_size,
         NO_DRAFT_PROBS,
     )

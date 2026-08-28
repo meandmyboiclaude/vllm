@@ -572,8 +572,6 @@ def native_sample_recovered_tokens(
         # state because RNG state advances after each call.
         generator.set_state(states[i])
 
-    inv_q = q.reciprocal()
-
     out = torch.empty_like(draft_token_ids)
 
     for req_idx in range(batch_size):
@@ -596,7 +594,8 @@ def native_sample_recovered_tokens(
                     0.0
                 )
 
-            score = prob * inv_q[req_idx]
+            # Division, matching sample_recovered_tokens_kernel (#41258).
+            score = prob / q[req_idx]
             recovered_id = torch.argmax(score, dim=-1)
             out[token_idx] = recovered_id
     return out

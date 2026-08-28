@@ -870,8 +870,6 @@ def sample_recovered_tokens(
         device,
         q_dtype,
     )
-    inv_q = q.reciprocal()
-
     recovered_token_ids = torch.empty_like(draft_token_ids)
     BLOCK_SIZE = 8192
     sample_recovered_tokens_kernel[(batch_size, max_spec_len)](
@@ -882,7 +880,7 @@ def sample_recovered_tokens(
         target_logits,
         target_max,
         target_inv_sum,
-        inv_q,
+        q,
         vocab_size,
         BLOCK_SIZE,
         NO_DRAFT_PROBS=draft_probs is None,
@@ -1343,7 +1341,7 @@ def sample_recovered_tokens_kernel(
     target_logits_ptr,  # [num_tokens, vocab_size]
     target_max_ptr,  # [num_tokens]
     target_inv_sum_ptr,  # [num_tokens]
-    inv_q_ptr,  # [batch_size, vocab_size]
+    q_ptr,  # [batch_size, vocab_size]
     vocab_size,
     BLOCK_SIZE: tl.constexpr,
     NO_DRAFT_PROBS: tl.constexpr,
@@ -1408,17 +1406,22 @@ def sample_recovered_tokens_kernel(
             # NOTE(woosuk): We don't need `prob = prob / tl.sum(prob)` here
             # because `tl.argmax` will select the maximum value.
 
-        inv_q = tl.load(
-            inv_q_ptr + req_idx * vocab_size + vocab_offset,
+        # other=1.0 (not 0.0): the divisor of a masked lane must stay neutral.
+        q = tl.load(
+            q_ptr + req_idx * vocab_size + vocab_offset,
             mask=vocab_mask,
-            other=0.0,
+            other=1.0,
         )
 
         # Local tile reduction.
         # Mask out-of-vocabulary entries to -inf so they can never win
         # the argmax — prevents producing recovered_id >= vocab_size
         # when all valid entries in the last tile have zero probability.
-        score = prob * inv_q
+        # Divide (upstream #41258) rather than multiply by a precomputed
+        # reciprocal: q is exponential, so small draws make 1/q overflow to inf
+        # in fp32 and inf * 0 is NaN. Matches the lazy in-kernel recovery
+        # (`score = prob / e`) in rejection_random_sample_kernel above.
+        score = prob / q
         score = tl.where(vocab_mask, score, float("-inf"))
         local_max, local_id = tl.max(score, axis=0, return_indices=True)
 
