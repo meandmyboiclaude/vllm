@@ -364,6 +364,18 @@ class DFlashSpeculator(DraftModelSpeculator):
             dcp_local_seq_lens=dcp_local_seq_lens,
         )
 
+    def _reset_draft_side_outputs(self, num_reqs: int) -> None:
+        """Invalidate per-step draft outputs the caller reads unconditionally.
+
+        The skip-drafts path returns without sampling, but the model runner
+        still records whatever the speculator exposes afterwards. Any such
+        buffer therefore has to be put back to its no-measurement state here,
+        or the recorded value is silently the previous step's. The base
+        speculator publishes only draft_tokens, which the runner already
+        treats as unscheduled on this path; subclasses with extra outputs
+        override.
+        """
+
     @torch.inference_mode()
     def propose(
         self,
@@ -510,6 +522,7 @@ class DFlashSpeculator(DraftModelSpeculator):
             # No rank needs draft tokens this step; the context KV written
             # above keeps the drafter in sync, so skip the query forward and
             # draft sampling on every rank.
+            self._reset_draft_side_outputs(num_reqs)
             return self.draft_tokens[:num_reqs]
 
         num_reqs_padded = batch_desc.num_reqs or num_reqs

@@ -117,6 +117,15 @@ class DSparkSpeculator(DFlashSpeculator):
             )
         return model
 
+    def _reset_draft_side_outputs(self, num_reqs: int) -> None:
+        # model_runner records draft_token_confidence_probs after every
+        # propose(), including the skip-drafts return that samples nothing.
+        # Without this the adaptive-verification budget would rank this step's
+        # requests on the previous step's confidences. 1.0 is the same
+        # no-measurement value AdaptiveVerification seeds a new request with.
+        if self.enable_adaptive_verification:
+            self.draft_token_confidence_probs[:num_reqs].fill_(1.0)
+
     def _sample_logits(
         self,
         logits: torch.Tensor,

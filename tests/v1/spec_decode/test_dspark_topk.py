@@ -72,3 +72,29 @@ def test_markov_embed_clamps_warmup_sentinel_ids():
     # gathering off the end of the codebook.
     out_of_range = head.embed(torch.tensor([-1, 9]))
     torch.testing.assert_close(out_of_range, head.markov_w1(torch.tensor([0, 3])))
+
+
+def test_skip_drafts_reset_clears_stale_confidences():
+    """The skip-drafts return samples nothing, but the runner still records."""
+    from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
+    from vllm.v1.worker.gpu.spec_decode.dspark.speculator import DSparkSpeculator
+
+    speculator = DSparkSpeculator.__new__(DSparkSpeculator)
+    speculator.enable_adaptive_verification = True
+    speculator.draft_token_confidence_probs = torch.full((4, 3), 0.25)
+
+    speculator._reset_draft_side_outputs(2)
+
+    # Only the active rows are reset; 1.0 is the no-measurement value.
+    assert speculator.draft_token_confidence_probs[:2].eq(1.0).all()
+    assert speculator.draft_token_confidence_probs[2:].eq(0.25).all()
+
+    # Adaptive verification off: nothing consumes the buffer, nothing to do.
+    speculator.enable_adaptive_verification = False
+    speculator.draft_token_confidence_probs.fill_(0.25)
+    speculator._reset_draft_side_outputs(2)
+    assert speculator.draft_token_confidence_probs.eq(0.25).all()
+
+    # The base speculator publishes no such buffer.
+    base = DFlashSpeculator.__new__(DFlashSpeculator)
+    assert base._reset_draft_side_outputs(2) is None
