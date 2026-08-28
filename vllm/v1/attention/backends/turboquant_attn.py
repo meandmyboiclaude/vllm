@@ -311,6 +311,13 @@ class TurboQuantMetadataBuilder(AttentionMetadataBuilder[TurboQuantMetadata]):
     """Builds TurboQuantMetadata from scheduler output."""
 
     kv_cache_spec: AttentionSpec
+    # Deliberate safety carry from vllm#53406 (see also #53410): the
+    # downgrade from UNIFORM_BATCH keeps spec-decode K+1 verify batches out
+    # of FULL capture, because _prefill_attention's continuation branch
+    # cannot be captured (it needs host-side lengths, and a captured graph
+    # would replay one batch's attention for all of them). The house chain
+    # restores FULL verify via PN201/PN125 once P67b routing bypasses that
+    # branch; do not "fix" this line by raising it here.
     _cudagraph_support: ClassVar[AttentionCGSupport] = (
         AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
     )
@@ -970,13 +977,41 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         # previously cached K/V from the TQ cache, not just the current
         # chunk's raw K/V.
 
-        # Defense-in-depth: if we somehow reach this continuation path
-        # during CUDA graph capture (e.g. spec-decode warmup shapes),
-        # return zeros rather than crashing on .tolist() GPU→CPU sync.
-        # The _cudagraph_support downgrade to UNIFORM_SINGLE_TOKEN_DECODE
-        # should prevent this, but guard here as a safety net.
+        # Capture safety: reaching the continuation path under an active
+        # stream capture is a routing defect, not a condition to absorb.
+        # The per-request loop below calls .tolist() on metadata, which is
+        # illegal during capture; the previous guard returned zeros instead,
+        # which BAKES a zero attention output into the graph and replays it
+        # for every batch that dispatches to that graph — silent corruption
+        # with the vllm#40880 signature (verify batches attending to nothing,
+        # drafter and verifier converging on high-bias tokens), not a crash.
+        #
+        # Fail loudly instead: the capture aborts and the boot names the
+        # routing bug. Two independent guards keep this unreachable in a
+        # correct configuration, so a raise here can only mean one of them
+        # regressed:
+        #   * stock declaration: TurboQuantMetadataBuilder._cudagraph_support
+        #     is UNIFORM_SINGLE_TOKEN_DECODE, so only q_len==1 decode batches
+        #     are captured and they never enter _prefill_attention;
+        #   * house chain: the P67b spec-verify routing intercepts uniform
+        #     K+1 batches at the top of forward() and dispatches them to the
+        #     P67 multi-query kernel, bypassing _prefill_attention entirely.
+        #     PN201's restore of UNIFORM_BATCH refuses to arm unless that
+        #     routing is live, precisely because of this path.
         if torch.cuda.is_current_stream_capturing():
-            return torch.zeros(N, Hq, D, device=query.device, dtype=query.dtype)
+            raise RuntimeError(
+                "TurboQuant _prefill_attention reached the continuation path "
+                f"under CUDA graph capture (N={N}, Hq={Hq}, D={D}, "
+                f"num_reqs={attn_metadata.query_start_loc.shape[0] - 1}, "
+                f"max_query_len={attn_metadata.max_query_len}, "
+                f"max_seq_len={attn_metadata.max_seq_len}). This path cannot "
+                "be captured: it needs host-side query/seq lengths, and the "
+                "graph would replay one batch's attention for every batch. "
+                "Aborting capture rather than baking a zeros output "
+                "(vllm#40880). Check that the cudagraph-support declaration "
+                "matches the batches being captured, and that spec-verify "
+                "routing (P67b) is live if UNIFORM_BATCH was restored."
+            )
 
         Hk = key.shape[1]
         use_gqa = Hk < Hq

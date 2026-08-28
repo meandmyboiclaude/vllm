@@ -9,6 +9,10 @@ Validates fixes for https://github.com/vllm-project/vllm/issues/40807:
   - build_for_cudagraph_capture always populates CPU-resident copies of
     query_start_loc and seq_lens so the prefill path never calls
     .tolist() on GPU tensors.
+  - if the continuation branch is nevertheless reached under capture, it
+    RAISES. It used to return zeros, which baked a zero attention output
+    into the graph and replayed it for every batch dispatching to that
+    graph (the vllm#40880 silent-corruption signature).
 """
 
 import pytest
@@ -95,10 +99,10 @@ class TestBuildForCudagraphCaptureCPUCopies:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="Requires CUDA")
 class TestPrefillCaptureGuard:
-    """The _prefill_attention continuation branch must not crash during
-    CUDA graph capture."""
+    """The _prefill_attention continuation branch must abort capture rather
+    than bake a zeros output into the graph."""
 
-    def test_capture_guard_returns_zeros(self):
+    def test_capture_guard_raises(self):
         from unittest.mock import patch
 
         from vllm.v1.attention.backends.turboquant_attn import (
@@ -126,19 +130,14 @@ class TestPrefillCaptureGuard:
                 is_prefill=True,
             )
 
-            result = TurboQuantAttentionImpl._prefill_attention(
-                impl,
-                query=query,
-                key=torch.randn(N, 2, D, device="cuda"),
-                value=torch.randn(N, 2, D, device="cuda"),
-                kv_cache=torch.zeros(1, 16, 2, 196, device="cuda"),
-                attn_metadata=meta,
-                Pi=torch.eye(D, device="cuda"),
-                centroids=torch.randn(16, D, device="cuda"),
-            )
-
-            assert result.shape == (N, Hq, D)
-            assert (result == 0).all(), (
-                "During CUDA graph capture, _prefill_attention continuation "
-                "branch should return zeros (safe for memory profiling)."
-            )
+            with pytest.raises(RuntimeError, match="under CUDA graph capture"):
+                TurboQuantAttentionImpl._prefill_attention(
+                    impl,
+                    query=query,
+                    key=torch.randn(N, 2, D, device="cuda"),
+                    value=torch.randn(N, 2, D, device="cuda"),
+                    kv_cache=torch.zeros(1, 16, 2, 196, device="cuda"),
+                    attn_metadata=meta,
+                    Pi=torch.eye(D, device="cuda"),
+                    centroids=torch.randn(16, D, device="cuda"),
+                )
