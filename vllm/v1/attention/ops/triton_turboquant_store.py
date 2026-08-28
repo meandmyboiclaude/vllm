@@ -66,10 +66,19 @@ def _store_quantized_value(
             v_var = tl.sum(v_cen * v_cen, axis=0) / D
             v_scale = tl.sqrt(v_var)
             v_scale = tl.where(v_scale > 1e-8, v_scale, 1e-8)
-            # Same fp16-storage hazard as the uniform branch below: (std, mean)
-            # are the stored pair, so clamp them into the fp16 finite range
-            # before companding, keeping the companding constants identical to
-            # the ones written to the cache.
+            # (std, mean) are the stored fp16 pair here. Clamping them into the
+            # fp16 finite range before companding does two things and no more:
+            # the stored pair is finite, and the constants used to compand are
+            # bit-identical to the ones the decode reads back.
+            # It does NOT bound the reconstruction. Decode computes
+            # centroid[q] * std + mean with |centroid| up to 2.150 for the
+            # 3-bit Lloyd-Max N(0,1) table, so a saturated std reconstructs up
+            # to ~2.15x above the fp16 range and turns into inf at the output
+            # store (triton_turboquant_decode.py, V_out store). The uniform
+            # branch below is bounded by construction — q <= levels and
+            # scale = (max-min)/levels, so q*scale + zero <= max <= 65504 — the
+            # NUQ branch has no such bound; the true fix belongs at the
+            # reconstruction read.
             v_scale = tl.minimum(v_scale, 65504.0)
             v_mean = tl.maximum(tl.minimum(v_mean, 65504.0), -65504.0)
             v_zero = v_mean
