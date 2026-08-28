@@ -745,9 +745,21 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         dummy_scheduler_output.total_num_scheduled_tokens = num_tokens
         dummy_scheduler_output.num_scheduled_tokens = num_scheduled_tokens
         if uniform_decode and self.speculative_config is not None:
-            # Describe the verifier draft layout so capture and replay agree on
-            # branch topology, not just on tensor shape (see the
-            # is_target_verifier_batch guard in execute_model).
+            # Describe the verifier draft layout so a uniform-decode dummy
+            # batch dispatches the same cudagraph descriptor a real verifier
+            # batch would: without it the is_target_verifier_batch guard in
+            # execute_model sees an empty draft dict and nulls this batch's
+            # uniform_tok_count. That matters for the consumers that reach
+            # execute_model — profile_run, the adaptive-verification cost
+            # curves in capture_model, and the DP idle-step
+            # execute_dummy_batch.
+            #
+            # It is NOT a prerequisite for capturing the verifier FULL graph,
+            # despite what this vendor's commit message claimed: on the MRV2
+            # runner CudagraphManager.capture drives capture itself through
+            # prepare_inputs_to_capture and model(**model_inputs); it never
+            # builds a SchedulerOutput, never calls _dummy_run, and so never
+            # reaches that guard.
             num_bonus_tokens = self.model_state.num_new_sampled_tokens_per_step
             dummy_scheduler_output.scheduled_spec_decode_tokens = {
                 req_id: [-1] * (n - num_bonus_tokens)
