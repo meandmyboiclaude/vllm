@@ -2000,11 +2000,30 @@ class Scheduler(SchedulerInterface):
             # termination. Validate the block (non-advancing) and commit only
             # its grammar-valid prefix, before _update_request_with_output
             # mutates request history.
+            #
+            # V2 model runner (vllm/v1/worker/gpu/): NOT applied. The filter's
+            # only lever is a scheduler-side rollback of num_computed_tokens /
+            # num_output_placeholders, and MRV2 never reads either back for a
+            # running request -- it tracks num_computed_tokens, last_sampled
+            # token and all_token_ids on the GPU from its own sampler output
+            # (input_batch.py _post_update_kernel; update_requests() only
+            # refreshes the optimistic CPU mirror). A rollback the runner does
+            # not see leaves it `rejected` tokens ahead of the scheduler for
+            # the rest of the request: its context keeps the rejected tokens,
+            # the grammar masks are built for the shorter history, and every
+            # later step's KV writes run `rejected` slots past the allocation
+            # the scheduler made (lookahead slack is num_spec+1 for DFlash, so
+            # the overrun lands in a neighbour's block once a boundary falls in
+            # it). Until the runner grows a resync protocol the pre-#52452 path
+            # stays in force on V2: the block is committed as sampled and an
+            # invalid suffix fails the request in the accept_tokens branch
+            # below, which is a clean FINISHED_ERROR rather than a divergence.
             if (
                 len(new_token_ids) > 1
                 and scheduled_spec_token_ids
                 and request.use_structured_output
                 and not output_is_stale
+                and not self.use_v2_model_runner
             ):
                 new_token_ids, num_grammar_rejected = (
                     self.structured_output_manager.filter_speculative_grammar_tokens(

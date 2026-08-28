@@ -1005,6 +1005,74 @@ def test_speculative_grammar_filter_commits_and_advances_only_valid_prefix():
     assert stats.num_accepted_tokens == 2
 
 
+@pytest.mark.parametrize("use_v2_model_runner", [False, True])
+def test_speculative_grammar_filter_runner_gate(use_v2_model_runner: bool):
+    """The pre-commit grammar filter only runs for the V1 model runner.
+
+    Its rollback of num_computed_tokens / num_output_placeholders is never
+    read back by the V2 runner (vllm/v1/worker/gpu/ tracks those on the GPU
+    from its own sampler output), so on V2 the block must be committed as
+    sampled and left to the accept_tokens check, exactly as before #52452.
+    """
+    scheduler = create_scheduler(
+        num_speculative_tokens=2, use_v2_model_runner=use_v2_model_runner
+    )
+    request = create_requests(num_requests=1)[0]
+    grammar = Mock(spec=StructuredOutputGrammar)
+    grammar.accept_tokens.return_value = True
+    request.structured_output_request = Mock(grammar=grammar)
+    request.status = RequestStatus.RUNNING
+    request.num_computed_tokens = request.num_tokens + 3
+    scheduler.requests[request.request_id] = request
+    scheduler.running.append(request)
+
+    manager = Mock()
+    manager.filter_speculative_grammar_tokens.return_value = ([10, 11], 1)
+    manager.should_advance.return_value = True
+    manager.trim_reasoning_for_advance.side_effect = lambda req, ids: ids
+    scheduler.structured_output_manager = manager
+
+    scheduler_output = SchedulerOutput(
+        scheduled_new_reqs=[],
+        scheduled_cached_reqs=CachedRequestData.make_empty(),
+        num_scheduled_tokens={request.request_id: 3},
+        total_num_scheduled_tokens=3,
+        scheduled_encoder_inputs={},
+        scheduled_spec_decode_tokens={request.request_id: [10, 11]},
+        num_common_prefix_blocks=[],
+        finished_req_ids=set(),
+        free_encoder_mm_hashes=[],
+    )
+    model_output = ModelRunnerOutput(
+        req_ids=[request.request_id],
+        req_id_to_index={request.request_id: 0},
+        sampled_token_ids=[[10, 11, 12]],
+        logprobs=None,
+        prompt_logprobs_dict={},
+        pooler_output=[],
+    )
+
+    outputs = scheduler.update_from_output(scheduler_output, model_output)
+
+    if use_v2_model_runner:
+        # Committed as sampled; the runner's view of the request is kept.
+        manager.filter_speculative_grammar_tokens.assert_not_called()
+        assert list(request.output_token_ids) == [10, 11, 12]
+        assert request.num_computed_tokens == request.num_tokens
+        assert outputs[0].outputs[0].new_token_ids == [10, 11, 12]
+        grammar.accept_tokens.assert_called_once_with(
+            request.request_id, [10, 11, 12]
+        )
+    else:
+        manager.filter_speculative_grammar_tokens.assert_called_once_with(
+            request, [10, 11, 12]
+        )
+        assert list(request.output_token_ids) == [10, 11]
+        assert request.num_computed_tokens == request.num_tokens
+        assert outputs[0].outputs[0].new_token_ids == [10, 11]
+        grammar.accept_tokens.assert_called_once_with(request.request_id, [10, 11])
+
+
 def test_check_stop_min_tokens():
     """Test that requests don't stop when min_tokens requirement isn't met."""
     from vllm.v1.core.sched.utils import check_stop
