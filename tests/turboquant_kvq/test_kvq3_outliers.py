@@ -70,6 +70,22 @@ def test_outliers_bit_exact_recovery():
     assert torch.equal(out[rows, idx], fp16_retain(val))
 
 
+def test_outlier_channel_saturates_beyond_fp16():
+    # gh-54085 follow-up 2: the kernel clamps each outlier into the fp16 finite
+    # range before storing it, so a magnitude above 65504 comes back saturated,
+    # not as inf. fp16_retain (the KVQ-2 sink model, whose producer does not
+    # clamp) still models the raw cast — the two channels differ on purpose.
+    x = torch.zeros(1, HEAD_DIM, dtype=torch.float32)
+    x[0, 1:] = torch.linspace(-1.0, 4.0, HEAD_DIM - 1)
+    x[0, 0] = -125000.0
+    out = outlier_value_codec(x, bits=3, n=1)
+    assert torch.isfinite(out).all(), "outlier channel reconstructed inf"
+    assert out[0, 0].item() == -65504.0
+    assert not torch.isfinite(fp16_retain(x[0, 0])), (
+        "fp16_retain must keep modelling the unclamped sink cast"
+    )
+
+
 def test_outliers_beat_nuqv_heavy_tailed():
     x = _heavy_tailed(4000, HEAD_DIM)
     mse_nuqv = _mse(nuqv_value_codec(x, 3), x)

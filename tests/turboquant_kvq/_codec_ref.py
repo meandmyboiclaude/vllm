@@ -15,8 +15,26 @@ import torch
 from _tqload import get_value_codebook
 
 
+# Largest finite float16. The store kernels saturate every quantity that is
+# written to the cache as fp16 at this magnitude (per-vector scale/zero, the
+# NUQ (std, mean) pair, the KVQ-3 outlier values, the MSE key norm), because an
+# unclamped cast produces inf and one inf poisons the whole reconstructed
+# vector. The references below reproduce those clamps so kernel and reference
+# still agree once inputs run above the fp16 range.
+_FP16_MAX = 65504.0
+
+
 def _to_fp16(x: torch.Tensor) -> torch.Tensor:
     return x.to(torch.float16).to(torch.float32)
+
+
+def _fp16_saturate(x: torch.Tensor) -> torch.Tensor:
+    """Clamp to the fp16 finite range, then round-trip through fp16.
+
+    Mirrors the kernels' ``tl.maximum(tl.minimum(x, 65504.0), -65504.0)``
+    ahead of an fp16 store, which saturates instead of producing inf.
+    """
+    return _to_fp16(x.clamp(-_FP16_MAX, _FP16_MAX))
 
 
 def uniform_value_codec(v: torch.Tensor, bits: int = 3) -> torch.Tensor:
@@ -34,6 +52,12 @@ def uniform_value_codec(v: torch.Tensor, bits: int = 3) -> torch.Tensor:
     levels = 2**bits - 1
     vmin = v.min(dim=-1, keepdim=True).values
     vmax = v.max(dim=-1, keepdim=True).values
+    # The kernel saturates the observed range into the fp16 finite range
+    # *before* deriving the scale, so that the zero point used to quantize is
+    # the one that is stored and read back. Mirror that here, otherwise this
+    # reference and the kernel diverge for any vector with |v| > 65504.
+    vmin = vmin.clamp(min=-_FP16_MAX)
+    vmax = vmax.clamp(max=_FP16_MAX)
     scale = (vmax - vmin) / levels
     scale = torch.where(scale > 1e-8, scale, torch.full_like(scale, 1e-8))
     q = torch.clamp(((v - vmin) / scale + 0.5).to(torch.int32), 0, levels)
@@ -60,6 +84,13 @@ def nuqv_encode(
     var = ((v - mean) ** 2).mean(dim=-1, keepdim=True)
     std = torch.sqrt(var)
     std = torch.where(std > 1e-8, std, torch.full_like(std, 1e-8))
+    # (std, mean) is the stored fp16 pair; the kernel saturates both before
+    # companding so the constants used to compand equal the stored ones. This
+    # keeps the *stored pair* finite — it does not bound the reconstruction,
+    # which is centroid * std + mean with |centroid| up to 2.150 (see the NUQ
+    # branch comment in triton_turboquant_store.py).
+    std = std.clamp(max=_FP16_MAX)
+    mean = mean.clamp(-_FP16_MAX, _FP16_MAX)
     z = (v - mean) / std
     idx = (z.unsqueeze(-1) >= mid).sum(dim=-1)  # sum(z >= midpoint_m)
     return idx, std, mean
@@ -84,7 +115,11 @@ def fp16_retain(v: torch.Tensor) -> torch.Tensor:
     """Lossless-within-fp16 retention: round-trip through float16.
 
     The sink side buffer stores raw fp16 K/V, so decode reconstruction of a
-    retained position is exactly the fp16 cast of the original.
+    retained position is exactly the fp16 cast of the original — including the
+    inf that |v| > 65504 produces. This models the KVQ-2 sink path, which has
+    no saturating store of its own. The KVQ-3 outlier channel is a different
+    producer: its kernel clamps, so ``outlier_value_codec`` below uses
+    ``_fp16_saturate`` instead.
     """
     return v.to(torch.float16).to(torch.float32)
 
@@ -123,12 +158,15 @@ def outlier_value_codec(v: torch.Tensor, bits: int = 3, n: int = 3) -> torch.Ten
     """Non-uniform value codec with exact outlier side-channel (KVQ-3).
 
     Mirrors the kernel: quantize the whole vector with the nuqv codec, then
-    overwrite the top-|v| elements with their exact fp16 values.
+    overwrite the top-|v| elements with their fp16 values. The kernel clamps
+    each outlier into the fp16 finite range before the store (this channel
+    carries the largest magnitudes in the vector, so it is the one most likely
+    to leave that range), hence ``_fp16_saturate`` rather than ``fp16_retain``.
     """
     out = nuqv_value_codec(v, bits)
     idx, val = outlier_select(v, n)
     rows = torch.arange(v.shape[0], device=v.device).unsqueeze(-1)
-    out[rows, idx] = fp16_retain(val)
+    out[rows, idx] = _fp16_saturate(val)
     return out
 
 

@@ -89,6 +89,27 @@ def test_nuqv_recovers_constant_vector_exactly():
     assert torch.allclose(out, x, atol=1e-2)
 
 
+def test_codecs_saturate_beyond_fp16_like_the_kernel():
+    # gh-54085 follow-up 2: the kernels clamp every fp16 side channel into
+    # [-65504, 65504] before storing it, so the CPU reference has to as well —
+    # otherwise the two disagree exactly where the bug used to live (an
+    # unclamped cast gives inf, and one inf poisons the whole vector).
+    x = torch.zeros(2, HEAD_DIM, dtype=torch.float32)
+    x[0, 1:] = torch.linspace(-1.0, 4.0, HEAD_DIM - 1)
+    x[0, 0] = -125000.0  # one end beyond fp16 range
+    x[1, 1:] = torch.linspace(-1.0, 4.0, HEAD_DIM - 1)
+    x[1, 0] = -125000.0
+    x[1, 1] = 125000.0  # both ends beyond fp16 range
+
+    out_u = uniform_value_codec(x, 3)
+    assert torch.isfinite(out_u).all(), "uniform reference reconstructed inf"
+
+    _, std, mean = nuqv_encode(x, 3)
+    assert torch.isfinite(std).all() and torch.isfinite(mean).all()
+    assert std.max().item() <= 65504.0
+    assert mean.abs().max().item() <= 65504.0
+
+
 def test_preset_slot_size_unchanged_vs_3bit_nc():
     nuqv = TurboQuantConfig.from_cache_dtype("turboquant_3bit_nuqv", HEAD_DIM)
     nc = TurboQuantConfig.from_cache_dtype("turboquant_3bit_nc", HEAD_DIM)
