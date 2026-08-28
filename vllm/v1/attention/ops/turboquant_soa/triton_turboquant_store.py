@@ -364,6 +364,15 @@ def _tq_fused_store_mse(
         c_inv_norm = 1.0 / tl.sqrt(c_norm_sq + 1e-16)
         vn_f32 = vn_f32 * c_inv_norm
 
+    # Third instance of the fp16 side-channel class fixed for the V scale/zero
+    # pair: this scalar is stored as fp16 and key reconstruction is
+    # centroid * stored, so a +inf here makes every element of the
+    # reconstructed key non-finite. Clamp the value that is actually stored —
+    # after the norm correction, since 1/||c_t|| can push an in-range norm back
+    # out of range (||c_t|| < 1) and can equally bring an out-of-range one back
+    # in (||c_t|| > 1), which a host-side clamp would have destroyed. Norms are
+    # non-negative, so only the upper end needs bounding.
+    vn_f32 = tl.minimum(vn_f32, 65504.0)
     vn_u16 = vn_f32.to(tl.float16).to(tl.uint16, bitcast=True)
     tl.store(KV_cache_u16_ptr + knorm_u16_addr, vn_u16)
 
@@ -498,6 +507,15 @@ def triton_turboquant_store(
     norms = k_flat.norm(dim=1, keepdim=True)
     x_hat = k_flat / (norms + 1e-8)
     y = x_hat @ PiT
+
+    # Note on the fp16 key-norm clamp (same class as the V scale/zero clamp in
+    # ``_store_quantized_value``): this copy saturates *in the kernel*, right
+    # before the fp16 store, not here. Under NORM_CORRECTION the stored scalar
+    # is ||k_t|| / ||c_t||, so a host-side clamp of ||k_t|| would saturate
+    # vectors whose corrected value is perfectly representable (||c_t|| > 1)
+    # and would still not cover the ||c_t|| < 1 case that pushes a clamped norm
+    # back out of range. The AoS sibling has no correction step, so it clamps
+    # in its launcher.
 
     v_flat = value.float().reshape(NH, D)
 

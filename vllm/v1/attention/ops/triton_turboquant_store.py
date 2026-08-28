@@ -564,13 +564,22 @@ def triton_turboquant_store(
     x_hat = k_flat / (norms + 1e-8)
     y = x_hat @ PiT
 
+    # Third instance of the fp16-storage class fixed for the value scale/zero
+    # and the outlier channel above: the kernel writes this per-vector key norm
+    # as fp16, and ||k|| > 65504 casts to +inf. The key reconstruction is
+    # centroid * stored_norm, so a single inf norm poisons every element of the
+    # vector. Saturate the *stored* copy only — ``x_hat`` above keeps the true
+    # norm, so the rotated vector stays unit-length for the MSE codebook and a
+    # saturating vector merely loses magnitude instead of going non-finite.
+    norms_store = norms.squeeze(1).clamp(max=65504.0)
+
     v_flat = value.float().reshape(NH, D)
 
     # Fused kernel: bucketize + MSE index pack + norm store + value pack
     grid = (NH,)
     _tq_fused_store_mse[grid](
         y,
-        norms.squeeze(1),
+        norms_store,
         v_flat,
         midpoints,
         val_mid,
