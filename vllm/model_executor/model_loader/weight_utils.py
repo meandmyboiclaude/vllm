@@ -4,9 +4,11 @@
 
 import asyncio
 import concurrent.futures
+import copy
 import fnmatch
 import glob
 import hashlib
+import inspect
 import json
 import os
 import tempfile
@@ -236,23 +238,105 @@ def convert_bin_to_safetensor_file(
             raise RuntimeError(f"The output tensors do not match for key {k}")
 
 
+def _invoke_hf_overrides_callable(hf_overrides: Callable, hf_config: Any) -> Any:
+    """Call an ``hf_overrides`` callable without touching ``hf_config``.
+
+    The speculative config transforms are *mutators*
+    (``SpeculativeConfig.hf_config_override`` rewrites ``model_type``,
+    ``architectures`` and friends on the object it is handed), so the live
+    config is never passed in — only a deep copy. A config that cannot be
+    copied means the call is skipped entirely rather than risking an in-place
+    rewrite from what is only a quantization lookup.
+    """
+    try:
+        config_arg = copy.deepcopy(hf_config)
+    except Exception:
+        logger.warning(
+            "hf_overrides is a callable but hf_config could not be deep-copied; "
+            "skipping the call so the live config is not mutated by a "
+            "quantization lookup. No hf_overrides quantization config will be "
+            "used."
+        )
+        return {}
+
+    try:
+        sig: inspect.Signature | None = inspect.signature(hf_overrides)
+    except (TypeError, ValueError):
+        sig = None
+
+    if sig is not None:
+        # Pick the arity from the signature instead of calling and catching
+        # TypeError: a one-arg mutator that raises TypeError *internally* would
+        # otherwise be invoked a second time (twice-applied transform).
+        try:
+            sig.bind(config_arg)
+        except TypeError:
+            pass
+        else:
+            try:
+                return hf_overrides(config_arg)
+            except TypeError as exc:
+                # Not an arity mismatch (the signature accepted the argument),
+                # so do NOT retry zero-arg: that would apply a mutating
+                # transform a second time.
+                logger.warning(
+                    "hf_overrides callable raised TypeError (%s); treating it "
+                    "as no hf_overrides quantization config.",
+                    exc,
+                )
+                return {}
+        try:
+            sig.bind()
+        except TypeError:
+            return {}
+        return hf_overrides()
+
+    # Signature unavailable (some C-implemented callables): fall back to the
+    # historical try-one-arg-then-zero-arg ladder.
+    try:
+        return hf_overrides(config_arg)
+    except TypeError:
+        try:
+            return hf_overrides()
+        except TypeError:
+            return {}
+
+
 def resolve_hf_overrides_for_quant(
     hf_overrides: Any,
     hf_config: Any = None,
 ) -> dict[str, Any]:
     """Materialize ModelConfig.hf_overrides for get_quant_config.
 
-    Speculative draft configs may store a callable (compose_draft_hf_overrides)
-    instead of a dict. Invoke it; keep raising for other non-dict types.
+    Speculative draft configs may store a callable instead of a dict, and the
+    two callable shapes behave very differently:
+
+    * dict factories return the override mapping and are used as-is;
+    * config transforms (``SpeculativeConfig.hf_config_override`` and the
+      ``compose_draft_hf_overrides`` partial wrapping it) take a
+      ``PretrainedConfig``, mutate it in place and return a
+      ``PretrainedConfig``. Their return value is not an override mapping at
+      all, and running one here would re-apply the draft transform to the live
+      ``model_config.hf_config`` as a side effect of a quantization lookup.
+
+    So a callable is only ever invoked on a deep copy of ``hf_config``, and a
+    non-mapping result is reported as "no overrides" ( ``{}`` ) rather than an
+    error. Non-callable, non-dict values keep raising.
     """
     if callable(hf_overrides):
-        try:
-            hf_overrides = hf_overrides(hf_config)
-        except TypeError:
-            try:
-                hf_overrides = hf_overrides()
-            except TypeError:
-                hf_overrides = {}
+        resolved = _invoke_hf_overrides_callable(hf_overrides, hf_config)
+        if resolved is None:
+            return {}
+        if not isinstance(resolved, dict):
+            logger.warning(
+                "hf_overrides callable %r returned %s, not a dict — it is a "
+                "config transform rather than an override mapping, so no "
+                "hf_overrides quantization config is available.",
+                getattr(hf_overrides, "__name__", hf_overrides),
+                type(resolved).__name__,
+            )
+            return {}
+        return resolved
     if hf_overrides is None:
         return {}
     if not isinstance(hf_overrides, dict):
