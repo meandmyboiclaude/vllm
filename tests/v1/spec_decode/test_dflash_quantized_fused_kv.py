@@ -140,7 +140,14 @@ def _make_fp8_k_proj():
     return k_proj
 
 
-def _attn_stub(proj, proj_attr="qkv_proj"):
+def _norm_weight(size, dtype=torch.bfloat16):
+    """Norm weights carry the model's activation dtype: the buffer builders
+    read it off ``hidden_norm.weight`` to pick the dequant output dtype, so a
+    default-fp32 ``torch.randn`` stub would describe a model we never serve."""
+    return torch.randn(size, dtype=dtype, device="cuda")
+
+
+def _attn_stub(proj, proj_attr="qkv_proj", dtype=torch.bfloat16):
     """Minimal attention-layer stub exposing what the buffer builders read."""
     return SimpleNamespace(
         **{proj_attr: proj},
@@ -148,7 +155,7 @@ def _attn_stub(proj, proj_attr="qkv_proj"):
         kv_size=KV_SIZE,
         head_dim=HEAD_DIM,
         num_kv_heads=KV_HEADS,
-        k_norm=SimpleNamespace(weight=torch.randn(HEAD_DIM, device="cuda")),
+        k_norm=SimpleNamespace(weight=_norm_weight(HEAD_DIM, dtype)),
         q_norm=SimpleNamespace(variance_epsilon=1e-6),
     )
 
@@ -166,12 +173,11 @@ def test_laguna_fused_kv_quantized(dist_init, fp8_vllm_config):
 
     model = object.__new__(DFlashLagunaModel)
     torch.nn.Module.__init__(model)
-    model.hidden_norm = SimpleNamespace(
-        weight=torch.randn(HIDDEN, device="cuda"))
+    model.hidden_norm = SimpleNamespace(weight=_norm_weight(HIDDEN))
     model._rms_norm_eps = 1e-6
     model.layers = [
         SimpleNamespace(input_layernorm=SimpleNamespace(
-            weight=torch.randn(HIDDEN, device="cuda")))
+            weight=_norm_weight(HIDDEN)))
         for _ in attns
     ]
     model._build_context_kv_buffers(attns, has_bias=False)
@@ -211,8 +217,7 @@ def test_gemma4_fused_kv_quantized(dist_init, fp8_vllm_config):
 
     model = object.__new__(Gemma4DSparkModel)
     torch.nn.Module.__init__(model)
-    model.hidden_norm = SimpleNamespace(
-        weight=torch.randn(HIDDEN, device="cuda"))
+    model.hidden_norm = SimpleNamespace(weight=_norm_weight(HIDDEN))
     model._rms_norm_eps = 1e-6
     model._build_context_kv_buffers(attns, has_bias=False)
 
@@ -234,6 +239,34 @@ def test_gemma4_fused_kv_quantized(dist_init, fp8_vllm_config):
     ref = (per_layer.view(num_ctx, NUM_LAYERS, KV_HEADS, HEAD_DIM)
            .permute(1, 0, 2, 3).contiguous())
     torch.testing.assert_close(all_k, ref, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_fused_kv_buffer_follows_norm_weight_dtype(dist_init, fp8_vllm_config,
+                                                   dtype):
+    """The dequant output dtype is read off the (unquantized) hidden-norm
+    weight, so an fp16 drafter gets an fp16 buffer and a bf16 drafter a bf16
+    one.  A hardcoded bf16 would silently upcast every fp16 drafter's fused
+    context-KV GEMM."""
+    from vllm.model_executor.models.laguna_dflash import DFlashLagunaModel
+
+    qkvs = [_make_fp8_qkv(), _make_fp8_qkv()]
+    for qkv in qkvs:
+        qkv.quant_method.process_weights_after_loading(qkv)
+    attns = [_attn_stub(q, dtype=dtype) for q in qkvs]
+
+    model = object.__new__(DFlashLagunaModel)
+    torch.nn.Module.__init__(model)
+    model.hidden_norm = SimpleNamespace(weight=_norm_weight(HIDDEN, dtype))
+    model._rms_norm_eps = 1e-6
+    model.layers = [
+        SimpleNamespace(input_layernorm=SimpleNamespace(
+            weight=_norm_weight(HIDDEN, dtype)))
+        for _ in attns
+    ]
+    model._build_context_kv_buffers(attns, has_bias=False)
+
+    assert model._kv_weights.dtype == dtype
 
 
 # ---------------------------------------------------------------------------
