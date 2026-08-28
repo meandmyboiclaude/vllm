@@ -74,7 +74,16 @@ class DSparkMarkovHead(nn.Module):
 
     def embed(self, token_ids: torch.Tensor) -> torch.Tensor:
         """r-dim Markov embedding of ``token_ids`` ([B] -> [B, r])."""
-        return self.markov_w1(token_ids)
+        # Clamp the gather into the codebook's row range. On the serving path
+        # the ids are real target tokens (the anchor) or freshly sampled draft
+        # ids, so this is an identity. But DSparkSpeculator reads the anchor
+        # straight out of the drafter's input_ids buffer
+        # (_sample_sequential{,_topk}), and during spec warmup / cudagraph
+        # capture that buffer still carries the -1 sentinel, which would make
+        # this an out-of-range row index — an illegal access on a captured
+        # graph. Same class as the codebook gathers #53978 clamped in
+        # _score_edges; warmup rows are discarded downstream anyway.
+        return self.markov_w1(token_ids.clamp(0, self.markov_w1.num_embeddings - 1))
 
     def bias(
         self,

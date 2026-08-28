@@ -56,3 +56,19 @@ def test_gathered_markov_bias_matches_dense_at_full_vocab():
 
     expected = original + markov_embed @ weight.T * scale
     torch.testing.assert_close(result, expected)
+
+
+def test_markov_embed_clamps_warmup_sentinel_ids():
+    """The anchor read can carry -1 during warmup / cudagraph capture."""
+    head = DSparkMarkovHead.__new__(DSparkMarkovHead)
+    nn.Module.__init__(head)
+    head.markov_w1 = nn.Embedding(4, 3)
+
+    # In range: an identity.
+    ids = torch.tensor([0, 2, 3])
+    torch.testing.assert_close(head.embed(ids), head.markov_w1(ids))
+
+    # Out of range in both directions: clamped onto the edge rows instead of
+    # gathering off the end of the codebook.
+    out_of_range = head.embed(torch.tensor([-1, 9]))
+    torch.testing.assert_close(out_of_range, head.markov_w1(torch.tensor([0, 3])))
