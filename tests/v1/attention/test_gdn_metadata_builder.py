@@ -424,6 +424,9 @@ def test_one_token_prefill_excludes_cudagraph_padding():
     # arrays into causal_conv1d_fn, which asserts size == (padded_batch,);
     # the padding row is state-less, hence the trailing False.
     assert meta.has_initial_state.tolist() == [True, True, False, False]
+    # It is read inside the captured region, so it must ride the builder's
+    # persistent staging buffer, not a per-step allocation (capture#2).
+    assert meta.has_initial_state.data_ptr() == builder.has_initial_state_buf.data_ptr()
     assert meta.prefill_query_start_loc is not None
     assert meta.prefill_query_start_loc.tolist() == [0, 1]
     assert meta.prefill_state_indices is not None
