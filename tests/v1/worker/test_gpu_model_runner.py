@@ -936,6 +936,9 @@ def test_dummy_sampler_run_warms_all_greedy_rejection_sampler(monkeypatch):
     runner.sampler = Mock(return_value="sampler_output")
     runner.sampler.logprobs_mode = "processed_logprobs"
     runner.speculative_config = SimpleNamespace(
+        # #46270 made the warmup draft length num_speculative_tokens instead of
+        # 1, so the mock has to carry it (K=5 is the served DFlash depth).
+        num_speculative_tokens=5,
         rejection_sample_method="standard",
         draft_sample_method="greedy",
     )
