@@ -1910,3 +1910,96 @@ class TestThinkingBudgetSpecVerifyRows:
             assert holder._state[0]["think_count"] <= len(committed)
             # One accepted token commits before the next step.
             committed.append(self.THINK_TOKEN)
+
+
+# --- in_think_mask staging-buffer reuse ---
+# The pinned host buffer feeding the non-blocking H2D in ``in_think_mask``
+# cannot be rewritten until the previous copy has landed; the holder keeps a
+# small ring with a per-slot event for that.
+
+
+class TestInThinkMaskStaging:
+    @staticmethod
+    def _make_holder(device: torch.device, is_pin_memory: bool):
+        class FakeReasoningConfig:
+            reasoning_start_token_ids = [900]
+            reasoning_end_token_ids = [901]
+            enabled = True
+
+        return ThinkingBudgetStateHolder(
+            reasoning_config=FakeReasoningConfig(),
+            max_num_seqs=8,
+            num_spec_tokens=2,
+            device=device,
+            is_pin_memory=is_pin_memory,
+        )
+
+    def test_staging_ring_rotates_and_stays_correct(self):
+        """Host staging must rotate, so a slot is never rewritten while its
+        own H2D copy may still be in flight."""
+        device = torch.device("cpu")
+        holder = self._make_holder(device, False)
+        assert len(holder._in_think_mask_cpus) > 1
+        first_slot = holder._in_think_mask_slot
+
+        holder._state = {0: {"in_think": True}, 2: {"in_think": False}}
+        assert holder.in_think_mask(4, device).tolist() == [
+            True,
+            False,
+            False,
+            False,
+        ]
+        assert holder._in_think_mask_slot != first_slot
+
+        holder._state = {1: {"in_think": True}}
+        assert holder.in_think_mask(4, device).tolist() == [
+            False,
+            True,
+            False,
+            False,
+        ]
+        # Back to the first slot; its stale contents must not leak through.
+        assert holder._in_think_mask_slot == first_slot
+        holder._state = {3: {"in_think": True}}
+        assert holder.in_think_mask(4, device).tolist() == [
+            False,
+            False,
+            False,
+            True,
+        ]
+
+    @pytest.mark.skipif(
+        not current_platform.is_cuda_alike(), reason="needs an accelerator"
+    )
+    def test_pinned_staging_records_reuse_events(self):
+        device = torch.device(DEVICES[0])
+        try:
+            holder = self._make_holder(device, True)
+        except (RuntimeError, torch.AcceleratorError) as exc:  # pragma: no cover
+            # Pinned host allocation needs free device memory; the box may be
+            # serving. The ring itself is covered by the CPU test above.
+            pytest.skip(f"pinned host allocation unavailable: {exc}")
+
+        first_slot = holder._in_think_mask_slot
+        holder._state = {0: {"in_think": True}}
+        mask = holder.in_think_mask(4, device)
+        assert mask.cpu().tolist() == [True, False, False, False]
+        # The slot just used carries a recorded event, so the next write to it
+        # waits for its copy.
+        assert holder._in_think_mask_events[first_slot] is not None
+
+        holder._state = {3: {"in_think": True}}
+        assert holder.in_think_mask(4, device).cpu().tolist() == [
+            False,
+            False,
+            False,
+            True,
+        ]
+        assert holder._in_think_mask_slot == first_slot
+        holder._state = {2: {"in_think": True}}
+        assert holder.in_think_mask(4, device).cpu().tolist() == [
+            False,
+            False,
+            True,
+            False,
+        ]

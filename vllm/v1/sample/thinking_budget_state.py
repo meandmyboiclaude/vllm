@@ -78,13 +78,31 @@ class ThinkingBudgetStateHolder:
         else:
             self._mask_capacity = max_num_reqs
 
-        # Persistent staging pair for in_think_mask(): fill the pinned host
+        # Persistent staging ring for in_think_mask(): fill a pinned host
         # buffer, async-copy into the device buffer, and hand out a view.
         # Avoids a per-step list build plus pinned host allocation on the
         # spec-decode verification path.
-        self._in_think_mask_cpu = torch.zeros(
-            max_num_reqs, dtype=torch.bool, pin_memory=is_pin_memory
-        )
+        #
+        # The host side must be a ring with per-slot events, not one buffer: a
+        # pinned source of a non_blocking H2D copy may not be rewritten until
+        # that copy has actually landed, and nothing between two in_think_mask()
+        # calls synchronizes the copy stream. Depth 2 plus an event wait makes
+        # the reuse ordered (the wait is a no-op in practice — a
+        # [max_num_reqs] bool DMA is long done by the next sampling step) while
+        # keeping the buffers persistent. The ring depth is unconditional (two
+        # [max_num_reqs] bool buffers is nothing); only the events are
+        # pinned-and-CUDA only, since unpinned staging copies synchronously
+        # from the host's point of view.
+        self._in_think_mask_pinned = is_pin_memory
+        ring_depth = 2
+        self._in_think_mask_cpus = [
+            torch.zeros(max_num_reqs, dtype=torch.bool, pin_memory=is_pin_memory)
+            for _ in range(ring_depth)
+        ]
+        self._in_think_mask_events: list[torch.cuda.Event | None] = [
+            None
+        ] * ring_depth
+        self._in_think_mask_slot = 0
         self._in_think_mask_gpu = torch.zeros(
             max_num_reqs, dtype=torch.bool, device=device
         )
@@ -208,7 +226,8 @@ class ThinkingBudgetStateHolder:
         Returns a view of a persistent device buffer refreshed through a
         pinned staging copy; the view is valid until the next call.
         """
-        cpu_mask = self._in_think_mask_cpu
+        slot = self._in_think_mask_slot
+        cpu_mask = self._in_think_mask_cpus[slot]
         if num_reqs > cpu_mask.shape[0] or device != self._in_think_mask_gpu.device:
             # Fallback for foreign devices or oversized batches (not hit in
             # serving: num_reqs <= max_num_seqs on the holder's own device).
@@ -217,6 +236,11 @@ class ThinkingBudgetStateHolder:
                 if i < num_reqs and state.get("in_think", False):
                     mask[i] = True
             return async_tensor_h2d(mask, device=device, dtype=torch.bool)
+        # Wait for this slot's previous H2D to land before rewriting its
+        # pinned pages. Only recorded (and only non-None) on the pinned path.
+        pending = self._in_think_mask_events[slot]
+        if pending is not None:
+            pending.synchronize()
         cpu_np = cpu_mask.numpy()
         cpu_np[:num_reqs] = False
         for i, state in self._state.items():
@@ -224,6 +248,11 @@ class ThinkingBudgetStateHolder:
                 cpu_np[i] = True
         gpu_mask = self._in_think_mask_gpu[:num_reqs]
         gpu_mask.copy_(cpu_mask[:num_reqs], non_blocking=True)
+        if self._in_think_mask_pinned and device.type == "cuda":
+            event = pending if pending is not None else torch.cuda.Event()
+            event.record()
+            self._in_think_mask_events[slot] = event
+        self._in_think_mask_slot = (slot + 1) % len(self._in_think_mask_cpus)
         return gpu_mask
 
     @staticmethod
