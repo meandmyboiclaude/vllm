@@ -23,6 +23,8 @@ class PendingRecv:
     sampled_tokens: torch.Tensor  # [num_reqs, max_sample_len]
     num_sampled: torch.Tensor  # [num_reqs]
     num_rejected: torch.Tensor  # [num_reqs]
+    # Private copy of the batch's idx_mapping: the runner's own tensor is a
+    # view of a persistent buffer reused by later steps (see `receive`).
     idx_mapping: torch.Tensor  # [num_reqs]
     idx_mapping_np: np.ndarray  # [num_reqs]
     # Records which rows need a deferred postprocess (bool).
@@ -137,6 +139,15 @@ class PPHandler:
         gen_at_receive_np = self.req_idx_gen_np[input_batch.idx_mapping_np]
 
         num_reqs = input_batch.num_reqs
+        # `input_batch.idx_mapping` is a view of the model runner's persistent
+        # CpuGpuBuffer (vendor #35561), overwritten by every later
+        # prepare_inputs. This slot is consumed pp_size steps later by
+        # `get_prev_sampled_outputs`, so keep a private copy — the same reason
+        # `gen_at_receive_np` is snapshotted above. Clone on the main stream,
+        # where the buffer's H2D copy was enqueued, before the broadcast block
+        # switches streams. `idx_mapping_np` needs no copy: prepare_batch_state
+        # builds it fresh per step with np.fromiter.
+        idx_mapping_snapshot = input_batch.idx_mapping.clone()
         with torch.cuda.stream(self.broadcast_stream):
             self.broadcast_stream.wait_stream(self.main_stream)
             sampled_tokens = torch.empty(
@@ -160,7 +171,7 @@ class PPHandler:
             sampled_tokens,
             num_sampled,
             num_rejected,
-            input_batch.idx_mapping,
+            idx_mapping_snapshot,
             input_batch.idx_mapping_np,
             need_sampled_mask,
             gen_at_receive_np,
