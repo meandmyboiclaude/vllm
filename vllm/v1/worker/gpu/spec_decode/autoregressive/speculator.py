@@ -13,7 +13,7 @@ from vllm.triton_utils import tl, triton
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
 from vllm.v1.worker.gpu.block_table import BlockTables
-from vllm.v1.worker.gpu.buffer_utils import async_copy_to_gpu
+from vllm.v1.worker.gpu.buffer_utils import CpuGpuBuffer
 from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 from vllm.v1.worker.gpu.dp_utils import DPSyncState, dispatch_cg_and_sync_dp
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
@@ -40,15 +40,15 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         )
 
         # Nonzero rows mask draft KV writes for requests without lookahead
-        # slots (carried #48244). Persistent buffers keep the device pointer
-        # stable for captured fused decode graphs and avoid a per-step pinned
-        # host allocation.
-        self.skip_kv_write_rows = torch.zeros(
+        # slots (carried #48244). The device tensor is persistent so captured
+        # fused decode graphs keep a stable pointer. The host side is a ring
+        # of pinned buffers (same discipline as the runner's #35561 buffers):
+        # a single pinned buffer rewritten every step races the previous
+        # step's still-queued non_blocking H2D copy under async scheduling.
+        self._skip_rows_buf = CpuGpuBuffer(
             self.max_num_reqs, dtype=torch.int8, device=device
         )
-        self.skip_kv_write_rows_cpu = torch.zeros(
-            self.max_num_reqs, dtype=torch.int8, device="cpu", pin_memory=True
-        )
+        self.skip_kv_write_rows = self._skip_rows_buf.gpu
         self._skip_rows_dirty = False
 
         self.inputs_embeds: torch.Tensor | None = None
@@ -396,11 +396,8 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         # bake its pointer in at capture time and see fresh values on replay.
         # Rows are zeroed again once no request needs masking.
         if no_draft_mask is not None and no_draft_mask.any():
-            self.skip_kv_write_rows_cpu.numpy()[:num_reqs] = no_draft_mask
-            async_copy_to_gpu(
-                self.skip_kv_write_rows_cpu[:num_reqs],
-                out=self.skip_kv_write_rows[:num_reqs],
-            )
+            self._skip_rows_buf.np[:num_reqs] = no_draft_mask
+            self._skip_rows_buf.copy_to_gpu(num_reqs)
             self._skip_rows_dirty = True
         elif self._skip_rows_dirty:
             self.skip_kv_write_rows.zero_()
