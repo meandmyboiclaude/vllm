@@ -903,6 +903,22 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             # required by the FlyDSL decode kernel. Pure-Triton store; the
             # cache tensor shape is identical to the default AoS store, only
             # the within-block byte convention differs.
+            #
+            # The SoA store and the SoA/FlyDSL decode carry neither the KVQ-1
+            # value codebook nor the KVQ-3 outlier side-channel (the SoA
+            # launchers take no value_nuq / value_outliers arguments, and the
+            # decode dispatch filters unknown kwargs by signature). A NUQ or
+            # outlier preset on this path would be written and read back as
+            # the plain uniform codec -- self-consistent, but silently not the
+            # preset the user asked for. Refuse rather than mis-label.
+            if self.tq_config.value_nuq or self.tq_config.n_value_outliers > 0:
+                raise NotImplementedError(
+                    f"TurboQuant preset {self.kv_cache_dtype!r} uses the "
+                    "non-uniform value codebook and/or the value outlier "
+                    "side-channel, which the SoA (FlyDSL) store/decode path "
+                    "does not implement; use the AoS path (no FlyDSL) or a "
+                    "uniform-value preset."
+                )
             soa_store, _, _ = _soa_imports()
             soa_store(
                 key=key,
