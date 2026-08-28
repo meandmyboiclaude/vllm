@@ -83,6 +83,10 @@ def fused_recurrent_gated_delta_rule_replayssm_kernel(
     softplus_x = tl.where(x <= SOFTPLUS_THRESHOLD, tl.log(1.0 + tl.exp(x)), x)
     g_val = -tl.exp(A_log_val) * softplus_x
     alpha_val = tl.exp(g_val)
+    # fp32, mirroring #53877's fix in the packed-decode sibling: beta feeds
+    # d_cur -> d_cache, so a bf16 round-trip here compounds over the replay
+    # window. tests/kernels/test_replayssm_standard_decode_gdn.py checks this
+    # kernel differentially against that sibling, so the two must stay in step.
     beta_val = tl.sigmoid(b_val)
 
     # Replay decay over the committed cache, from the cached per-step gates g.
