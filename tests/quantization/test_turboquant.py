@@ -336,6 +336,9 @@ class TestTurboQuantKVCacheSpec:
             head_size_v=128,
             num_kv_heads=4,
             sliding_window=None,
+            # Every get_kv_cache_spec branch forwards the draft-layer marker
+            # onto the spec (kvutils finding 3, #54041); a target layer is False.
+            non_causal_multi_token_decode=False,
             # KVQ-4 resolves a per-layer preset, so the layer index is read.
             layer_name="model.layers.0.self_attn.attn",
             get_attn_backend=lambda: TurboQuantAttentionBackend,
