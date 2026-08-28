@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
 import multiprocessing
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Iterator, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from copy import copy
 from typing import TYPE_CHECKING, overload
@@ -49,7 +49,7 @@ class _TokenSequenceView(Sequence[int]):
     * The engine-parser adapters (qwen3 among them) go one step further and
       materialize it -- ``list(input_ids)`` in
       ``ParserEngineReasoningAdapter.is_reasoning_end`` -- so they pay a full
-      Python-level copy per call.
+      Python-level copy per call. ``__iter__`` below keeps that at C speed.
 
     All of it is reached only through ``filter_speculative_grammar_tokens``,
     which returns before building a view unless the request is speculative
@@ -63,6 +63,12 @@ class _TokenSequenceView(Sequence[int]):
 
     def __len__(self) -> int:
         return len(self.prefix) + len(self.suffix)
+
+    def __iter__(self) -> Iterator[int]:
+        # The Sequence mixin would iterate via __getitem__, one Python call per
+        # token; chaining the two underlying sequences is C-level and yields
+        # exactly the same elements in the same order.
+        return itertools.chain(iter(self.prefix), iter(self.suffix))
 
     @overload
     def __getitem__(self, index: int) -> int: ...
