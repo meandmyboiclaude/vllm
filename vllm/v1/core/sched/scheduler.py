@@ -1022,6 +1022,16 @@ class Scheduler(SchedulerInterface):
                     # `request.num_prompt_tokens` to consider the resumed
                     # requests, which have output tokens.
                     num_new_tokens = request.num_tokens - num_computed_tokens
+                    # #54028: clamp the prefill chunk *before* the padding
+                    # decision. Applied afterwards it can shorten a padded
+                    # decode back below 1 + num_spec_tokens while
+                    # pad_spec_decode stays True, so the request keeps a
+                    # full-width placeholder attachment that no longer matches
+                    # its token span (and the #54102 verifier-topology guard
+                    # then reads the short span as a non-verifier).
+                    threshold = self.scheduler_config.long_prefill_token_threshold
+                    if 0 < threshold < num_new_tokens:
+                        num_new_tokens = threshold
 
                     # Pad new decode requests to uniform spec decoding size to
                     # preserve full cudagraph for this step.
@@ -1045,10 +1055,6 @@ class Scheduler(SchedulerInterface):
                                 break
                             num_new_tokens = padded_num_tokens
                             pad_spec_decode = True
-
-                    threshold = self.scheduler_config.long_prefill_token_threshold
-                    if 0 < threshold < num_new_tokens:
-                        num_new_tokens = threshold
 
                     # chunked prefill has to be enabled explicitly to allow
                     # pooling requests to be chunked
