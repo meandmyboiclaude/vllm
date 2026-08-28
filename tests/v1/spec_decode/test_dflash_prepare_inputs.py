@@ -149,6 +149,10 @@ def test_prepare_dflash_inputs_excludes_rejected_context_suffix():
     assert out.input_buffers.is_padding[3:12].all()
     assert out.input_buffers.input_ids[3:12].cpu().tolist() == [0] * 9
     assert out.input_buffers.positions[3:12].cpu().tolist() == [0] * 9
+    # ... and rows beyond that bound are left alone (no dispatch reads them),
+    # so they still hold the fixture's -1 fill.
+    assert out.input_buffers.input_ids[12:].cpu().tolist() == [-1] * 4
+    assert not out.input_buffers.is_padding[12:].any()
 
 
 def test_prepare_dflash_inputs_excludes_rejected_context_suffix_with_dcp():

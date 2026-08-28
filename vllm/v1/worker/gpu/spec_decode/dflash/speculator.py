@@ -581,7 +581,7 @@ def _prepare_dflash_inputs_kernel(
     num_query_per_req,
     num_speculative_steps,
     max_num_reqs,
-    max_num_tokens,
+    max_query_tokens,
     max_model_len,
     cp_rank,
     SAMPLE_FROM_ANCHOR: tl.constexpr,
@@ -743,10 +743,13 @@ def _prepare_dflash_inputs_kernel(
             # whatever a previous step left behind (a stale id can be the -1
             # sentinel, which reaches the embedding and the DFlash2 selector
             # codebook gathers), and PAD slots so no K/V is written.
+            # The span ends at max_query_tokens, the largest draft dispatch —
+            # not at the whole max_num_batched_tokens buffer. See the bound's
+            # derivation in prepare_dflash_inputs.
             q_pad_start = num_reqs * num_query_per_req
-            for i in range(q_pad_start, max_num_tokens, BLOCK_SIZE):
+            for i in range(q_pad_start, max_query_tokens, BLOCK_SIZE):
                 block = i + tl.arange(0, BLOCK_SIZE)
-                mask = block < max_num_tokens
+                mask = block < max_query_tokens
                 tl.store(out_input_ids_ptr + block, 0, mask=mask)
                 tl.store(out_query_positions_ptr + block, 0, mask=mask)
                 tl.store(out_is_padding_ptr + block, True, mask=mask)
@@ -798,6 +801,20 @@ def prepare_dflash_inputs(
     max_tokens_per_req = max_target_query_len + num_query_per_req
     BLOCK_SIZE = min(256, triton.next_power_of_2(max(1, max_tokens_per_req)))
     num_blocks = triton.cdiv(max_tokens_per_req, BLOCK_SIZE)
+    # Upper bound on the query rows any draft dispatch can read, and so on the
+    # rows the kernel has to keep padded. Every DFlash step is uniform at
+    # num_query_per_req tokens per request, so:
+    #   * eager steps run num_reqs * num_query_per_req <= this bound;
+    #   * captured graphs are built from CudaGraphManager._init_candidates,
+    #     which drops any capture size above max_num_reqs * decode_query_len
+    #     (decode_query_len is num_query_per_req here), so every replay size
+    #     is <= this bound too.
+    # Padding the whole max_num_batched_tokens span instead costs ~2K wasted
+    # stores per launch at serving shapes, serialized in one program. The
+    # input_ids / positions / is_padding buffers belong to the drafter alone;
+    # the query slot mapping is shared with the target, which rewrites it
+    # before its next forward, so leaving its tail untouched is inert.
+    max_query_tokens = min(max_num_tokens, max_num_reqs * num_query_per_req)
     _prepare_dflash_inputs_kernel[(num_reqs, num_blocks)](
         input_buffers.input_ids,
         input_buffers.positions,
@@ -828,7 +845,7 @@ def prepare_dflash_inputs(
         num_query_per_req,
         num_speculative_steps,
         max_num_reqs,
-        max_num_tokens,
+        max_query_tokens,
         max_model_len,
         cp_rank,
         SAMPLE_FROM_ANCHOR=sample_from_anchor,
