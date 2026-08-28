@@ -72,13 +72,14 @@ def _store_quantized_value(
             # bit-identical to the ones the decode reads back.
             # It does NOT bound the reconstruction. Decode computes
             # centroid[q] * std + mean with |centroid| up to 2.150 for the
-            # 3-bit Lloyd-Max N(0,1) table, so a saturated std reconstructs up
-            # to ~2.15x above the fp16 range and turns into inf at the output
-            # store (triton_turboquant_decode.py, V_out store). The uniform
-            # branch below is bounded by construction — q <= levels and
-            # scale = (max-min)/levels, so q*scale + zero <= max <= 65504 — the
-            # NUQ branch has no such bound; the true fix belongs at the
-            # reconstruction read.
+            # 3-bit Lloyd-Max N(0,1) table, so a large std reconstructs up to
+            # ~2.15x std past the mean and can leave the fp16 range even when
+            # every source element was inside it. The uniform branch below is
+            # bounded by construction — q <= levels and scale = (max-min)/
+            # levels, so q*scale + zero <= max <= 65504 — the NUQ branch has
+            # no such bound, so the decode kernels saturate at the
+            # reconstruction read (triton_turboquant_decode.py, both the
+            # stage-1 value read and the _tq_full_dequant_kv V_out store).
             v_scale = tl.minimum(v_scale, 65504.0)
             v_mean = tl.maximum(tl.minimum(v_mean, 65504.0), -65504.0)
             v_zero = v_mean

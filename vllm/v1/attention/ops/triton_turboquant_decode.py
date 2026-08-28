@@ -289,6 +289,26 @@ def _tq_decode_stage1(
                     other=0.0,
                 )
                 values = v_cent * v_scales[:, None] + v_zeros[:, None]
+                # The NUQ reconstruction is not bounded by the stored pair:
+                # |centroid| reaches 2.150 on the 3-bit Lloyd-Max table, so
+                # centroid * std + mean can run past the fp16 range for a
+                # vector whose elements all fit in it (half at -60000, half at
+                # +60000 gives std 60000 and a top centroid at ~129000). The
+                # uniform branch is bounded by construction (q <= levels,
+                # scale = (max-min)/levels).
+                #
+                # Nothing goes non-finite HERE: this accumulator is fp32 and
+                # the stage-2 output is cast to query.dtype (bf16 on this
+                # stack), so the saturation is not an inf guard. It is a
+                # consistency bound. The store clamps both stored constants
+                # into the fp16 range (triton_turboquant_store.py), so the
+                # codec's representable domain IS [-65504, 65504]; the second
+                # reader of the same bytes, ``_tq_full_dequant_kv``, writes
+                # V_out as fp16 and MUST saturate or it emits inf. Bounding
+                # both readers identically keeps the decode path and the
+                # continuation-prefill path from reconstructing the same
+                # cached vector differently.
+                values = tl.maximum(tl.minimum(values, 65504.0), -65504.0)
             else:
                 values = v_idx_int.to(tl.float32) * v_scales[:, None] + v_zeros[:, None]
         else:  # VQB == 4
@@ -504,6 +524,11 @@ def _tq_full_dequant_kv(
         if VALUE_NUQ:
             v_cent = tl.load(Val_centroids_ptr + v_idx_int, mask=d_mask, other=0.0)
             v_vals = v_cent * v_scale + v_zero
+            # Same bound as the stage-1 NUQ read: the reconstruction can exceed
+            # the fp16 range for an in-range source vector, and V_out below is
+            # stored as fp16 -- an unclamped cast writes inf into the dequant
+            # buffer and flash-attn turns it into NaN for the whole row.
+            v_vals = tl.maximum(tl.minimum(v_vals, 65504.0), -65504.0)
         else:
             v_vals = v_idx_int.to(tl.float32) * v_scale + v_zero
     else:
