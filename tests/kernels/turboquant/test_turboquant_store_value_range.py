@@ -418,3 +418,185 @@ def test_soa_norm_correction_key_norm_stored_finite(centroid_mag):
     true_norm = float(key[0, 0].float().norm().cpu())
     expected = min(true_norm / c_norm, FP16_MAX)
     assert stored == pytest.approx(expected, rel=2e-2)
+
+
+# ---------------------------------------------------------------------------
+# NUQ value path (KVQ-1): the reconstruction is bounded at the decode read
+# ---------------------------------------------------------------------------
+
+
+def _full_dequant_v(kv_cache: torch.Tensor, value_quant_bits: int, value_nuq: bool):
+    """Run ``_tq_full_dequant_kv`` over slot 0 exactly as the continuation
+    prefill launches it (FP8-key path) and return the reconstructed V row."""
+    from vllm.model_executor.layers.quantization.turboquant.centroids import (
+        get_value_codebook,
+    )
+    from vllm.v1.attention.ops.triton_turboquant_decode import (
+        _tq_full_dequant_kv,
+        _use_fp8_e4b15,
+    )
+
+    val_data_bytes = D * value_quant_bits // 8
+    k_out = torch.empty(1, H, 1, D, dtype=torch.float16, device=DEVICE_TYPE)
+    v_out = torch.empty(1, H, 1, D, dtype=torch.float16, device=DEVICE_TYPE)
+    block_table = torch.zeros(1, 1, dtype=torch.int32, device=DEVICE_TYPE)
+    centroids = torch.zeros(2, dtype=torch.float32, device=DEVICE_TYPE)
+    # Same argument shape as the backend launch ([TQ-FDQ-VALCENT]): the value
+    # codebook is passed only for a NUQ preset, else the positional is None.
+    if value_nuq:
+        val_centroids = get_value_codebook(value_quant_bits)[0].to(
+            device=DEVICE_TYPE, dtype=torch.float32
+        )
+    else:
+        val_centroids = None
+    _tq_full_dequant_kv[(1, H)](
+        kv_cache,
+        block_table,
+        centroids,
+        val_centroids,
+        k_out,
+        v_out,
+        k_out.stride(0),
+        k_out.stride(1),
+        k_out.stride(2),
+        v_out.stride(0),
+        v_out.stride(1),
+        v_out.stride(2),
+        kv_cache.stride(0),
+        kv_cache.stride(1),
+        kv_cache.stride(2),
+        block_table.stride(0),
+        HEAD_DIM=D,
+        BLOCK_SIZE=BLOCK_SIZE,
+        NUM_KV_HEADS=H,
+        MSE_BYTES=D,
+        KPS=KEY_PACKED_SIZE,
+        VQB=value_quant_bits,
+        VAL_DATA_BYTES=val_data_bytes,
+        MSE_BITS=1,
+        KEY_FP8=1,
+        BLOCK_D=D,
+        FP8_E4B15=_use_fp8_e4b15(0),
+        VALUE_NUQ=1 if value_nuq else 0,
+        N_VAL_CENTROIDS=2**value_quant_bits,
+        N_OUTLIERS=0,
+        num_warps=4,
+    )
+    torch.cuda.synchronize()
+    return v_out[0, 0, 0].float().cpu()
+
+
+def _nuq_store(value: torch.Tensor) -> torch.Tensor:
+    """Store one (N, H, D) value tensor through the NUQ (3-bit) codec."""
+    from vllm.model_executor.layers.quantization.turboquant.centroids import (
+        get_value_codebook,
+    )
+
+    vqb = 3
+    slot_bytes = KEY_PACKED_SIZE + D * vqb // 8 + 4
+    _, mid = get_value_codebook(vqb)
+    key = torch.zeros(N, H, D, dtype=torch.bfloat16, device=DEVICE_TYPE)
+    kv_cache = torch.zeros(
+        NUM_BLOCKS, BLOCK_SIZE, H, slot_bytes, dtype=torch.uint8, device=DEVICE_TYPE
+    )
+    triton_turboquant_store(
+        key,
+        value,
+        kv_cache,
+        torch.zeros(N, dtype=torch.int32, device=DEVICE_TYPE),
+        torch.eye(D, dtype=torch.float32, device=DEVICE_TYPE),
+        torch.zeros(1, dtype=torch.float32, device=DEVICE_TYPE),
+        mse_bits=1,
+        key_packed_size=KEY_PACKED_SIZE,
+        value_quant_bits=vqb,
+        key_fp8=True,
+        value_nuq=True,
+        val_midpoints=mid.to(device=DEVICE_TYPE, dtype=torch.float32),
+    )
+    torch.cuda.synchronize()
+    return kv_cache
+
+
+def _nuq_reference(v: torch.Tensor) -> torch.Tensor:
+    """CPU mirror of the NUQ store + decode arithmetic (tests/turboquant_kvq/
+    _codec_ref.py::nuqv_value_codec), incl. the fp16 round-trip of the stored
+    pair and the saturating reconstruction read."""
+    from vllm.model_executor.layers.quantization.turboquant.centroids import (
+        get_value_codebook,
+    )
+
+    cent, mid = get_value_codebook(3)
+    cent = cent.float()
+    mid = mid.float()
+    mean = v.mean(dim=-1, keepdim=True)
+    std = torch.sqrt(((v - mean) ** 2).mean(dim=-1, keepdim=True))
+    std = torch.where(std > 1e-8, std, torch.full_like(std, 1e-8))
+    std = std.clamp(max=FP16_MAX)
+    mean = mean.clamp(-FP16_MAX, FP16_MAX)
+    idx = ((v - mean) / std).unsqueeze(-1).ge(mid).sum(dim=-1)
+    std_h = std.to(torch.float16).float()
+    mean_h = mean.to(torch.float16).float()
+    return (cent[idx] * std_h + mean_h).clamp(-FP16_MAX, FP16_MAX)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+@pytest.mark.parametrize(
+    "n_high",
+    [
+        # 26/128 at +65024, the rest at -65024: z_top = 2.0 lands on the 2.152
+        # centroid and centroid * std + mean = ~72800, past the fp16 range for
+        # a vector every element of which is inside it. Reconstructed as inf
+        # before the read-side clamp.
+        26,
+        # Balanced: z = +-1 -> in-range reconstruction, clamp is a no-op.
+        64,
+    ],
+)
+def test_nuq_reconstruction_finite_and_matches_reference(n_high):
+    v = torch.full((N, H, D), -65024.0, dtype=torch.float32)
+    v[0, 0, :n_high] = 65024.0
+    kv_cache = _nuq_store(v.to(torch.bfloat16).to(DEVICE_TYPE))
+    recon = _full_dequant_v(kv_cache, value_quant_bits=3, value_nuq=True)
+
+    assert torch.isfinite(recon).all(), (
+        f"NUQ reconstruction non-finite: "
+        f"{(~torch.isfinite(recon)).sum().item()}/{D} elements"
+    )
+    assert recon.abs().max().item() <= FP16_MAX
+
+    ref = _nuq_reference(v[0, 0]).to(torch.float16).float()
+    # One fp16 ulp at the top of the range is 32; the kernel's fp32 mean/std
+    # accumulate in a different order from torch's.
+    torch.testing.assert_close(recon, ref, rtol=1e-3, atol=64.0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_full_dequant_uniform_launch_accepts_none_codebook():
+    """The backend passes ``None`` for the value codebook positional on every
+    non-NUQ preset ([TQ-FDQ-VALCENT]); the kernel must compile and reconstruct
+    the uniform codec with that argument shape."""
+    value = _value_vector(-1.0, 4.0)
+    val_data_bytes = D * 3 // 8
+    slot_bytes = KEY_PACKED_SIZE + val_data_bytes + 4
+    key = torch.zeros(N, H, D, dtype=torch.bfloat16, device=DEVICE_TYPE)
+    kv_cache = torch.zeros(
+        NUM_BLOCKS, BLOCK_SIZE, H, slot_bytes, dtype=torch.uint8, device=DEVICE_TYPE
+    )
+    triton_turboquant_store(
+        key,
+        value,
+        kv_cache,
+        torch.zeros(N, dtype=torch.int32, device=DEVICE_TYPE),
+        torch.eye(D, dtype=torch.float32, device=DEVICE_TYPE),
+        torch.zeros(1, dtype=torch.float32, device=DEVICE_TYPE),
+        mse_bits=1,
+        key_packed_size=KEY_PACKED_SIZE,
+        value_quant_bits=3,
+        key_fp8=True,
+    )
+    torch.cuda.synchronize()
+    recon = _full_dequant_v(kv_cache, value_quant_bits=3, value_nuq=False)
+    ref = value[0, 0].float().cpu()
+    assert torch.isfinite(recon).all()
+    step = _quant_step(ref.numpy(), 3)
+    assert (recon - ref).abs().max().item() <= step + 1e-3

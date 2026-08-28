@@ -103,7 +103,11 @@ def nuqv_value_codec(v: torch.Tensor, bits: int = 3) -> torch.Tensor:
     idx, std, mean = nuqv_encode(v, bits)
     std_h = _to_fp16(std)
     mean_h = _to_fp16(mean)
-    return cent[idx] * std_h + mean_h
+    # The decode kernels saturate the NUQ reconstruction into the fp16 finite
+    # range at the read (centroid * std + mean is not bounded by the stored
+    # pair: |centroid| reaches 2.150, so an in-range vector can reconstruct
+    # past 65504). Mirror that so reference and kernel agree there too.
+    return (cent[idx] * std_h + mean_h).clamp(-_FP16_MAX, _FP16_MAX)
 
 
 # ---------------------------------------------------------------------------
