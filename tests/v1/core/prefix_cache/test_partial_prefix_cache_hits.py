@@ -257,6 +257,11 @@ def test_mamba_align_split_stops_at_replay_boundary():
         use_eagle=False,
         hash_block_size=hash_block_size,
         mamba_partial_cache_hit=True,
+        # Upstream #52789-family: the split consults prefill checkpoints; this
+        # house test exercises the no-checkpoint path.
+        mamba_has_prefill_checkpoint_blocks=False,
+        max_num_scheduled_tokens=8192,
+        scheduler_config=SimpleNamespace(long_prefill_token_threshold=0),
     )
     split = Scheduler._mamba_block_aligned_split
 
