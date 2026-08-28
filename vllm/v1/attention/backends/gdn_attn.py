@@ -177,6 +177,15 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             dtype=torch.int32,
             device=device,
         )
+        # Staging for has_initial_state on the FULL-graph one-token path.
+        # zeros, not empty: the padded tail is refilled every build, but a
+        # capture that runs before any real batch has staged this buffer
+        # must not read uninitialised bytes.
+        self.has_initial_state_buf: torch.Tensor = torch.zeros(
+            (self.decode_cudagraph_max_bs,),
+            dtype=torch.bool,
+            device=device,
+        )
 
         # Cached decode kernel: persistent per-decode-row ring write position.
         # write_pos is derived per request each step (decode_step % max_cache_len)
@@ -670,15 +679,19 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
 
             # The staged arrays are batch_size-wide; keep has_initial_state the
             # same length (padded rows have no state and zero-length queries).
-            if has_initial_state is not None and has_initial_state.size(0) < batch_size:
-                has_initial_state = torch.cat(
-                    [
-                        has_initial_state,
-                        has_initial_state.new_zeros(
-                            batch_size - has_initial_state.size(0)
-                        ),
-                    ]
+            # Stage it through the persistent buffer like every sibling above:
+            # this tensor is read INSIDE the captured region, so a freshly
+            # allocated one per step (the old torch.cat) would be replayed from
+            # the address it happened to have at capture time — every later
+            # step's values would be written somewhere the graph never reads.
+            if has_initial_state is not None:
+                n_hs = has_initial_state.size(0)
+                assert n_hs <= batch_size
+                self.has_initial_state_buf[:n_hs].copy_(
+                    has_initial_state, non_blocking=True
                 )
+                has_initial_state = self.has_initial_state_buf[:batch_size]
+                has_initial_state[n_hs:].fill_(False)
 
             if self.use_cached_kernel:
                 # write_pos_d is None when the batch has no live decode rows
