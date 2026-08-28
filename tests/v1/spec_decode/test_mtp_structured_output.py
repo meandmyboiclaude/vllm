@@ -465,6 +465,36 @@ def test_speculative_grammar_filter_rejects_tokens_after_completion(backend):
     assert rejected == 1
 
 
+@pytest.mark.parametrize("backend", ["xgrammar", "guidance"])
+def test_speculative_grammar_filter_passes_through_terminated_grammar(backend):
+    """A terminated grammar must not reject the block it is handed.
+
+    Once the matcher terminates, ``validate_tokens`` answers [] for every
+    input while ``accept_tokens`` no-ops and reports success, and
+    ``_fill_bitmasks`` writes the full (unconstrained) mask for those
+    positions. Filtering there would reject the whole block, commit nothing,
+    and roll num_computed_tokens / num_output_placeholders straight back --
+    a zero-progress step that repeats forever, because termination is
+    permanent. The block has to pass through untouched.
+    """
+    tokenizer, manager, request, prompt = _make_manager_and_request(backend)
+    grammar = request.structured_output_request.grammar
+
+    # Same shape as test_accept_tokens_syncs_terminated_after_overshoot:
+    # a complete JSON object plus EOS terminates the matcher.
+    assert grammar.accept_tokens(request.request_id, prompt)
+    grammar.accept_tokens(request.request_id, [tokenizer.eos_token_id])
+    assert grammar.is_terminated()
+    # The livelock precondition: validate_tokens is unconditionally empty.
+    assert grammar.validate_tokens(prompt) == []
+
+    block = [tokenizer.encode(" ")[0], tokenizer.encode("z")[0]]
+    filtered, rejected = manager.filter_speculative_grammar_tokens(request, block)
+
+    assert filtered == block
+    assert rejected == 0
+
+
 def test_reasoning_boundary_scan_does_not_copy_committed_history():
     """Boundary detection can expose long history without materializing it."""
     parser_calls = 0

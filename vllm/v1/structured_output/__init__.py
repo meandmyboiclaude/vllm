@@ -588,6 +588,10 @@ class StructuredOutputManager:
         returning, so the scheduler's normal commit path remains the only
         operation that advances the matcher.
 
+        A terminated grammar is filtered out up front: it constrains nothing
+        further, so the block is committed as sampled. See the inline note --
+        rejecting there is a permanent zero-progress step, not a resample.
+
         Args:
             request: Request that owns the grammar and reasoning state.
             new_token_ids: Accepted tokens awaiting scheduler commit.
@@ -605,6 +609,18 @@ class StructuredOutputManager:
             return new_token_ids, 0
         grammar = structured_request.grammar
         if not isinstance(grammar, StructuredOutputGrammar):
+            return new_token_ids, 0
+        if grammar.is_terminated():
+            # A terminated matcher has no constraint left to violate, and it
+            # answers ``validate_tokens`` with [] for *any* input while
+            # ``accept_tokens`` no-ops and reports success. Filtering here
+            # would therefore reject the whole block, commit nothing, and roll
+            # num_computed_tokens/num_output_placeholders back to where they
+            # started -- a step with zero progress that repeats forever,
+            # because termination is permanent. Matching the rest of the
+            # stack (``_fill_bitmasks`` writes the full mask once terminated,
+            # so these positions were deliberately unconstrained) the block
+            # passes through untouched.
             return new_token_ids, 0
 
         reasoner = self._get_reasoner(request)
