@@ -365,17 +365,21 @@ class RejectionSampler(nn.Module):
             # ``bonus_token_forced``. Without a fresh ``update_state`` here, target
             # draft rows would reuse stale forcing state and greedy argmax can diverge
             # from plain (non-spec) decode.
-            # ``update_state`` strips ``len(spec)`` tokens from each row. The
-            # expanded ``output_token_ids`` above uses cumulative draft prefixes
-            # (last row has only K-1 drafts for K proposals), so passing it with
-            # ``repeat_indices`` would strip an accepted token. Use the same
-            # per-request layout as ``Sampler`` (accepted + full draft list).
-            thinking_rows = Sampler._combine_outputs_with_spec_tokens(
-                sampling_metadata.output_token_ids,
-                sampling_metadata.spec_token_ids,
-            )
+            # Pass committed outputs only — the same rows ``Sampler`` passes.
+            # ``update_state`` does not strip anything: it assigns
+            # ``state["output_tok_ids"] = output_token_ids[seq_idx]`` verbatim and
+            # reads the drafts from ``spec_token_ids``, which
+            # ``_update_think_state`` already charges against the budget
+            # (``predicted_countdown = countdown - len(spec) - 1``, and
+            # ``think_count + len(spec) + 1`` for the end-mode transition).
+            # Appending the drafts to the output rows as well counted every draft
+            # twice per step and left ``prev_output_length`` at committed+K, so the
+            # next step's ``len(output) - prev_output_length`` went negative.
+            # The expanded ``output_token_ids`` built above for penalties/bad-words
+            # is deliberately not used: it is per-logit-row with cumulative draft
+            # prefixes, not the per-request layout the holder indexes.
             holder.update_state(
-                thinking_rows,
+                sampling_metadata.output_token_ids,
                 sampling_metadata.spec_token_ids,
                 None,
             )

@@ -1785,3 +1785,128 @@ class TestThinkingBudgetNaturalEndReentry:
         )
 
     # --- Forced-end re-entry tests ---
+
+
+# --- Spec-decode verify-stage rows for the thinking budget ---
+# ``RejectionSampler.apply_logits_processors`` refreshes the holder a second
+# time per step (after the bonus-token ``Sampler`` pass). It must hand the
+# holder committed output rows only: the drafts travel in ``spec_token_ids``
+# and are charged against the budget there, so appending them to the output
+# rows as well counts every draft twice.
+
+
+class TestThinkingBudgetSpecVerifyRows:
+    THINK_START = 900
+    THINK_END = 901
+    THINK_TOKEN = 60
+    BUDGET = 8
+    NUM_SPEC = 2
+
+    @staticmethod
+    def _make_holder(num_spec: int) -> ThinkingBudgetStateHolder:
+        class FakeReasoningConfig:
+            reasoning_start_token_ids = [TestThinkingBudgetSpecVerifyRows.THINK_START]
+            reasoning_end_token_ids = [TestThinkingBudgetSpecVerifyRows.THINK_END]
+            enabled = True
+
+        return ThinkingBudgetStateHolder(
+            reasoning_config=FakeReasoningConfig(),
+            max_num_seqs=8,
+            num_spec_tokens=num_spec,
+            device=torch.device("cpu"),
+            is_pin_memory=False,
+        )
+
+    def _sync(self, holder: ThinkingBudgetStateHolder) -> None:
+        holder.sync_batch(
+            BatchUpdate(
+                batch_size=1,
+                removed=(),
+                added=[(0, SamplingParams(thinking_token_budget=self.BUDGET), None, [])],
+                moved=(),
+            )
+        )
+
+    @staticmethod
+    def _run_verify_stage(
+        holder: ThinkingBudgetStateHolder,
+        output_token_ids: list[list[int]],
+        spec: list[list[int]],
+    ) -> None:
+        """Drive the real ``RejectionSampler`` verify-stage holder refresh."""
+        from types import SimpleNamespace
+
+        from vllm.v1.sample.rejection_sampler import RejectionSampler
+        from vllm.v1.sample.sampler import Sampler
+
+        sampling_metadata = SimpleNamespace(
+            no_penalties=True,
+            bad_words_token_ids=None,
+            output_token_ids=output_token_ids,
+            spec_token_ids=spec,
+            allowed_token_ids_mask=None,
+            logitsprocs=SimpleNamespace(non_argmax_invariant=[]),
+            thinking_budget_state_holder=holder,
+        )
+        spec_decode_metadata = SimpleNamespace(
+            num_draft_tokens=[len(s) for s in spec]
+        )
+        logits = torch.zeros(max(1, sum(len(s) for s in spec)), VOCAB_SIZE)
+        RejectionSampler(Sampler()).apply_logits_processors(
+            logits, sampling_metadata, spec_decode_metadata
+        )
+
+    def test_verify_stage_passes_committed_rows_only(self):
+        """The verify-stage refresh must not double-count the K drafts."""
+        holder = self._make_holder(self.NUM_SPEC)
+        self._sync(holder)
+
+        committed = [self.THINK_START, self.THINK_TOKEN, self.THINK_TOKEN]
+        spec = [[self.THINK_TOKEN] * self.NUM_SPEC]
+        output_token_ids = [list(committed)]
+
+        # Stage 1: the bonus-token sampler pass (``Sampler``), committed rows.
+        holder.update_state(output_token_ids, spec, None)
+        think_count_after_bonus = holder._state[0]["think_count"]
+        countdown_after_bonus = holder._state[0]["check_count_down"]
+
+        recorded: list[list[list[int]]] = []
+        original_update_state = holder.update_state
+
+        def _recording_update_state(rows, spec_rows, repeat_indices=None):
+            recorded.append(rows)
+            return original_update_state(rows, spec_rows, repeat_indices)
+
+        holder.update_state = _recording_update_state  # type: ignore[method-assign]
+
+        # Stage 2: the target-verify pass inside the rejection sampler.
+        self._run_verify_stage(holder, output_token_ids, spec)
+
+        assert len(recorded) == 1
+        # Committed rows verbatim — not committed + drafts.
+        assert recorded[0] == [committed]
+        assert holder._state[0]["output_tok_ids"] == committed
+
+        # Budget accounting is unchanged by the second refresh of the same step.
+        assert holder._state[0]["think_count"] == think_count_after_bonus
+        assert holder._state[0]["check_count_down"] == countdown_after_bonus
+        assert holder._state[0]["prev_output_length"] == len(committed)
+
+    def test_next_step_delta_stays_non_negative(self):
+        """Committed length must never trail ``prev_output_length``."""
+        holder = self._make_holder(self.NUM_SPEC)
+        self._sync(holder)
+
+        committed = [self.THINK_START, self.THINK_TOKEN]
+        spec = [[self.THINK_TOKEN] * self.NUM_SPEC]
+
+        for _ in range(3):
+            rows = [list(committed)]
+            # Bonus-token pass (``Sampler``), then the verify pass through the
+            # real ``RejectionSampler`` call site.
+            holder.update_state(rows, spec, None)
+            self._run_verify_stage(holder, rows, spec)
+            assert holder._state[0]["prev_output_length"] <= len(committed)
+            assert holder._state[0]["think_count"] <= len(committed)
+            # One accepted token commits before the next step.
+            committed.append(self.THINK_TOKEN)
