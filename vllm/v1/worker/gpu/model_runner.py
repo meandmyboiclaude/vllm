@@ -335,7 +335,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Pre-allocated tensors for reuse. The CPU-side ring depth comes from
         # _DEFAULT_MAX_CONCURRENCY, already set from max_concurrent_batches above.
         int32_buf_kwargs = dict(dtype=torch.int32, device=self.device)
-        self.idx_mapping = CpuGpuBuffer(self.max_num_reqs, **int32_buf_kwargs)
+        # idx_mapping stays int64: #35561 was authored against the pre-#51210
+        # tree, where request indices were int32 everywhere. Merged #51210
+        # widened them — BatchReqState.idx_mapping_np is np.intp and
+        # InputBatch.make_dummy builds torch.int64 — so an int32 buffer here
+        # would feed the dummy/capture path and the serving path different
+        # dtypes for the same tensor. The other five buffers below keep the
+        # dtype of the allocations they replace (all int32).
+        self.idx_mapping = CpuGpuBuffer(
+            self.max_num_reqs, dtype=torch.int64, device=self.device
+        )
         self.cu_num_logits = CpuGpuBuffer(self.max_num_reqs + 1, **int32_buf_kwargs)
         self.query_start_loc = CpuGpuBuffer(gpu=self.input_buffers.query_start_loc)
 

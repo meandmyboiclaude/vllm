@@ -140,9 +140,12 @@ def spec_decode_rejection_warmup(worker: Worker) -> None:
                 # positions buffer is int64; idx_mapping / expanded_idx_mapping /
                 # expanded_local_pos are the runner's int32 buffers.
                 pos=torch.zeros(num_logits, dtype=torch.int64, device=device),
-                idx_mapping=torch.zeros(num_reqs, dtype=torch.int32, device=device),
+                # int64 to match the serving dtype of idx_mapping /
+                # expanded_idx_mapping (#51210); an int32 warmup would compile
+                # a Triton specialization the real batches never use.
+                idx_mapping=torch.zeros(num_reqs, dtype=torch.int64, device=device),
                 expanded_idx_mapping=torch.zeros(
-                    num_logits, dtype=torch.int32, device=device
+                    num_logits, dtype=torch.int64, device=device
                 ),
                 expanded_local_pos=torch.arange(
                     num_logits, dtype=torch.int32, device=device
