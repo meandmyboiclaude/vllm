@@ -259,6 +259,11 @@ class DFlashSpeculator(DraftModelSpeculator):
             num_tokens_across_dp=num_tokens_across_dp,
             slot_mapping=slot_mappings,
             batch_descriptor=batch_descriptor,
+            # #53577: the padded query rows the prepare kernel marks are only
+            # useful if the forward context carries the mask — that is what
+            # lets the MoE gating kernel drop padded rows instead of routing
+            # garbage. The kernel side of #53577 was vendored without this.
+            is_padding=self.input_buffers.is_padding[:num_tokens],
         ):
             # Embed the draft ids outside the compiled forward into the
             # CUDA-graph-stable buffer, then hand the model inputs_embeds.
