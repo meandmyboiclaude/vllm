@@ -408,8 +408,17 @@ def test_one_token_prefill_batch_stages_cudagraph_metadata(
 def test_one_token_prefill_excludes_cudagraph_padding():
     """Padding rows must not enter the prefill chunk metadata."""
     builder = _create_gdn_builder(full_cuda_graph=True)
-    batch = BatchSpec(seq_lens=[100, 50, 1, 0], query_lens=[1, 1, 1, 0])
-    common = create_common_attn_metadata(batch, BLOCK_SIZE, DEVICE).replace(
+    seq_lens = [100, 50, 1, 0]
+    batch = BatchSpec(seq_lens=seq_lens, query_lens=[1, 1, 1, 0])
+    common = create_common_attn_metadata(batch, BLOCK_SIZE, DEVICE)
+    # Deterministic, all-non-null block ids: the helper draws random ids and
+    # NULL_BLOCK_ID is 0, so a live row could otherwise hold a genuine 0.
+    num_rows, num_cols = common.block_table_tensor.shape
+    block_table = torch.arange(
+        1, num_rows * num_cols + 1, dtype=common.block_table_tensor.dtype, device=DEVICE
+    ).reshape(num_rows, num_cols)
+    common = common.replace(
+        block_table_tensor=block_table,
         is_prefilling=torch.tensor([False, False, True, False]),
         num_actual_tokens=4,
     )
@@ -435,9 +444,19 @@ def test_one_token_prefill_excludes_cudagraph_padding():
     assert meta.prefill_has_initial_state.tolist() == [False]
     assert meta.non_spec_state_indices_tensor is not None
     assert meta.non_spec_state_indices_tensor.shape == (4,)
-    torch.testing.assert_close(
-        meta.non_spec_state_indices_tensor, common.block_table_tensor[:, 0]
-    )
+    # This model defaults to mamba_cache_mode "align" (prefix caching on), so
+    # mamba_get_block_table_tensor() gathers the block holding each request's
+    # LAST token — column (seq_len - 1) // block_size, not column 0.
+    last_block_col = [max(sl - 1, 0) // BLOCK_SIZE for sl in seq_lens]
+    assert last_block_col == [6, 3, 0, 0]
+    expected_state_indices = [
+        int(block_table[row, col]) for row, col in enumerate(last_block_col)
+    ]
+    # Row 3 is cudagraph padding: the builder nulls every row past
+    # num_decodes + num_prefills so a padded row cannot write state through a
+    # live block id.
+    expected_state_indices[3] = NULL_BLOCK_ID
+    assert meta.non_spec_state_indices_tensor.tolist() == expected_state_indices
     assert meta.non_spec_query_start_loc is not None
     torch.testing.assert_close(meta.non_spec_query_start_loc, common.query_start_loc)
 
