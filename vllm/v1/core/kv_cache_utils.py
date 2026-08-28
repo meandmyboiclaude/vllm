@@ -1103,6 +1103,24 @@ def _commensurate_padded_block_size(
     return None
 
 
+def _is_page_paddable_attention(layer_spec: KVCacheSpec) -> bool:
+    """Attention spec whose page may be padded to an arbitrary shared page.
+
+    Every attention spec except the MLA-format ones: MLA indexes the cache in
+    whole token rows (see ``flat_kv_row_view``), so its block stride can only
+    be padded by its own row-aligned ``alignment``, not to an arbitrary page.
+
+    ``SlidingWindowMLASpec`` is MLA-format but is NOT a subclass of
+    ``MLAAttentionSpec`` -- it derives from ``SlidingWindowSpec`` -- so an
+    ``isinstance(..., MLAAttentionSpec)`` test alone leaves the sliding-window
+    MLA layers on the padding path, where their row layout would be broken by
+    a page pad and their own ``alignment`` padding would be treated as stale.
+    """
+    return isinstance(layer_spec, AttentionSpec) and not isinstance(
+        layer_spec, (MLAAttentionSpec, SlidingWindowMLASpec)
+    )
+
+
 def _unify_branch_page_size_bytes(layer_spec: KVCacheSpec) -> int:
     """Page size the branch choice and the scaling ratio are taken from.
 
@@ -1115,9 +1133,7 @@ def _unify_branch_page_size_bytes(layer_spec: KVCacheSpec) -> int:
     every ``replace``, so the aligned page is the correct base (and clearing it
     would simply be undone).
     """
-    if isinstance(layer_spec, AttentionSpec) and not isinstance(
-        layer_spec, MLAAttentionSpec
-    ):
+    if _is_page_paddable_attention(layer_spec):
         return layer_spec.unpadded_page_size_bytes
     return layer_spec.page_size_bytes
 
@@ -1219,9 +1235,7 @@ def unify_kv_cache_spec_page_size(
             continue
         if max_page_size % _unify_branch_page_size_bytes(layer_spec) == 0:
             continue
-        if isinstance(layer_spec, AttentionSpec) and not isinstance(
-            layer_spec, MLAAttentionSpec
-        ):
+        if _is_page_paddable_attention(layer_spec):
             scaled_pad_specs[layer_name] = _scale_block_size_before_padding(
                 layer_spec, max_page_size
             )
@@ -1257,8 +1271,7 @@ def unify_kv_cache_spec_page_size(
                 if (
                     new_block_size % max_page_block_lcm != 0
                     and max_page_block_lcm % new_block_size != 0
-                    and isinstance(layer_spec, AttentionSpec)
-                    and not isinstance(layer_spec, MLAAttentionSpec)
+                    and _is_page_paddable_attention(layer_spec)
                 ):
                     # Byte-exact scaling would break token commensurability.
                     # Prefer a commensurate block size with a padded page.
@@ -1290,9 +1303,7 @@ def unify_kv_cache_spec_page_size(
                         )
                 if padded_spec is not None:
                     new_spec = padded_spec
-                elif isinstance(layer_spec, AttentionSpec) and not isinstance(
-                    layer_spec, MLAAttentionSpec
-                ):
+                elif _is_page_paddable_attention(layer_spec):
                     # The ratio came from the natural page, so the scaled
                     # natural page lands exactly on the shared page: any
                     # pre-existing padding is stale and must be dropped, or it
@@ -1306,11 +1317,38 @@ def unify_kv_cache_spec_page_size(
                 else:
                     # MLA (and any non-attention spec that reaches here) keeps
                     # its own padding: ``__post_init__`` reapplies the
-                    # alignment padding on every ``replace``.
-                    new_spec = replace(layer_spec, block_size=new_block_size)
-            elif isinstance(layer_spec, AttentionSpec) and not isinstance(
-                layer_spec, MLAAttentionSpec
-            ):
+                    # alignment padding on every ``replace``. That reapplied
+                    # padding is a round-up of the SCALED natural page to the
+                    # layer's own ``alignment``, and a padding that came from
+                    # outside (no ``alignment`` set, e.g. a skip-quant shared
+                    # page) is not reapplied at all but carried verbatim, so
+                    # neither lands on the shared page by construction. An
+                    # already-padded layer therefore re-pads to the shared page
+                    # here (house fix 8c7f647a38, boot AssertionError class);
+                    # the ratio came from the PADDED page for these specs (see
+                    # ``_unify_branch_page_size_bytes``), so the scaled natural
+                    # page never outruns it.
+                    repad = (
+                        {"page_size_padded": max_page_size}
+                        if getattr(layer_spec, "page_size_padded", None) is not None
+                        else {}
+                    )
+                    new_spec = replace(layer_spec, block_size=new_block_size, **repad)
+                    if new_spec.page_size_bytes != max_page_size:
+                        # ``_apply_alignment_padding`` overrode the re-pad with
+                        # its own row-aligned round-up, which falls short of the
+                        # shared page. MLA cannot be padded past its alignment
+                        # (see the docstring), so this spec set is unifiable
+                        # only by the full-allocation fallback in
+                        # ``get_kv_cache_groups``, which catches this error.
+                        raise NotImplementedError(
+                            f"Layer {layer_name}: scaling the block size lands "
+                            f"the page at {new_spec.page_size_bytes} bytes, "
+                            f"short of the maximum {max_page_size} bytes, and "
+                            "an MLA page can only be padded to its own "
+                            "alignment."
+                        )
+            elif _is_page_paddable_attention(layer_spec):
                 # The page does not divide the maximum, so it has to be padded.
                 # Scale the block size by the whole part of the ratio first so
                 # the layer does not pay a full max-size page for a block that

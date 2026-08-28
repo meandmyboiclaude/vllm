@@ -3300,6 +3300,70 @@ def test_unify_kv_cache_page_size_mla_alignment_padding_is_the_scaling_base():
         )
 
 
+def test_unify_kv_cache_page_size_mla_carried_padding_repads_to_shared_page():
+    """A padding that is NOT the product of ``alignment`` must be re-padded.
+
+    ``__post_init__`` only reapplies alignment padding; a page pad carried in
+    from outside (e.g. a skip-quant shared page) survives ``replace`` verbatim,
+    so scaling the block size grows the natural page past that stale pad and
+    ``page_size_bytes`` asserts ``padded >= unpadded`` at boot.
+    """
+    carried = MLAAttentionSpec(
+        block_size=1,
+        num_kv_heads=1,
+        head_size=96,
+        dtype=torch.float32,
+        page_size_padded=512,
+    )
+    assert carried.alignment is None
+    assert carried.unpadded_page_size_bytes == 384
+    assert carried.page_size_bytes == 512
+
+    large = new_kv_cache_spec(block_size=1)
+    assert large.page_size_bytes == 1024
+
+    unified = kv_cache_utils.unify_kv_cache_spec_page_size(
+        {"carried_pad_layer": carried, "large_attn_layer": large}
+    )
+
+    # Ratio 1024 // 512 doubles the block: the natural page grows to 768 B, so
+    # keeping the 512 B pad would be smaller than the page it must cover.
+    assert unified["carried_pad_layer"].block_size == 2
+    assert unified["carried_pad_layer"].unpadded_page_size_bytes == 768
+    assert unified["carried_pad_layer"].page_size_padded == 1024
+    assert unified["carried_pad_layer"].page_size_bytes == 1024
+    assert unified["large_attn_layer"] == large
+
+
+def test_unify_kv_cache_page_size_sliding_window_mla_is_not_page_padded():
+    """Sliding-window MLA is MLA-format even though it is not an MLA subclass.
+
+    ``SlidingWindowMLASpec`` derives from ``SlidingWindowSpec``, so an
+    ``isinstance(..., MLAAttentionSpec)`` guard does not see it; it must still
+    keep MLA's row-aligned padding contract instead of being padded to the
+    shared page.
+    """
+    swa_mla = SlidingWindowMLASpec(
+        block_size=1,
+        num_kv_heads=1,
+        head_size=96,
+        dtype=torch.float32,
+        sliding_window=128,
+    )
+    assert not isinstance(swa_mla, MLAAttentionSpec)
+    assert swa_mla.page_size_bytes == 384
+
+    # 1024 is not a multiple of 384, so the only way to unify by padding would
+    # be to pad the MLA page to an arbitrary size. Callers fall back to full
+    # allocation on NotImplementedError.
+    large = new_kv_cache_spec(block_size=1)
+    assert large.page_size_bytes == 1024
+    with pytest.raises(NotImplementedError):
+        kv_cache_utils.unify_kv_cache_spec_page_size(
+            {"swa_mla_layer": swa_mla, "large_attn_layer": large}
+        )
+
+
 def test_hma_not_disabled_when_kv_events_enabled():
     """
     Test enabling KV events must not force disable_hybrid_kv_cache_manager to True.
