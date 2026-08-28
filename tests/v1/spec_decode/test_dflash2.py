@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from vllm.config.kernel import KernelConfig
 from vllm.model_executor.models.qwen3_dflash import DFlashQwen3Model
 from vllm.model_executor.models.qwen3_dflash2 import _grouped_conv, _score_edges
 from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
@@ -161,6 +162,10 @@ def test_dflash2_model_decoder_layer_cls(monkeypatch):
             dtype=torch.float32,
             is_mm_prefix_lm=False,
         ),
+        # The real dataclass: UnquantizedLinearMethod reads
+        # kernel_config.linear_backend off the *current* config while the
+        # decoder layers are built.
+        kernel_config=KernelConfig(),
     )
     from vllm.platforms import current_platform
 
@@ -218,6 +223,10 @@ def test_dflash2_model_decoder_layer_cls(monkeypatch):
             quantization=None,
             quantization_param_path=None,
         ),
+        # DFlashQwen3Model reads this to decide whether the one-row transient
+        # vocabulary placeholders (#53662) may be used in place of a full
+        # embedding table; DFlash2 declares transient_vocab_size = 1.
+        parallel_config=SimpleNamespace(pipeline_parallel_size=1),
     )
     mock_current_vllm_config.speculative_config = vllm_config.speculative_config
     vllm_config.compilation_config = mock_current_vllm_config.compilation_config
@@ -229,6 +238,19 @@ def test_dflash2_model_decoder_layer_cls(monkeypatch):
     # 4. Assert that the layers are DFlash2Qwen3DecoderLayer (the subclass)
     assert len(model.layers) == 2
     assert isinstance(model.layers[0], DFlash2Qwen3DecoderLayer)
+
+
+def test_dflash2_rejects_pipeline_parallelism():
+    # Upstream #53662's gate: the DFlash2 embedding is the target's, so there
+    # is no per-PP-rank copy to share. Raised before anything is constructed.
+    from vllm.model_executor.models.qwen3_dflash2 import DFlash2Qwen3ForCausalLM
+
+    vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(pipeline_parallel_size=2)
+    )
+
+    with pytest.raises(ValueError, match="does not support pipeline parallelism"):
+        DFlash2Qwen3ForCausalLM(vllm_config=vllm_config)
 
 def test_dflash_context_rope_cache_matches_k_dtype_and_reuses_storage():
     """Context RoPE cache conversion is persistent for the fixed K dtype."""
