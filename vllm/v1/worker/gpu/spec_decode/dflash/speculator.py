@@ -270,12 +270,15 @@ class DFlashSpeculator(DraftModelSpeculator):
             # data-dependent local_scalar_dense -> orphan unbacked SymInt
             # (PendingUnbackedSymbolNotFound {u0}) at AOT compile, and where the
             # warmup -1 sentinel ids reach an inductor-lowered bounds assert.
-            # NOTE(vendor): upstream passes input_ids=None here. We keep passing
-            # input_ids because DSparkSpeculator shares this _run_model and its
-            # model still consumes input_ids (sp_shard + per-layer markov head)
-            # even when inputs_embeds is supplied. The DFlash/DFlash2 models
-            # ignore input_ids once input_embeds is not None, so the embedding
-            # is still out of the compiled region for them.
+            # NOTE(vendor): upstream passes input_ids=None here (#53978). We
+            # keep passing the buffer, but it is a dead argument for all three
+            # families that share this _run_model: DFlashQwen3Model.forward —
+            # which DFlash2 and DSpark both inherit unchanged — takes the
+            # input_embeds branch and never touches input_ids. DSpark's Markov
+            # head and DFlash2's selector do read ids, but they read them from
+            # input_buffers directly, outside this call. Passing it is
+            # defensive only: a future family that overrides forward and wants
+            # ids gets them, at no cost to the compiled region.
             self.inputs_embeds[:num_tokens] = self.model.embed_input_ids(
                 self.input_buffers.input_ids[:num_tokens]
             )
