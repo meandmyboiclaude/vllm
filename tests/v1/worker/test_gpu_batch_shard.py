@@ -41,6 +41,7 @@ def _make_batch(
     max_num_reqs: int,
     max_spec: int,
     slot_pool: np.ndarray | None = None,
+    no_draft_mask: bool = False,
 ) -> InputBatch:
     """Consistent batch with random unique request slots, 1 + k_i logits
     rows per request at the tail of each query segment."""
@@ -97,6 +98,11 @@ def _make_batch(
         is_prefilling_np=np.zeros(num_reqs, dtype=np.bool_),
         has_prefill=False,
         max_seq_len_np=None,
+        # Carried #48244 field: [num_reqs] bool mask of requests the drafter
+        # may skip. BatchSharder re-slices it to the local rows.
+        no_draft_mask_np=(
+            (np.arange(num_reqs) % 3 == 0) if no_draft_mask else None
+        ),
         input_ids=torch.zeros(num_tokens, dtype=torch.int32, device=DEVICE),
         positions=torch.arange(num_tokens, dtype=torch.int64, device=DEVICE),
         is_padding=torch.zeros(num_tokens, dtype=torch.bool, device=DEVICE),
@@ -276,6 +282,31 @@ def test_shard_no_spec():
         assert _np(local.logits_indices).tolist() == (
             _np(batch.logits_indices)[owned].tolist()
         )
+
+
+@requires_cuda
+@pytest.mark.parametrize("tp_size", [2, 4])
+def test_shard_no_draft_mask_is_resliced(tp_size: int):
+    """The carried no_draft_mask_np is [num_reqs]-shaped, so a local sub-batch
+    must carry the owned rows' entries, not the global mask: the speculators
+    index it by local request index, and a global-length mask next to a
+    smaller num_reqs would skip the wrong requests' drafts."""
+    rng = np.random.default_rng(7)
+    max_num_reqs = 32
+    batch = _make_batch(
+        rng, num_reqs=15, max_num_reqs=max_num_reqs, max_spec=3, no_draft_mask=True
+    )
+    assert batch.no_draft_mask_np is not None
+    for local, _, _ in _shard_all_ranks(batch, max_num_reqs, tp_size):
+        owned = _owned_batch_indices(local)
+        assert local.no_draft_mask_np is not None
+        assert len(local.no_draft_mask_np) == local.num_reqs
+        assert (local.no_draft_mask_np == batch.no_draft_mask_np[owned]).all()
+
+    # None must stay None (the common no-mask batch keeps its fast path).
+    plain = _make_batch(rng, num_reqs=9, max_num_reqs=max_num_reqs, max_spec=2)
+    for local, _, _ in _shard_all_ranks(plain, max_num_reqs, tp_size):
+        assert local.no_draft_mask_np is None
 
 
 @pytest.mark.parametrize("tp_size", [2, 4])
