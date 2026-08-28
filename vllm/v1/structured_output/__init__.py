@@ -35,7 +35,27 @@ logger = init_logger(__name__)
 
 
 class _TokenSequenceView(Sequence[int]):
-    """Read-only concatenation that does not copy committed token history."""
+    """Read-only concatenation that does not copy committed token history.
+
+    Cost note (#52452 review): skipping the copy moves element access into
+    Python, so what a reader pays depends entirely on which reasoning parser
+    consumes the view, and nothing here is on a plain-decode path.
+
+    * Parsers that inspect only ``delta_ids`` -- the ``BaseThinkingReasoningParser``
+      family, step3p5, gptoss, identity -- never index the view at all.
+    * Parsers inheriting the ``ReasoningParser.is_reasoning_end_streaming``
+      default walk the whole sequence: an element-wise scan through
+      ``__getitem__`` runs about 4-7x a list scan.
+    * The engine-parser adapters (qwen3 among them) go one step further and
+      materialize it -- ``list(input_ids)`` in
+      ``ParserEngineReasoningAdapter.is_reasoning_end`` -- so they pay a full
+      Python-level copy per call.
+
+    All of it is reached only through ``filter_speculative_grammar_tokens``,
+    which returns before building a view unless the request is speculative
+    *and* structured-output *and* has a reasoner; the probe loop then runs at
+    most ``len(new_token_ids)`` (K+1) times per accepted block.
+    """
 
     def __init__(self, prefix: Sequence[int], suffix: Sequence[int]) -> None:
         self.prefix = prefix
