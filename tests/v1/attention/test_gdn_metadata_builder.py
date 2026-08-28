@@ -492,3 +492,27 @@ def test_full_cudagraph_spec_metadata_uses_request_count():
     assert meta.spec_query_start_loc.shape == (batch.batch_size + 1,)
     assert meta.num_accepted_tokens is not None
     assert meta.num_accepted_tokens.shape == (batch.batch_size,)
+
+    # Every tensor the spec branch stages is read from the address the FULL
+    # graph captured, so each must BE the builder's persistent buffer (sliced
+    # from 0), not a per-step allocation. The shape checks above cannot see
+    # that difference: a regression to a fresh tensor of the same width keeps
+    # them all green (the same gap capture#2 closed for has_initial_state).
+    assert (
+        meta.spec_state_indices_tensor.data_ptr()
+        == builder.spec_state_indices_tensor.data_ptr()
+    )
+    assert (
+        meta.spec_sequence_masks.data_ptr() == builder.spec_sequence_masks.data_ptr()
+    )
+    assert (
+        meta.spec_query_start_loc.data_ptr() == builder.spec_query_start_loc.data_ptr()
+    )
+    assert (
+        meta.num_accepted_tokens.data_ptr() == builder.num_accepted_tokens.data_ptr()
+    )
+    assert meta.spec_token_indx is not None
+    # Non-empty first: a zero-length slice does NOT keep the base data_ptr, so
+    # the identity check below would be testing the wrong thing.
+    assert meta.spec_token_indx.numel() == batch.compute_num_tokens()
+    assert meta.spec_token_indx.data_ptr() == builder.spec_token_indx.data_ptr()
