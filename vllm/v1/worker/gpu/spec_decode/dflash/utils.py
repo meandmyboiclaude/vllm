@@ -60,6 +60,13 @@ def load_dflash_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
     target_inner = getattr(target_language_model, "model", target_language_model)
     draft_inner = dflash_model.model
 
+    # A DFlash variant whose checkpoint ships no vocabulary weights builds
+    # one-row placeholders instead of a full [vocab, hidden] table (DFlash2's
+    # `transient_vocab_size = 1`, #53662) and relies on the aliasing below to
+    # replace them. Remember whether that is the case so the handoff can be
+    # checked afterwards.
+    transient_vocab_size = getattr(draft_inner, "transient_vocab_size", None)
+
     # Skip embedding sharing under PP — each rank owns its own embedding.
     if get_pp_group().world_size == 1:
         target_embed = getattr(target_inner, "embed_tokens", None) or getattr(
@@ -81,5 +88,29 @@ def load_dflash_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
         if draft_lm_head is not None:
             del dflash_model.lm_head
         dflash_model.lm_head = target_lm_head
+
+    # Post-condition for the transient-vocabulary drafters: every branch above
+    # is conditional (no target module found, _should_share declining on a
+    # quantized or mismatched copy, PP > 1), and a placeholder that survives
+    # one of them is a silent wrong-answer bug — the drafter would embed every
+    # token as row 0 and score against a one-token head. Fail loudly here
+    # instead. Sizes are checked rather than identity: a variant may legally
+    # alias to something other than these exact modules, as long as what it
+    # ends up with is not the one-row stub.
+    if transient_vocab_size is not None:
+        embed = getattr(draft_inner, "embed_tokens", None)
+        num_embeddings = getattr(embed, "num_embeddings", None)
+        assert num_embeddings is None or num_embeddings > transient_vocab_size, (
+            f"{type(dflash_model).__name__} built a {transient_vocab_size}-row "
+            "embedding placeholder and nothing replaced it: the target's "
+            "embedding was not shared with the drafter."
+        )
+        head = getattr(dflash_model, "lm_head", None)
+        head_rows = getattr(head, "num_embeddings", None)
+        assert head_rows is None or head_rows > transient_vocab_size, (
+            f"{type(dflash_model).__name__} built a {transient_vocab_size}-row "
+            "lm_head placeholder and nothing replaced it: the target's lm_head "
+            "was not shared with the drafter."
+        )
 
     return dflash_model
