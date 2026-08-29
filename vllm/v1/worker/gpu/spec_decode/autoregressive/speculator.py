@@ -38,6 +38,9 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         self.last_token_indices = torch.zeros(
             self.max_num_reqs, dtype=torch.int64, device=device
         )
+        self.sample_src_positions = torch.zeros(
+            self.max_num_reqs, dtype=torch.int64, device=device
+        )
 
         # Nonzero rows mask draft KV writes for requests without lookahead
         # slots (carried #48244). The device tensor is persistent so captured
@@ -367,6 +370,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             input_batch.seq_lens,
             num_rejected,
             self.input_buffers,
+            self.sample_src_positions,
             self.max_model_len,
             self.max_num_reqs,
             advance_draft_positions=self.advance_draft_positions,
@@ -493,6 +497,10 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
     ) -> None:
         last_token_indices = self.last_token_indices[:num_reqs]
         positions = self.input_buffers.positions[last_token_indices]
+        # The output hidden state at position P (= positions) and the token id
+        # at P+1 are used to draft the token at P+2. Sampling keys a draw by the
+        # position before the sampled token, so the net adjustment is +1.
+        sample_src_positions = positions + 1
         idx_mapping = self.idx_mapping[:num_reqs]
 
         last_hidden_states, hidden_states = self._run_model(
@@ -507,11 +515,11 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             # KV-sync-only pass: no drafts from this batch can be consumed,
             # and the draft decode steps are skipped by the caller.
             return
-        sample_hidden_states = last_hidden_states[last_token_indices]
 
+        sample_hidden_states = last_hidden_states[last_token_indices]
         self.draft_tokens[:num_reqs, 0] = self.sample_draft(
             sample_hidden_states,
-            positions,
+            sample_src_positions,
             idx_mapping,
             self.temperature,
             self.seeds,
@@ -523,6 +531,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         else:
             self.hidden_states[:num_reqs] = hidden_states[last_token_indices]
         self.input_buffers.positions[:num_reqs] = positions
+        self.sample_src_positions[:num_reqs] = sample_src_positions
 
     def _multi_step_decode(
         self,
@@ -678,7 +687,6 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
         self._prepare_eplb_forward(num_reqs)
 
         idx_mapping = self.idx_mapping[:num_reqs]
-        positions = self.input_buffers.positions[:num_reqs]
         # Run the draft model forward pass.
         last_hidden_states, hidden_states = self._run_model(
             num_tokens_padded,
@@ -687,18 +695,13 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             num_tokens_across_dp,
             cudagraph_runtime_mode,
         )
-        last_hidden_states = last_hidden_states[:num_reqs]
-
-        sample_positions = positions
-        if not self.advance_draft_positions:
-            # The forward pass holds positions fixed (Q-only, shared target KV),
-            # but Gumbel sampling still needs the absolute draft position.
-            sample_positions = positions + self.current_draft_step
 
         # Sample the draft tokens.
+        sample_hidden_states = last_hidden_states[:num_reqs]
+        sample_src_positions = self.sample_src_positions[:num_reqs]
         draft_tokens = self.sample_draft(
-            last_hidden_states,
-            sample_positions,
+            sample_hidden_states,
+            sample_src_positions,
             idx_mapping,
             self.temperature,
             self.seeds,
@@ -714,6 +717,7 @@ class AutoRegressiveSpeculator(DraftModelSpeculator):
             self.draft_tokens,
             self.hidden_states,
             self.input_buffers,
+            self.sample_src_positions,
             num_reqs,
             self.max_model_len,
             self.num_speculative_steps,
@@ -851,6 +855,7 @@ def _prepare_decode_inputs_kernel(
     num_rejected_ptr,
     input_ids_ptr,
     positions_ptr,
+    sample_src_positions_ptr,
     query_start_loc_ptr,
     seq_lens_ptr,
     max_model_len,
@@ -879,6 +884,10 @@ def _prepare_decode_inputs_kernel(
     draft_token = tl.load(draft_tokens_ptr + req_idx * draft_tokens_stride)
     tl.store(input_ids_ptr + req_idx, draft_token)
 
+    # Advance the draft sampling key.
+    sample_position = tl.load(sample_src_positions_ptr + req_idx)
+    tl.store(sample_src_positions_ptr + req_idx, sample_position + 1)
+
     target_seq_len = tl.load(target_seq_lens_ptr + req_idx)
     num_rejected = tl.load(num_rejected_ptr + req_idx)
     seq_len = target_seq_len - num_rejected
@@ -898,6 +907,7 @@ def prepare_decode_inputs(
     target_seq_lens: torch.Tensor,
     num_rejected: torch.Tensor,
     input_buffers: InputBuffers,
+    sample_src_positions: torch.Tensor,
     max_model_len: int,
     max_num_reqs: int,
     advance_draft_positions: bool = True,
@@ -910,6 +920,7 @@ def prepare_decode_inputs(
         num_rejected,
         input_buffers.input_ids,
         input_buffers.positions,
+        sample_src_positions,
         input_buffers.query_start_loc,
         input_buffers.seq_lens,
         max_model_len,
@@ -927,6 +938,7 @@ def _update_draft_inputs_kernel(
     next_input_hidden_states_stride,
     input_ids_ptr,
     positions_ptr,
+    sample_src_positions_ptr,
     seq_lens_ptr,
     draft_tokens_ptr,
     current_draft_step_ptr,
@@ -951,6 +963,10 @@ def _update_draft_inputs_kernel(
     if step >= num_speculative_steps - 1:
         # This is the final step. Skip updating draft forward inputs.
         return
+
+    # Advance the draft sampling key.
+    sample_position = tl.load(sample_src_positions_ptr + req_idx)
+    tl.store(sample_src_positions_ptr + req_idx, sample_position + 1)
 
     # Write the sampled draft token into the input ids tensor for the next
     # forward pass.
@@ -993,6 +1009,7 @@ def update_draft_inputs(
     output_draft_tokens: torch.Tensor,
     next_input_hidden_states: torch.Tensor,
     input_buffers: InputBuffers,
+    sample_src_positions: torch.Tensor,
     num_reqs: int,
     max_model_len: int,
     num_speculative_steps: int,
@@ -1006,6 +1023,7 @@ def update_draft_inputs(
         next_input_hidden_states.stride(0),
         input_buffers.input_ids,
         input_buffers.positions,
+        sample_src_positions,
         input_buffers.seq_lens,
         draft_tokens,
         current_draft_step,
