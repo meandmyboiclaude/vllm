@@ -59,7 +59,7 @@ def spec_decode_rejection_warmup(worker: Worker) -> None:
     # while the server runs True leaves the served kernel uncompiled.
     use_fp64 = bool(getattr(model_config, "use_fp64_gumbel", False))
 
-    device = torch.device("cuda")
+    device = worker.device
     num_reqs = 1
     tokens_per_req = num_spec + 1
     num_logits = num_reqs * tokens_per_req
