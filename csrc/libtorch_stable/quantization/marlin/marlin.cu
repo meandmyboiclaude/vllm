@@ -23,6 +23,9 @@
   #define MARLIN_NAMESPACE_NAME marlin
 #endif
 
+#include <cstdio>
+#include <cstdlib>
+
 #include "kernel.h"
 
 #include <torch/csrc/stable/accelerator.h>
@@ -273,6 +276,21 @@ MarlinFuncPtr get_marlin_kernel(
   return kernel;
 }
 
+// [club-kt 2026-09-12] Sweep/trace knobs for the thread-config heuristic (host side, read once).
+//   VLLM_MARLIN_CFG_INDEX=<i>   force the i-th entry of the (small|large)_batch table when valid
+//   VLLM_MARLIN_A8_NO_SMFILL=1  skip the "fill more SMs with {128,64,128}" override for int8 A
+//   VLLM_MARLIN_CFG_TRACE=1     print the chosen config per launch to stderr
+// Measured 2026-09-11 (4090, M=48, K=6144, N=5120 = o_proj/out_proj): int8-A gets {128,64,128}
+// through the SM-fill override and runs 45.6 us; bf16-A on the same shape runs 30.9 us.
+static int kt_env_int(const char* name, int dflt) {
+  const char* v = getenv(name);
+  if (v == nullptr || *v == '\0') return dflt;
+  return atoi(v);
+}
+static const int KT_CFG_INDEX = kt_env_int("VLLM_MARLIN_CFG_INDEX", -1);
+static const int KT_A8_NO_SMFILL = kt_env_int("VLLM_MARLIN_A8_NO_SMFILL", 0);
+static const int KT_CFG_TRACE = kt_env_int("VLLM_MARLIN_CFG_TRACE", 0);
+
 exec_config_t determine_exec_config(
     const vllm::ScalarType& a_type, const vllm::ScalarType& b_type,
     const vllm::ScalarType& c_type, const vllm::ScalarType& s_type, int prob_m,
@@ -290,6 +308,7 @@ exec_config_t determine_exec_config(
           : sizeof(small_batch_thread_configs) / sizeof(thread_config_t);
 
   for (int i = 0; i < thread_configs_size; i++) {
+    if (KT_CFG_INDEX >= 0 && i != KT_CFG_INDEX) continue;  // [club-kt] sweep: one entry only
     thread_config_t th_config = thread_configs[i];
 
     if (!is_valid_config(th_config, thread_m_blocks, prob_m, prob_n, prob_k,
@@ -455,7 +474,8 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
           is_k_full, has_zp, is_zp_float, is_a_8bit, stages, max_shared_mem,
           sms);
       thread_tfg = exec_cfg.tb_cfg;
-      if (thread_tfg.thread_n != -1) {
+      if (thread_tfg.thread_n != -1 && !(KT_A8_NO_SMFILL && is_a_8bit) &&
+          KT_CFG_INDEX < 0) {  // [club-kt] the sweep knobs bypass the SM-fill override
         if (prob_n / thread_tfg.thread_n *
                 div_ceil(prob_m_split, thread_m_blocks * 16) * 4 <=
             sms) {
@@ -478,6 +498,13 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
     int num_threads = thread_tfg.num_threads;
     thread_k = thread_tfg.thread_k;
     thread_n = thread_tfg.thread_n;
+    if (KT_CFG_TRACE) {
+      fprintf(stderr,
+              "[marlin-cfg] a_bits=%d b_bits=%d M=%d(split %d) N=%d K=%d -> "
+              "m_blocks=%d thread_k=%d thread_n=%d threads=%d\n",
+              (int)a_type.size_bits(), num_bits, prob_m, prob_m_split, prob_n,
+              prob_k, thread_m_blocks, thread_k, thread_n, num_threads);
+    }
     int blocks = sms * exec_cfg.blocks_per_sm;
     if (exec_cfg.blocks_per_sm > 1)
       max_shared_mem_new = max_shared_mem / exec_cfg.blocks_per_sm - 1024;
