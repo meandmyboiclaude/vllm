@@ -728,8 +728,13 @@ def apply_gptq_marlin_linear(
 
     a_scales = None
     if input_dtype == torch.int8:
-        assert wtype == scalar_types.uint4b8, (
-            "W8A8-INT8 is not supported by marlin kernel."
+        # [club-kt 2026-09-12] uint8b128 x int8 activations is instantiated in this
+        # wheel (generate_kernels.py: kS8 x kU8B128). The kernel skips dequant when
+        # a_bits == b_bits, so the packed weight must be pre-converted to two's
+        # complement int8 (u8 ^ 0x80) at load; that is done where the weight is
+        # repacked (kernel process_weights_after_loading), not here.
+        assert wtype in (scalar_types.uint4b8, scalar_types.uint8b128), (
+            "int8 activations need uint4b8 or uint8b128 weights (got " + str(wtype) + ")"
         )
         reshaped_x, a_scales = marlin_quant_input(reshaped_x, input_dtype)
         a_scales = a_scales * input_global_scale
