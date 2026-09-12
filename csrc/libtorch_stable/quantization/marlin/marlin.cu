@@ -25,6 +25,9 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <map>
+#include <mutex>
+#include <utility>
 
 #include "kernel.h"
 
@@ -747,9 +750,46 @@ torch::stable::Tensor marlin_gemm(
     max_m_block_size = min(max_m_block_size, 64);
     int max_c_tmp_size =
         sms * max_m_block_size * MARLIN_NAMESPACE_NAME::max_thread_n;
-    c_tmp = torch::stable::empty({max_c_tmp_size},
-                                 torch::headeronly::ScalarType::Float,
-                                 std::nullopt, device);
+    // [club-cuda-lane 2026-09-12] PERSISTENT c_tmp. A per-call empty() under CUDA
+    // graph capture lands in each captured graph's private pool: with ~257 Marlin
+    // launches per forward and a capture set of 6+ graphs the fp32-reduce scratch
+    // alone raised the capture-phase peak by ~1 GiB (quant's paired boot on
+    // p2070e8, 22,896 -> 23,876 MiB). The kernel never reads a slot before writing
+    // it and two launches on one stream are ordered, so ONE buffer per
+    // (device, stream), sized once at the largest M block (64 rows), serves every
+    // call; the first use happens in eager warm-up, outside any graph pool, and the
+    // captured graphs reference that fixed address. Different streams get their
+    // own buffer (no cross-stream aliasing). VLLM_MARLIN_CTMP_PER_CALL=1 restores
+    // the per-call allocation for bisection.
+    static const bool kt_ctmp_per_call = [] {
+      const char* v = getenv("VLLM_MARLIN_CTMP_PER_CALL");
+      return v != nullptr && *v == '1';
+    }();
+    if (kt_ctmp_per_call) {
+      c_tmp = torch::stable::empty({max_c_tmp_size},
+                                   torch::headeronly::ScalarType::Float,
+                                   std::nullopt, device);
+    } else {
+      const int64_t persistent_size =
+          static_cast<int64_t>(sms) * 64 * MARLIN_NAMESPACE_NAME::max_thread_n;
+      const cudaStream_t cur_stream = get_current_cuda_stream(device_index);
+      static std::mutex ctmp_mutex;
+      static std::map<std::pair<int, cudaStream_t>, torch::stable::Tensor>
+          ctmp_cache;
+      std::lock_guard<std::mutex> guard(ctmp_mutex);
+      auto key = std::make_pair(static_cast<int>(device_index), cur_stream);
+      auto it = ctmp_cache.find(key);
+      if (it == ctmp_cache.end() || it->second.numel() < persistent_size) {
+        it = ctmp_cache
+                 .insert_or_assign(
+                     key, torch::stable::empty(
+                              {persistent_size},
+                              torch::headeronly::ScalarType::Float,
+                              std::nullopt, device))
+                 .first;
+      }
+      c_tmp = it->second;
+    }
     // [club-cuda-lane 2026-09-12] NO memset here. The cross-CTA fp32 reduce never
     // reads a c_tmp slot before writing it: the slice's first CTA (slice_idx == 0)
     // only WRITES (global_reduce_fp32(first=true)), every later CTA acquires the
