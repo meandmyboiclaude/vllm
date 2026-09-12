@@ -31,6 +31,7 @@ from vllm.model_executor.warmup.flashinfer_sparse_mla_warmup import (
     deepseek_v4_sparse_mla_attention_warmup,
     flashinfer_sparse_mla_decode_autotune_warmup,
 )
+from vllm.model_executor.warmup.logprob_triton_warmup import logprob_triton_warmup
 from vllm.model_executor.warmup.hybrid_mamba_warmup import (
     hybrid_mamba_triton_warmup,
 )
@@ -143,6 +144,9 @@ def kernel_warmup(worker: "Worker", *, process_local_only: bool = False):
         )
 
     qwen_triton_warmup(worker.model_runner, worker.vllm_config.model_config)
+    # upstream #55918: warm the top-k log-softmax kernel at every topk width so a client
+    # asking for an unwarmed logprobs width does not JIT-compile mid-request.
+    logprob_triton_warmup(worker.model_runner)
 
     compilation_config = worker.vllm_config.compilation_config
     cudagraph_capture_sizes = list(compilation_config.cudagraph_capture_sizes or [])
