@@ -536,6 +536,13 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
       "Tensor state_indices, Tensor cu_seqlens, Tensor num_accepted_tokens, "
       "Tensor! state, Tensor output_gate, Tensor norm_weight, Tensor! out, "
       "float scale, float norm_eps=1e-5) -> ()");
+  ops.def(
+      "house_gdn_replayssm_spec("
+      "Tensor mixed_qkv, Tensor a, Tensor b, Tensor A_log, Tensor dt_bias, "
+      "Tensor! ckpt, Tensor! ckpt_scale, Tensor! d_cache, Tensor! k_cache, "
+      "Tensor! g_cache, Tensor! out, Tensor query_start_loc, "
+      "Tensor ssm_state_indices, Tensor write_pos, Tensor cache_base, "
+      "Tensor is_flush, int null_block_id, float scale) -> ()");
 #endif
 
 #ifdef VLLM_ENABLE_KIMI_K3_ATTN_RES
@@ -810,6 +817,7 @@ STABLE_TORCH_LIBRARY_IMPL(_C, CUDA, ops) {
 #ifdef VLLM_ENABLE_FUSED_GDN_DECODE
   ops.impl("fused_gdn_decode_post_conv_mtp",
            TORCH_BOX(&fused_gdn_decode_post_conv_mtp));
+  ops.impl("house_gdn_replayssm_spec", TORCH_BOX(&house_gdn_replayssm_spec));
 #endif
 
 #ifdef VLLM_ENABLE_KIMI_K3_ATTN_RES

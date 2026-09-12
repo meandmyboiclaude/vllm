@@ -1136,7 +1136,8 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
   endif()
   if(FUSED_GDN_DECODE_ARCHS)
     set(FUSED_GDN_DECODE_SRC
-      "csrc/libtorch_stable/gdn/fused_gdn_decode_kernel.cu")
+      "csrc/libtorch_stable/gdn/fused_gdn_decode_kernel.cu"
+      "csrc/libtorch_stable/gdn/house_gdn_replayssm_spec.cu")
     set_gencode_flags_for_srcs(
       SRCS "${FUSED_GDN_DECODE_SRC}"
       CUDA_ARCHS "${FUSED_GDN_DECODE_ARCHS}")

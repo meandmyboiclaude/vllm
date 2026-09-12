@@ -396,6 +396,18 @@ void fused_kda_decode(
 #endif
 
 #ifdef VLLM_ENABLE_FUSED_GDN_DECODE
+// [house cuda-lane 2026-09-12] one-launch CUDA ReplaySSM spec-decode (int8 checkpoint + circular d/k/g ring)
+void house_gdn_replayssm_spec(
+    torch::stable::Tensor const& mixed_qkv, torch::stable::Tensor const& a,
+    torch::stable::Tensor const& b, torch::stable::Tensor const& A_log,
+    torch::stable::Tensor const& dt_bias, torch::stable::Tensor& ckpt,
+    torch::stable::Tensor& ckpt_scale, torch::stable::Tensor& d_cache,
+    torch::stable::Tensor& k_cache, torch::stable::Tensor& g_cache,
+    torch::stable::Tensor& out, torch::stable::Tensor const& query_start_loc,
+    torch::stable::Tensor const& ssm_state_indices,
+    torch::stable::Tensor const& write_pos,
+    torch::stable::Tensor const& cache_base,
+    torch::stable::Tensor const& is_flush, int64_t null_block_id, double scale);
 void fused_gdn_decode_post_conv_mtp(
     torch::stable::Tensor const& mixed_qkv, torch::stable::Tensor const& a,
     torch::stable::Tensor const& b, torch::stable::Tensor const& a_log,
