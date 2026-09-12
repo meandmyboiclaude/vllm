@@ -1293,6 +1293,14 @@ __global__ void Marlin(
   };
 
   auto matmul_a8 = [&](int k) {
+    // [club-cuda-lane 2026-09-12] 8-bit B on the int8-A path is fed to the MMA as
+    // packed bytes with NO zero-point step (the `else` branch below); an
+    // asymmetric 8-bit B (kU8) would decode plausibly and wrongly. Refuse at
+    // compile time so a future generator entry cannot instantiate it silently.
+    static_assert(!(is_a_8bit && b_type.size_bits() == 8 && has_zp),
+                  "int8-activation x 8-bit ASYMMETRIC weights has no zero-point "
+                  "path in matmul_a8; only uint8b128 (symmetric, ^0x80 at load) "
+                  "is supported");
     int k2 = k % 2;
   #pragma unroll
     for (int j = 0; j < 2; j++) {

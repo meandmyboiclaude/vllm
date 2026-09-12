@@ -723,10 +723,22 @@ torch::stable::Tensor marlin_gemm(
     c_tmp = torch::stable::empty({max_c_tmp_size},
                                  torch::headeronly::ScalarType::Float,
                                  std::nullopt, device);
-    // cudagraph-replay safety (DOMINANT root): the cross-CTA fp32 global reduce
-    // reads c_tmp partial slots; an uninitialized c_tmp is reused dirty across CUDA
-    // graph replays. Isolation: dirty c_tmp -> 570 NaN/1961 calls; zeroed -> 5/7762.
-    torch::stable::zero_(c_tmp);
+    // [club-cuda-lane 2026-09-12] NO memset here. The cross-CTA fp32 reduce never
+    // reads a c_tmp slot before writing it: the slice's first CTA (slice_idx == 0)
+    // only WRITES (global_reduce_fp32(first=true)), every later CTA acquires the
+    // lock the previous one released after its write, and the last CTA only READS.
+    // Stale c_tmp is therefore unreachable while the lock protocol holds; the
+    // upstream-PR-#45660 zero_() (never merged) cost sms*ceil16(M)*256 fp32 =
+    // 6.0 MiB (M=48) / 8.0 MiB (M=1032) of memset PER LAUNCH -- ~257 launches per
+    // decode step on Qwen3.8 -> ~1.5 GiB/step -- and, when the locks are broken,
+    // turned a loud NaN into a silently WRONG partial sum. A broken lock is fixed
+    // by locking the workspace after graph capture (upstream #55341), not here.
+    // VLLM_MARLIN_ZERO_CTMP=1 restores the memset for bisection only.
+    static const bool kt_zero_ctmp = [] {
+      const char* v = getenv("VLLM_MARLIN_ZERO_CTMP");
+      return v != nullptr && *v == '1';
+    }();
+    if (kt_zero_ctmp) torch::stable::zero_(c_tmp);
   } else {
     c_tmp = torch::stable::empty({0}, torch::headeronly::ScalarType::Float,
                                  std::nullopt, device);
