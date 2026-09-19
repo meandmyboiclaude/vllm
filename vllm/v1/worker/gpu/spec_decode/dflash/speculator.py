@@ -1,10 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import copy
-from collections.abc import Mapping
 from typing import Any
 
-import numpy as np
 import torch
 import torch.nn as nn
 
@@ -15,10 +13,13 @@ from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
-from vllm.v1.kv_cache_interface import KVCacheConfig
+from vllm.v1.kv_cache_interface import (
+    KVCacheConfig,
+    get_kv_cache_spec_sliding_window,
+)
 from vllm.v1.worker.gpu.attn_utils import build_slot_mappings_by_layer
 from vllm.v1.worker.gpu.block_table import BlockTables
-from vllm.v1.worker.gpu.cp_utils import cp_local_slot, prepare_dcp_local_seq_lens
+from vllm.v1.worker.gpu.cp_utils import cp_local_slot
 from vllm.v1.worker.gpu.dp_utils import DPSyncState, dispatch_cg_and_sync_dp
 from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
 from vllm.v1.worker.gpu.model_states.interface import ModelState
@@ -35,6 +36,13 @@ class DFlashSpeculator(DraftModelSpeculator):
     _speculator_name = "DFlash"  # For logging, so we can share methods with subclasses
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
+        parallel_config = vllm_config.parallel_config
+        if parallel_config.prefill_context_parallel_size > 1:
+            vllm_config = copy.copy(vllm_config)
+            vllm_config.parallel_config = replace(
+                parallel_config,
+                prefill_context_parallel_size=1,
+            )
         super().__init__(vllm_config, device)
 
         self.hidden_states = torch.zeros(
@@ -201,6 +209,19 @@ class DFlashSpeculator(DraftModelSpeculator):
             target_input_buffers,
             target_attn_groups,
         )
+
+        # FlashAttention's AOT split schedule is wrong for a windowed drafter,
+        # and `_get_sliding_window_configs` leaves it on or off depending on
+        # whether the target also runs FlashAttention. Decide it here instead.
+        for groups in self.attn_groups:
+            for group in groups:
+                builder = group.get_metadata_builder()
+                if getattr(
+                    builder, "aot_schedule", False
+                ) and get_kv_cache_spec_sliding_window(builder.kv_cache_spec):
+                    # `aot_schedule` belongs to FlashAttention's builder, not
+                    # to the base class this loop is typed against.
+                    builder.aot_schedule = False  # type: ignore[attr-defined]
 
         self.draft_kv_cache_group_ids = [
             gid for gid, g in enumerate(self.attn_groups) if g
@@ -440,12 +461,15 @@ class DFlashSpeculator(DraftModelSpeculator):
                 num_query_tokens,
                 attn_metadata=None,
                 slot_mappings=None,
-                num_tokens_across_dp=(
-                    dp_sync.num_tokens_across_dp if dp_sync is not None else None
-                ),
+                num_tokens_across_dp=None,
                 cudagraph_runtime_mode=CUDAGraphMode.NONE,
             )
             return self.draft_tokens[:num_reqs]
+
+        if self.pcp_manager is not None and not dummy_run:
+            self.block_tables.gather_block_tables(
+                input_batch.idx_mapping, num_reqs_padded=num_reqs
+            )
 
         # The query slot mapping is written into the shared BlockTables slot_mappings.
         # That buffer's address is what the captured CUDA graph reads from at replay.
@@ -506,15 +530,21 @@ class DFlashSpeculator(DraftModelSpeculator):
         no_draft_mask = input_batch.no_draft_mask_np
         want_skip_drafts = bool(no_draft_mask is not None and no_draft_mask.all())
 
+        batch_sync, num_batch_tokens = (
+            self._build_uniform_batch_dp_sync(dp_sync, num_reqs, self.num_query_per_req)
+            if dp_sync is not None
+            else (None, num_query_tokens)
+        )
         # Every DFlash step has exactly num_query_per_req tokens, so we can use FULL CGs
         batch_desc, batch_sync, skip_drafts = dispatch_cg_and_sync_dp(
             self.query_cudagraph_manager,
             num_reqs,
-            num_query_tokens,
+            num_batch_tokens,
             uniform_token_count=self.num_query_per_req,
             dp_size=self.dp_size,
             dp_rank=self.dp_rank,
             need_eager=is_profile,
+            dp_sync=batch_sync,
             want_skip_drafts=want_skip_drafts,
         )
 
@@ -533,10 +563,10 @@ class DFlashSpeculator(DraftModelSpeculator):
 
         # Rebuild the draft attention metadata even when replaying the FULL
         # graph so that any attention metadata builder state is updated.
-        draft_attn_metadata = self._build_draft_attn_metadata(
+        draft_attn_metadata = self._build_uniform_attn_metadata(
             num_reqs=num_reqs,
-            num_reqs_padded=num_reqs_padded,
-            num_tokens_padded=num_tokens_padded,
+            batch_desc=batch_desc,
+            num_query_per_req=self.num_query_per_req,
             seq_lens_cpu_upper_bound=input_batch.seq_lens_cpu_upper_bound,
             step=self.num_query_per_req,
             causal=self._group_causal,

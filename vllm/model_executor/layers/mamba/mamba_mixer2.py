@@ -2,10 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 
+from collections.abc import Sequence
+
 import torch
 from torch import nn
 
 from vllm.config import CacheConfig, ModelConfig, get_current_vllm_config
+from vllm.config.mamba import MambaBackendEnum
 from vllm.distributed import (
     divide,
     get_tensor_model_parallel_rank,
@@ -16,6 +19,7 @@ from vllm.distributed import (
 from vllm.forward_context import ForwardContext, get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.custom_op import CustomOp, PluggableLayer
+from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.linear import (
     ColumnParallelLinear,
     MergedColumnParallelLinear,
@@ -35,16 +39,14 @@ from vllm.model_executor.layers.mamba.ops.layernorm_gated import rms_norm_gated
 from vllm.model_executor.layers.mamba.ops.selective_state_update_replayssm_output_only import (  # noqa: E501
     selective_state_update_replayssm_output_only,
 )
-from vllm.model_executor.layers.mamba.ops.selective_state_update_replayssm_spec import (
-    selective_state_update_replayssm_spec,
-)
-from vllm.model_executor.layers.mamba.ops.selective_state_update_replayssm_state_and_output import (  # noqa: E501
-    selective_state_update_replayssm_state_and_output,
-)
 from vllm.model_executor.layers.mamba.ops.ssd_combined import (
     mamba_chunk_scan_combined_varlen,
 )
-from vllm.model_executor.layers.mamba.ops.ssu_dispatch import selective_state_update
+from vllm.model_executor.layers.mamba.ops.ssu_dispatch import (
+    reset_replayssm_ring_trackers,
+    selective_state_update,
+    selective_state_update_replayssm_flashinfer,
+)
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.model_loader.weight_utils import (
     LoaderFunction,
@@ -64,6 +66,7 @@ from vllm.utils.torch_utils import (
 from vllm.v1.attention.backend import AttentionMetadata
 from vllm.v1.attention.backends.mamba2_attn import Mamba2AttentionMetadata
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
+from vllm.v1.kv_cache_interface import KVCacheGroupSpec
 
 logger = init_logger(__name__)
 
@@ -177,6 +180,13 @@ class Mixer2RMSNormGated(CustomOp):
             norm_before_gate=False,
         )
 
+    def forward_xpu(
+        self,
+        x: torch.Tensor,
+        gate: torch.Tensor,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        return self.forward_cuda(x, gate)
+
 
 def mamba_v2_sharded_weight_loader(
     shard_spec: list[tuple[int, int, float]],
@@ -242,8 +252,7 @@ def mamba_v2_sharded_weight_loader(
 # --8<-- [start:mamba_mixer2]
 @PluggableLayer.register("mamba_mixer2")
 class MambaMixer2(MambaBase, PluggableLayer):
-    """
-    Compute ∆, A, B, C, and D the state space parameters and compute
+    """Compute ∆, A, B, C, and D the state space parameters and compute
     the `contextualized_states`. A, D are input independent
     (see Mamba paper [1] Section 3.5.2 "Interpretation of A"
     for why A isn't selective) ∆, B, C are input-dependent
@@ -508,44 +517,27 @@ class MambaMixer2(MambaBase, PluggableLayer):
         self.model_config = model_config
         self.cache_config = cache_config
         self.prefix = prefix
-        self.use_cache_kernel = (
+        self.use_replayssm = (
             cache_config.use_replayssm if cache_config is not None else False
         )
-        self.max_cache_len = (
-            cache_config.replayssm_buffer_len if cache_config is not None else 16
+        self.replayssm_buffer_len = (
+            cache_config.replayssm_buffer_len
+            if cache_config is not None and cache_config.use_replayssm
+            else None
         )
-        self.cached_kernel_variant = (
-            cache_config.replayssm_route
-            if cache_config is not None
-            else "state_and_output"
-        )
-        self.use_cache_spec_kernel = (
-            cache_config.use_replayssm_spec if cache_config is not None else False
-        )
-        # num_decode_tokens -> which SSM-update arm was captured at that shape.
-        # See the capture guard in conv_ssm_forward's decode branch.
-        self._captured_ssm_route: dict[int, bool] = {}
         self.mamba_config = vllm_config.mamba_config
-        if (
-            self.use_cache_kernel or self.use_cache_spec_kernel
-        ) and self.num_heads % self.tp_size != 0:
+        if self.use_replayssm and self.num_heads % self.tp_size != 0:
             raise ValueError(
-                "Mamba2 cached decode kernel requires tensor-parallel heads "
-                "to divide evenly"
+                "--use-replayssm requires tensor-parallel heads to divide evenly"
             )
-        # The tuple is (conv_state, ssm_state); with state-and-output/bc decode enabled
-        # (conv_state, ssm_state, x_cache, dt_cache, B_cache); with cached-spec
-        # (hybrid) enabled (conv_state, ssm_state, post_conv_cache, dt_cache).
-        if self.use_cache_spec_kernel:
-            _n_state = 4
-        elif self.use_cache_kernel:
-            _n_state = 5
-        else:
-            _n_state = 2
+        # ReplaySSM appends x/dt/B rings to (conv_state, ssm_state).
+        _n_state = 5 if self.use_replayssm else 2
         self.kv_cache = tuple(torch.tensor([]) for _ in range(_n_state))
+        self._replayssm_ring_start = torch.empty(0, dtype=torch.int32)
+        self._replayssm_prev_num_accepted = torch.empty(0, dtype=torch.int32)
+        self._updates_replayssm_trackers = True
 
         self.num_spec = vllm_config.num_speculative_tokens
-        self.max_spec_len = 1 + self.num_spec
         if self.num_spec > 0:
             self.register_buffer(
                 "_decode_state_offsets",
@@ -731,6 +723,7 @@ class MambaMixer2(MambaBase, PluggableLayer):
         assert self.cache_config is not None
         mamba_block_size = self.cache_config.mamba_block_size
         is_mamba_cache_all = self.cache_config.mamba_cache_mode == "all"
+        ring_start = prev_num_accepted = None
 
         attn_metadata: AttentionMetadata | None = None
         if attn_metadata_raw is not None:
@@ -747,21 +740,11 @@ class MambaMixer2(MambaBase, PluggableLayer):
                 else self.kv_cache[0].transpose(-1, -2)
             )
             ssm_state = self.kv_cache[1]
-            spec_post_conv_cache = spec_dt_cache = None
-            if self.use_cache_spec_kernel:
-                if len(self.kv_cache) != 4:
-                    raise ValueError(
-                        "Mamba2 cached-spec decode kernel requires four Mamba "
-                        "state tensors (conv, ssm, post_conv_cache, dt_cache)"
-                    )
-                spec_post_conv_cache, spec_dt_cache = self.kv_cache[2:]
-                x_cache = dt_cache = B_cache = None
-            elif self.use_cache_kernel:
-                if len(self.kv_cache) != 5:
-                    raise ValueError(
-                        "Mamba2 cached decode kernel requires five Mamba state tensors"
-                    )
-                x_cache, dt_cache, B_cache = self.kv_cache[2:]
+            if self.use_replayssm:
+                x_cache, dt_cache, B_cache = self.kv_cache[2:5]
+                if self.mamba_config.backend == MambaBackendEnum.FLASHINFER:
+                    ring_start = self._replayssm_ring_start
+                    prev_num_accepted = self._replayssm_prev_num_accepted
             else:
                 x_cache = dt_cache = B_cache = None
             has_initial_states_p = attn_metadata.has_initial_states_p
@@ -1020,6 +1003,13 @@ class MambaMixer2(MambaBase, PluggableLayer):
                 #   tensor
                 assert state_indices_tensor_p is not None
                 ssm_state[state_indices_tensor_p] = varlen_states
+                if ring_start is not None and self._updates_replayssm_trackers:
+                    assert prev_num_accepted is not None
+                    reset_replayssm_ring_trackers(
+                        ring_start,
+                        prev_num_accepted,
+                        state_indices_tensor_p,
+                    )
 
         # Process decode requests
         if has_decode:
@@ -1065,14 +1055,8 @@ class MambaMixer2(MambaBase, PluggableLayer):
                 initial_state_idx=block_idx_last_computed_token_d,
                 num_accepted_tokens=num_accepted_tokens,
                 query_start_loc=query_start_loc_d,
-                max_query_len=self.max_spec_len,
+                max_query_len=state_indices_tensor_d.size(-1),
             )
-
-            # cached-spec (hybrid) feeds the full channel-last post-conv output
-            # ([num_decode_tokens, conv_dim]) straight to the SSM scatter (no
-            # split) and uses the raw (unexpanded) dt. Capture before reuse.
-            conv_out_spec = hidden_states_B_C_d
-            dt_d_raw = dt_d
 
             hidden_states_d, B_d, C_d = self.split_hidden_states_B_C_fn(
                 hidden_states_B_C_d
@@ -1102,108 +1086,40 @@ class MambaMixer2(MambaBase, PluggableLayer):
             preallocated_ssm_out_d = preallocated_ssm_out_d.view(
                 num_decode_tokens, -1, self.head_dim
             )
-            _use_spec_arm = (
-                self.use_cache_spec_kernel
-                and attn_metadata.spec_write_pos_d is not None
-            )
-            if self.use_cache_spec_kernel:
-                # Capture safety. The arm below is chosen by a PYTHON branch on
-                # batch CONTENT (are the spec cursors present?), not on the
-                # tensor shape the cudagraph dispatcher keys on. Whichever arm
-                # runs while a graph is being captured is the only arm that
-                # graph will ever run, so two batches that dispatch to the SAME
-                # captured shape but want DIFFERENT arms would make the replay
-                # silently execute the wrong SSM update.
-                #
-                # Different capture shapes legitimately take different arms
-                # (a uniform K+1 verify shape vs a plain decode shape), so pin
-                # per shape and only refuse when one shape captures both.
-                #
-                # This mixer is not the serving layer type on this stack (GDN
-                # is), so a guard is the scope here rather than a re-route.
-                if torch.cuda.is_current_stream_capturing():
-                    _pinned = self._captured_ssm_route.get(num_decode_tokens)
-                    if _pinned is None:
-                        self._captured_ssm_route[num_decode_tokens] = _use_spec_arm
-                    elif _pinned != _use_spec_arm:
-                        raise RuntimeError(
-                            "Mamba2 mixer captured both the cached-spec and the "
-                            "baseline SSM-update arm at num_decode_tokens="
-                            f"{num_decode_tokens}. Graph replay would run "
-                            "whichever arm was captured last for every batch of "
-                            "that shape, silently producing the wrong state "
-                            "update. Give the two arms distinct capture shapes, "
-                            "or route them to distinct graphs, before enabling "
-                            "--use-replayssm-spec with full CUDA graphs."
-                        )
-            if _use_spec_arm:
-                # Fires only on speculative-verify batches (spec cursors set in
-                # build()). Rare non-spec decode rows under the spec flag (e.g. a
-                # single-token prefill chunk replayed as decode) have no cursors
-                # and fall through to the baseline update below.
-                if is_mamba_cache_all:
-                    raise ValueError(
-                        "Mamba2 cached-spec decode kernel requires "
-                        "mamba_cache_mode='none'"
+            if self.use_replayssm:
+                assert self.replayssm_buffer_len is not None
+                if self.mamba_config.backend == MambaBackendEnum.FLASHINFER:
+                    assert ring_start is not None
+                    assert prev_num_accepted is not None
+                    assert attn_metadata.replayssm_scratch is not None
+                    selective_state_update_replayssm_flashinfer(
+                        ssm_state,
+                        hidden_states_d,
+                        dt_d,
+                        A_d,
+                        B_d,
+                        C_d,
+                        preallocated_ssm_out_d,
+                        x_cache,
+                        B_cache,
+                        dt_cache,
+                        ring_start,
+                        prev_num_accepted,
+                        logical_window=self.replayssm_buffer_len,
+                        D=D_d,
+                        dt_bias=dt_bias,
+                        dt_softplus=True,
+                        state_batch_indices=state_indices_tensor_d_input,
+                        scratch=attn_metadata.replayssm_scratch,
+                        update_trackers=self._updates_replayssm_trackers,
+                        enable_stochastic_rounding=(
+                            self.mamba_config.enable_stochastic_rounding
+                        ),
+                        stochastic_rounding_philox_rounds=(
+                            self.mamba_config.stochastic_rounding_philox_rounds
+                        ),
                     )
-                assert spec_post_conv_cache is not None
-                assert spec_dt_cache is not None
-                assert query_start_loc_d is not None
-                # Hybrid: causal_conv1d_update (above) already produced conv_out;
-                # feed it + raw dt + the prepared A/D/dt_bias to the circular
-                # scatter+scan. Cursors are block-keyed (advanced once per step
-                # by the commit in build()). out is the packed preallocated buf.
-                selective_state_update_replayssm_spec(
-                    ssm_state,
-                    spec_post_conv_cache,
-                    spec_dt_cache,
-                    conv_out_spec,
-                    dt_d_raw,
-                    A_d,
-                    write_pos=attn_metadata.spec_write_pos_d,
-                    post_conv_state_pos=attn_metadata.spec_post_origin_d,
-                    is_flush=attn_metadata.spec_is_flush_d,
-                    query_start_loc=query_start_loc_d,
-                    state_batch_indices=state_indices_tensor_d[:, 0],
-                    max_cache_len=self.max_cache_len + self.max_spec_len,
-                    max_spec_len=self.max_spec_len,
-                    d_inner=self.intermediate_size // self.tp_size,
-                    ngroups=self.n_groups // self.tp_size,
-                    dstate=self.ssm_state_size,
-                    D=D_d,
-                    z=None,
-                    dt_bias=dt_bias,
-                    dt_softplus=True,
-                    out=preallocated_ssm_out_d,
-                    bc_pre=attn_metadata.spec_bc_pre_scratch,
-                )
-            elif self.use_cache_kernel:
-                if is_mamba_cache_all:
-                    raise ValueError(
-                        "Mamba2 cached decode kernel requires mamba_cache_mode='none'"
-                    )
-                if num_accepted_tokens is not None or query_start_loc_d is not None:
-                    raise ValueError(
-                        "Mamba2 cached decode kernel does not support "
-                        "speculative or varlen decode"
-                    )
-                if attn_metadata.write_pos_d is None:
-                    raise ValueError(
-                        "Mamba2 cached decode metadata is missing write_pos_d"
-                    )
-                if attn_metadata.is_flush_d is None:
-                    raise ValueError(
-                        "Mamba2 cached decode metadata is missing is_flush_d"
-                    )
-                assert x_cache is not None
-                assert dt_cache is not None
-                assert B_cache is not None
-                if self.cached_kernel_variant == "output_only":
-                    if attn_metadata.bc_pre_scratch is None:
-                        raise ValueError(
-                            "Mamba2 output-only decode kernel requires "
-                            "bc_pre_scratch in attention metadata"
-                        )
+                else:
                     selective_state_update_replayssm_output_only(
                         ssm_state,
                         hidden_states_d,
@@ -1220,38 +1136,15 @@ class MambaMixer2(MambaBase, PluggableLayer):
                         bc_pre=attn_metadata.bc_pre_scratch,
                         write_pos=attn_metadata.write_pos_d,
                         is_flush=attn_metadata.is_flush_d,
-                        max_cache_len=self.max_cache_len,
+                        max_cache_len=self.replayssm_buffer_len,
                         state_batch_indices=state_indices_tensor_d_input,
                         out=preallocated_ssm_out_d,
-                        # Stochastic Rounding for the vanilla decode path is
-                        # read from mamba_config inside ssu_dispatch; the replay
-                        # kernel isn't a dispatch backend, so pass it here.
                         enable_stochastic_rounding=(
                             self.mamba_config.enable_stochastic_rounding
                         ),
                         cache_philox_rounds=(
                             self.mamba_config.stochastic_rounding_philox_rounds
                         ),
-                    )
-                else:
-                    selective_state_update_replayssm_state_and_output(
-                        ssm_state,
-                        hidden_states_d,
-                        dt_d,
-                        A_d,
-                        B_d,
-                        C_d,
-                        D_d,
-                        dt_bias,
-                        dt_softplus=True,
-                        x_cache=x_cache,
-                        dt_cache=dt_cache,
-                        B_cache=B_cache,
-                        write_pos=attn_metadata.write_pos_d,
-                        is_flush=attn_metadata.is_flush_d,
-                        max_cache_len=self.max_cache_len,
-                        state_batch_indices=state_indices_tensor_d_input,
-                        out=preallocated_ssm_out_d,
                     )
             else:
                 selective_state_update(
@@ -1275,51 +1168,20 @@ class MambaMixer2(MambaBase, PluggableLayer):
     def get_state_dtype(self) -> tuple[torch.dtype, ...]:
         assert self.model_config is not None
         assert self.cache_config is not None
-        if self.use_cache_spec_kernel:
-            return MambaStateDtypeCalculator.mamba2_replayssm_spec_state_dtype(
-                self.model_config.dtype,
-                self.cache_config.mamba_cache_dtype,
-                self.cache_config.mamba_ssm_cache_dtype,
-            )
-        elif self.use_cache_kernel:
-            return MambaStateDtypeCalculator.mamba2_replayssm_state_dtype(
-                self.model_config.dtype,
-                self.cache_config.mamba_cache_dtype,
-                self.cache_config.mamba_ssm_cache_dtype,
-            )
-        return MambaStateDtypeCalculator.mamba2_state_dtype(
+        base_dtype = MambaStateDtypeCalculator.mamba2_state_dtype(
             self.model_config.dtype,
             self.cache_config.mamba_cache_dtype,
             self.cache_config.mamba_ssm_cache_dtype,
         )
+        if self.use_replayssm:
+            return MambaStateDtypeCalculator.append_replayssm_ring(
+                base_dtype, self.model_config.dtype
+            )
+        return base_dtype
 
     def get_state_shape(self) -> tuple[tuple[int, ...], ...]:
         tp_world_size = get_tensor_model_parallel_world_size()
-        if self.use_cache_spec_kernel:
-            return MambaStateShapeCalculator.mamba2_replayssm_spec_state_shape(
-                intermediate_size=self.intermediate_size,
-                tp_world_size=tp_world_size,
-                n_groups=self.n_groups,
-                num_heads=self.num_heads,
-                head_dim=self.head_dim,
-                state_size=self.ssm_state_size,
-                conv_kernel=self.conv_kernel_size,
-                num_spec=self.num_spec,
-                replayssm_buffer_len=self.max_cache_len,
-            )
-        elif self.use_cache_kernel:
-            return MambaStateShapeCalculator.mamba2_replayssm_state_shape(
-                intermediate_size=self.intermediate_size,
-                tp_world_size=tp_world_size,
-                n_groups=self.n_groups,
-                num_heads=self.num_heads,
-                head_dim=self.head_dim,
-                state_size=self.ssm_state_size,
-                conv_kernel=self.conv_kernel_size,
-                num_spec=self.num_spec,
-                replayssm_buffer_len=self.max_cache_len,
-            )
-        return MambaStateShapeCalculator.mamba2_state_shape(
+        base_shape = MambaStateShapeCalculator.mamba2_state_shape(
             intermediate_size=self.intermediate_size,
             tp_world_size=tp_world_size,
             n_groups=self.n_groups,
@@ -1329,10 +1191,78 @@ class MambaMixer2(MambaBase, PluggableLayer):
             conv_kernel=self.conv_kernel_size,
             num_spec=self.num_spec,
         )
+        if self.use_replayssm:
+            assert self.replayssm_buffer_len is not None
+            return MambaStateShapeCalculator.append_replayssm_ring(
+                base_shapes=base_shape,
+                n_groups=self.n_groups,
+                tp_world_size=tp_world_size,
+                logical_window=self.replayssm_buffer_len,
+                backend=self.mamba_config.backend,
+            )
+        return base_shape
 
     @property
     def mamba_type(self) -> MambaAttentionBackendEnum:
         return MambaAttentionBackendEnum.MAMBA2
+
+
+def share_replayssm_ring_trackers(
+    ordered_layer_names: list[str],
+    forward_context: dict[str, Attention],
+    kv_cache_groups: Sequence[KVCacheGroupSpec] | None = None,
+) -> None:
+    """Share ring cursors within each cache-slot index namespace.
+
+    Layers backed by one KV-cache group use the same physical block indices and
+    can therefore share cursors. Different KV-cache groups may assign different
+    block indices to the same request and must keep separate cursor tensors.
+    The final local layer in each group advances its cursors after every layer
+    in that group has consumed the previous values.
+    """
+    replayssm_mixers: dict[str, MambaMixer2] = {}
+    for layer_name in ordered_layer_names:
+        layer = forward_context[layer_name]
+        if (
+            isinstance(layer, MambaMixer2)
+            and layer.use_replayssm
+            and layer.mamba_config.backend == MambaBackendEnum.FLASHINFER
+        ):
+            replayssm_mixers[layer_name] = layer
+
+    layer_to_group: dict[str, int] = {}
+    if kv_cache_groups:
+        for group_idx, group in enumerate(kv_cache_groups):
+            for layer_name in group.layer_names:
+                layer_to_group[layer_name] = group_idx
+
+    groups_by_namespace: dict[int | str, list[str]] = {}
+    for layer_name in ordered_layer_names:
+        if layer_name not in replayssm_mixers:
+            continue
+        namespace = layer_to_group.get(layer_name, layer_name)
+        groups_by_namespace.setdefault(namespace, []).append(layer_name)
+
+    for group_layer_names in groups_by_namespace.values():
+        last_layer_name = group_layer_names[-1]
+
+        first_mixer = replayssm_mixers[group_layer_names[0]]
+        first_state = first_mixer.kv_cache[1]
+        num_blocks, device = first_state.shape[0], first_state.device
+        for layer_name in group_layer_names:
+            state = replayssm_mixers[layer_name].kv_cache[1]
+            if (state.shape[0], state.device) != (num_blocks, device):
+                raise ValueError(
+                    "ReplaySSM layers in one cache group must share cache capacity"
+                )
+
+        ring_start = torch.zeros(num_blocks, dtype=torch.int32, device=device)
+        prev_num_accepted = torch.zeros_like(ring_start)
+        for layer_name in group_layer_names:
+            mixer = replayssm_mixers[layer_name]
+            mixer._replayssm_ring_start = ring_start
+            mixer._replayssm_prev_num_accepted = prev_num_accepted
+            mixer._updates_replayssm_trackers = layer_name == last_layer_name
 
 
 def mamba_mixer2(
@@ -1346,17 +1276,8 @@ def mamba_mixer2(
     self.conv_ssm_forward(projected_states=projected_states, output=output)
 
 
-def mamba_mixer2_fake(
-    projected_states: torch.Tensor,
-    output: torch.Tensor,
-    layer_name: LayerNameType,
-) -> None:
-    return
-
-
 direct_register_custom_op(
     op_name="mamba_mixer2",
     op_func=mamba_mixer2,
     mutates_args=["output"],
-    fake_impl=mamba_mixer2_fake,
 )

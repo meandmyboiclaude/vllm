@@ -10,6 +10,7 @@ import torch
 
 import vllm.envs as envs
 from vllm.config.cache import MambaDType
+from vllm.config.mamba import MambaBackendEnum
 from vllm.config.model import ModelDType
 from vllm.distributed import divide
 from vllm.logger import init_logger
@@ -17,6 +18,7 @@ from vllm.utils.torch_utils import (
     STR_DTYPE_TO_TORCH_DTYPE,
     get_kv_cache_torch_dtype,
 )
+from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 
 logger = init_logger(__name__)
 
@@ -93,45 +95,6 @@ class MambaStateDtypeCalculator:
         return (*base_dtypes, activation_dtype, torch.float32, activation_dtype)
 
     @classmethod
-    def mamba2_replayssm_state_dtype(
-        cls,
-        model_dtype: ModelDType | torch.dtype,
-        mamba_cache_dtype: MambaDType,
-        mamba_ssm_cache_dtype: MambaDType,
-    ) -> tuple[torch.dtype, ...]:
-        """Mamba2 ReplaySSM state dtypes: baseline ``(conv, ssm)`` plus the
-        ring-buffer dtypes ``(x_cache, dt_cache, B_cache)`` =
-        ``(activation, fp32, activation)`` via ``append_replayssm_ring``. Call
-        only when use_replayssm is on; must stay in sync with
-        ``MambaMixer2.get_state_dtype``.
-        """
-        base_dtypes = cls.mamba2_state_dtype(
-            model_dtype, mamba_cache_dtype, mamba_ssm_cache_dtype
-        )
-        return cls.append_replayssm_ring(base_dtypes, model_dtype)
-
-    @classmethod
-    def mamba2_replayssm_spec_state_dtype(
-        cls,
-        model_dtype: ModelDType | torch.dtype,
-        mamba_cache_dtype: MambaDType,
-        mamba_ssm_cache_dtype: MambaDType,
-    ) -> tuple[torch.dtype, ...]:
-        """Mamba2 ReplaySSM state dtypes for the SPECULATIVE-decode (hybrid)
-        kernel: the hybrid 4-tuple
-        ``(conv, ssm_checkpoint, post_conv_cache, dt_cache)``. The checkpoint
-        and ``dt_cache`` are forced fp32 (the cached-spec reconstruction was
-        validated against an fp32 reference); ``post_conv_cache`` is activation
-        dtype. Call only when use_replayssm_spec is on; must stay in sync with
-        ``MambaMixer2.get_state_dtype``.
-        """
-        conv_dtype, _ssm_dtype = cls.mamba2_state_dtype(
-            model_dtype, mamba_cache_dtype, mamba_ssm_cache_dtype
-        )
-        activation_dtype = get_kv_cache_torch_dtype("auto", model_dtype)
-        return conv_dtype, torch.float32, activation_dtype, torch.float32
-
-    @classmethod
     def _mamba_state_dtype(
         cls,
         model_dtype: ModelDType | torch.dtype,
@@ -167,62 +130,23 @@ class MambaStateDtypeCalculator:
         )
 
     @classmethod
-    def gated_delta_net_replayssm_state_dtype(
-        cls,
-        model_dtype: ModelDType | torch.dtype,
-        mamba_cache_dtype: MambaDType,
-        mamba_ssm_cache_dtype: MambaDType,
-    ) -> tuple[torch.dtype, ...]:
-        """GDN ReplaySSM state dtypes: baseline ``(conv, ssm)`` plus the ring
-        cache dtypes ``(d_cache, k_cache, g_cache)``. The ``d``/``k`` input
-        caches use fp16 for bf16 activations; ``g_cache`` is float32. Call only
-        when use_replayssm is on.
-        """
-        conv_dtype, ssm_dtype = cls._mamba_state_dtype(
-            model_dtype, mamba_cache_dtype, mamba_ssm_cache_dtype
-        )
-        activation_dtype = get_kv_cache_torch_dtype("auto", model_dtype)
-        cache_dtype = (
-            torch.float16 if activation_dtype == torch.bfloat16 else activation_dtype
-        )
-        return conv_dtype, ssm_dtype, cache_dtype, cache_dtype, torch.float32
-
-    @classmethod
-    def gated_delta_net_replayssm_spec_state_dtype(
-        cls,
-        model_dtype: ModelDType | torch.dtype,
-        mamba_cache_dtype: MambaDType,
-        mamba_ssm_cache_dtype: MambaDType,
-    ) -> tuple[torch.dtype, ...]:
-        """GDN ReplaySSM state dtypes for the SPECULATIVE-decode kernel.
-
-        The ``ssm`` checkpoint is forced to ``float32``; the ``d``/``k`` ring
-        caches use fp16 for bf16 activations (same rule as the non-spec path).
-        Call only when use_replayssm_spec is on.
-        """
-        conv_dtype, ssm_dtype = cls._mamba_state_dtype(
-            model_dtype, mamba_cache_dtype, mamba_ssm_cache_dtype
-        )
-        activation_dtype = get_kv_cache_torch_dtype("auto", model_dtype)
-        cache_dtype = (
-            torch.float16 if activation_dtype == torch.bfloat16 else activation_dtype
-        )
-        return (
-            conv_dtype,
-            torch.float32,  # fp32 checkpoint
-            cache_dtype,  # d_cache
-            cache_dtype,  # k_cache
-            torch.float32,  # g_cache
-        )
-
-    @classmethod
     def kda_state_dtype(
         cls,
         model_dtype: ModelDType | torch.dtype,
         mamba_cache_dtype: MambaDType,
+        mamba_ssm_cache_dtype: MambaDType = "auto",
     ) -> tuple[torch.dtype, torch.dtype]:
-        state_dtype = get_kv_cache_torch_dtype(mamba_cache_dtype, model_dtype)
-        return (state_dtype, torch.float32)
+        conv_state_dtype = get_kv_cache_torch_dtype(mamba_cache_dtype, model_dtype)
+        if mamba_ssm_cache_dtype == "auto":
+            recurrent_state_dtype = torch.float32
+        elif mamba_ssm_cache_dtype in ("float32", "bfloat16"):
+            recurrent_state_dtype = STR_DTYPE_TO_TORCH_DTYPE[mamba_ssm_cache_dtype]
+        else:
+            raise ValueError(
+                "KDA recurrent state supports only auto, float32, and bfloat16; "
+                f"got {mamba_ssm_cache_dtype}"
+            )
+        return (conv_state_dtype, recurrent_state_dtype)
 
     @classmethod
     def append_kda_recoverssm_record(
@@ -298,115 +222,34 @@ class MambaStateShapeCalculator:
     @classmethod
     def append_replayssm_ring(
         cls,
-        base_shapes: tuple[tuple[int, ...], ...],
+        base_shapes: tuple[tuple[int, int], tuple[int, int, int]],
         n_groups: int,
         tp_world_size: int,
-        replayssm_buffer_len: int,
-    ) -> tuple[tuple[int, ...], ...]:
-        """Append the ReplaySSM ring shapes (x_cache, dt_cache, B_cache) to a
-        base ``(conv, ssm)`` tuple. ``base_shapes[1]`` is the ssm shape
-        ``(nheads // tp, head_dim, state_size)``. B_cache uses the
-        head-shard-extended ``n_groups`` (the group count the decode kernel
-        actually writes per shard); extension is idempotent, so callers may
-        pass the raw or the already-extended value.
+        logical_window: int,
+        backend: MambaBackendEnum,
+    ) -> tuple[
+        tuple[int, int],
+        tuple[int, int, int],
+        tuple[int, int, int],
+        tuple[int, int],
+        tuple[int, int, int],
+    ]:
+        """Append the physical ReplaySSM ring shapes.
+
+        ``base_shapes[1]`` is ``(nheads // tp, head_dim, state_size)``;
+        B_cache uses the un-extended ``n_groups``.
         """
+        ring_buffer_len = logical_window
+        if backend == MambaBackendEnum.FLASHINFER:
+            # FlashInfer keeps the live window and appended token together.
+            ring_buffer_len += 1
         local_nheads, head_dim, state_size = base_shapes[1]
-        n_groups = n_groups + cls.extra_groups_for_head_shards(n_groups, tp_world_size)
         local_ngroups = divide(n_groups, tp_world_size)
         return (
             *base_shapes,
-            (local_nheads, replayssm_buffer_len, head_dim),
-            (local_nheads, replayssm_buffer_len),
-            (local_ngroups, replayssm_buffer_len, state_size),
-        )
-
-    @classmethod
-    def mamba2_replayssm_state_shape(
-        cls,
-        tp_world_size: int,
-        intermediate_size: int,
-        n_groups: int,
-        num_heads: int,
-        head_dim: int,
-        state_size: int,
-        conv_kernel: int,
-        replayssm_buffer_len: int,
-        num_spec: int = 0,
-    ) -> tuple[tuple[int, ...], ...]:
-        """Mamba2 ReplaySSM state shapes: baseline ``(conv, ssm)`` plus the
-        ring-buffer shapes ``x_cache``/``dt_cache``/``B_cache`` via
-        ``append_replayssm_ring`` (which head-shard-extends ``n_groups``
-        idempotently, matching what the decode kernel writes per shard).
-        Call only when use_replayssm is on; must stay in sync with
-        ``MambaMixer2.get_state_shape``.
-        """
-        base_shapes = cls.mamba2_state_shape(
-            tp_world_size=tp_world_size,
-            intermediate_size=intermediate_size,
-            n_groups=n_groups,
-            num_heads=num_heads,
-            head_dim=head_dim,
-            state_size=state_size,
-            conv_kernel=conv_kernel,
-            num_spec=num_spec,
-        )
-        return cls.append_replayssm_ring(
-            base_shapes,
-            n_groups=n_groups,
-            tp_world_size=tp_world_size,
-            replayssm_buffer_len=replayssm_buffer_len,
-        )
-
-    @classmethod
-    def mamba2_replayssm_spec_state_shape(
-        cls,
-        tp_world_size: int,
-        intermediate_size: int,
-        n_groups: int,
-        num_heads: int,
-        head_dim: int,
-        state_size: int,
-        conv_kernel: int,
-        replayssm_buffer_len: int,
-        num_spec: int = 0,
-    ) -> tuple[tuple[int, ...], ...]:
-        """Mamba2 ReplaySSM state shapes for the SPECULATIVE-decode (hybrid)
-        kernel: baseline ``(conv, ssm)`` (conv keeps its spec sliding-window
-        size ``conv_kernel-1+num_spec`` -- the hybrid reuses
-        ``causal_conv1d_update``) plus the circular caches
-        ``post_conv_cache=(cache_buf_len, conv_dim_local)`` and
-        ``dt_cache=(local_nheads, cache_buf_len)``, where the L = B + max_spec_len
-        history window sizes ``cache_buf_len = next_pow2(replayssm_buffer_len + 1 +
-        num_spec)`` and ``conv_dim_local`` matches the post-conv x|B width (C is
-        not cached; read fresh from conv_out). Call only when use_replayssm_spec
-        is on; must stay in sync with ``MambaMixer2.get_state_shape``.
-        """
-        conv_state_shape, temporal_state_shape = cls.mamba2_state_shape(
-            tp_world_size=tp_world_size,
-            intermediate_size=intermediate_size,
-            n_groups=n_groups,
-            num_heads=num_heads,
-            head_dim=head_dim,
-            state_size=state_size,
-            conv_kernel=conv_kernel,
-            num_spec=num_spec,
-        )
-        n_groups_ext = n_groups + cls.extra_groups_for_head_shards(
-            n_groups, tp_world_size
-        )
-        conv_dim_local = divide(
-            intermediate_size + n_groups_ext * state_size, tp_world_size
-        )
-        # L = B + max_spec_len history window: physical pow2 buffer next_pow2(L).
-        cache_buf_len = 1 << (replayssm_buffer_len + num_spec).bit_length()
-        local_nheads = divide(num_heads, tp_world_size)
-        post_conv_cache_shape = (cache_buf_len, conv_dim_local)
-        dt_cache_shape = (local_nheads, cache_buf_len)
-        return (
-            conv_state_shape,
-            temporal_state_shape,
-            post_conv_cache_shape,
-            dt_cache_shape,
+            (local_nheads, ring_buffer_len, head_dim),
+            (local_nheads, ring_buffer_len),
+            (local_ngroups, ring_buffer_len, state_size),
         )
 
     @classmethod
@@ -425,7 +268,6 @@ class MambaStateShapeCalculator:
     def extra_groups_for_head_shards(cls, ngroups: int, tp_size: int):
         """Compute the increase in group numbers to account for
         replication in order to accompany the head shards."""
-
         # in the case ngoups % tp_size == 0, this will be zero
         if ngroups % tp_size == 0:
             return 0
@@ -456,88 +298,6 @@ class MambaStateShapeCalculator:
             head_k_dim,
         )
         return conv_state_shape, temporal_state_shape
-
-    @classmethod
-    def gated_delta_net_replayssm_state_shape(
-        cls,
-        tp_world_size: int,
-        num_k_heads: int,
-        num_v_heads: int,
-        head_k_dim: int,
-        head_v_dim: int,
-        conv_kernel_size: int,
-        replayssm_buffer_len: int,
-        num_spec: int = 0,
-    ) -> tuple[tuple[int, ...], ...]:
-        """GDN ReplaySSM state shapes: baseline ``(conv, ssm)`` plus the cached
-        ring-buffer shapes ``d_cache``/``k_cache``/``g_cache``. Head counts use
-        the (un-extended) ``num_v_heads``/``num_k_heads`` divided by
-        ``tp_world_size``, matching ``gated_delta_net_state_shape``. Call only
-        when use_replayssm is on.
-        """
-        conv_state_shape, temporal_state_shape = cls.gated_delta_net_state_shape(
-            tp_world_size,
-            num_k_heads,
-            num_v_heads,
-            head_k_dim,
-            head_v_dim,
-            conv_kernel_size,
-            num_spec,
-        )
-        local_v_heads = divide(num_v_heads, tp_world_size)
-        local_k_heads = divide(num_k_heads, tp_world_size)
-        d_cache_shape = (local_v_heads, replayssm_buffer_len, head_v_dim)
-        k_cache_shape = (local_k_heads, replayssm_buffer_len, head_k_dim)
-        g_cache_shape = (local_v_heads, replayssm_buffer_len)
-        return (
-            conv_state_shape,
-            temporal_state_shape,
-            d_cache_shape,
-            k_cache_shape,
-            g_cache_shape,
-        )
-
-    @classmethod
-    def gated_delta_net_replayssm_spec_state_shape(
-        cls,
-        tp_world_size: int,
-        num_k_heads: int,
-        num_v_heads: int,
-        head_k_dim: int,
-        head_v_dim: int,
-        conv_kernel_size: int,
-        replayssm_buffer_len: int,
-        num_spec: int = 0,
-    ) -> tuple[tuple[int, ...], ...]:
-        """GDN ReplaySSM state shapes for the SPECULATIVE-decode kernel.
-
-        The circular ``d_cache``/``k_cache``/``g_cache`` use the L = B + max_spec_len
-        history window: a power-of-two buffer ``next_pow2(replayssm_buffer_len + 1 +
-        num_spec)``. Call only when use_replayssm_spec is on. The block-keyed
-        cursors live in the GDN metadata builder, not the page.
-        """
-        conv_state_shape, temporal_state_shape = cls.gated_delta_net_state_shape(
-            tp_world_size,
-            num_k_heads,
-            num_v_heads,
-            head_k_dim,
-            head_v_dim,
-            conv_kernel_size,
-            num_spec,
-        )
-        cache_buf_len = 1 << (replayssm_buffer_len + num_spec).bit_length()
-        local_v_heads = divide(num_v_heads, tp_world_size)
-        local_k_heads = divide(num_k_heads, tp_world_size)
-        d_cache_shape = (local_v_heads, cache_buf_len, head_v_dim)
-        k_cache_shape = (local_k_heads, cache_buf_len, head_k_dim)
-        g_cache_shape = (local_v_heads, cache_buf_len)
-        return (
-            conv_state_shape,
-            temporal_state_shape,
-            d_cache_shape,
-            k_cache_shape,
-            g_cache_shape,
-        )
 
     @classmethod
     def kda_state_shape(
@@ -589,13 +349,13 @@ class MambaStateShapeCalculator:
 
 @dataclass
 class MambaCopySpec:
-    """
-    Data class specifying the memory-copy parameters for Mamba states used for
+    """Data class specifying the memory-copy parameters for Mamba states used for
     prefix caching in align mode.
 
     Attributes:
         start_addr (int): Starting address for the memory copy operation.
         num_elements (int): Number of elements to copy from the starting address.
+
     """
 
     start_addr: int
@@ -614,6 +374,10 @@ Parameters:
   num_accepted_tokens: int - number of accepted tokens used to compute the copy offset.
       Range: 1 .. 1 + num_speculative_tokens (inclusive).
 """
+MambaStateCopyFuncs: TypeAlias = tuple[MambaStateCopyFunc, ...]
+MambaStateCopyFuncsByType: TypeAlias = dict[
+    MambaAttentionBackendEnum, MambaStateCopyFuncs
+]
 
 
 def get_conv_copy_spec(
@@ -628,10 +392,7 @@ def get_conv_copy_spec(
     DS layout ``(num_blocks, dim, state_len)``.
     """
     src_block_id = block_ids[cur_block_idx]
-    # num_accepted_tokens can be 0 for stale rows whose sampled tokens were
-    # discarded; clamp so the offset never goes negative (a negative value
-    # would silently slice from the end of the state).
-    offset = max(num_accepted_tokens - 1, 0)
+    offset = num_accepted_tokens - 1
     if is_conv_state_dim_first():
         # DS offset > 0 is handled by the fused postprocess kernel.
         assert offset == 0, (
@@ -654,10 +415,7 @@ def get_temporal_copy_spec(
     num_accepted_tokens: int,
 ) -> MambaCopySpec:
     """Return a MambaCopySpec for copying a temporal state slice."""
-    # num_accepted_tokens can be 0 for stale rows whose sampled tokens were
-    # discarded; clamp so the index never goes negative (a negative value
-    # would silently pick a block from the end of the list).
-    src_block_id = block_ids[cur_block_idx + max(num_accepted_tokens - 1, 0)]
+    src_block_id = block_ids[cur_block_idx + num_accepted_tokens - 1]
     src_state = state[src_block_id]
     return MambaCopySpec(
         start_addr=src_state.data_ptr(), num_elements=src_state.numel()
