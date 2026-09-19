@@ -407,18 +407,22 @@ class AsyncLLM(EngineClient):
                 raise NotImplementedError
 
             # Streaming input case.
-            return await self._add_streaming_input_request(
-                request_id,
-                prompt,
-                params,
-                arrival_time,
-                lora_request,
-                tokenization_kwargs,
-                trace_headers,
-                priority,
-                data_parallel_rank,
-                session_id,
-            )
+            try:
+                return await self._add_streaming_input_request(
+                    request_id,
+                    prompt,
+                    params,
+                    arrival_time,
+                    lora_request,
+                    tokenization_kwargs,
+                    trace_headers,
+                    priority,
+                    data_parallel_rank,
+                    session_id,
+                )
+            except asyncio.CancelledError:
+                await self.abort(request_id, internal=False)
+                raise
 
         # Convert Input --> Request.
         if isinstance(prompt, EngineCoreRequest):
