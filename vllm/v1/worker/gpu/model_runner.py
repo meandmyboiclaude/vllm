@@ -1464,6 +1464,14 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         )
         seq_lens_cpu_upper_bound = torch.from_numpy(seq_lens_cpu_upper_bound_np)
 
+        # [rebase-8] Restored: the merge lost this binding where upstream's side won a
+        # region that never conflicted, leaving max_seq_len_np=... at the InputBatch
+        # construction as an unbound local (NameError on the PP path).
+        max_seq_len_np = None
+        if self.use_pp:
+            # max_seq_len is only consumed by the PP `compute_need_sampled_mask`
+            max_seq_len_np = self.req_states.max_seq_len[idx_mapping_np]
+
         prompt_lens = None
         if self.model_config.rswa_window is not None:
             # prompt_lens is only used in R-SWA case.

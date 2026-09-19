@@ -10,6 +10,7 @@ import torch
 from vllm.config import CacheConfig
 from vllm.logger import init_logger
 from vllm.model_executor.layers.mamba.mamba_utils import (
+    MambaStateCopyFunc,
     MambaStateCopyFuncsByType,
     get_conv_copy_spec,
     get_temporal_copy_spec,
@@ -1902,7 +1903,11 @@ def postprocess_mamba_none_normalize_gpu(
     num_reqs: int,
     num_accepted_tokens_gpu: torch.Tensor,
     num_accepted_tokens_cpu_tensor: torch.Tensor,
-    input_batch: GPUInputBatch,
+    # [rebase-8] GPUInputBatch was removed upstream (it lived in
+    # lora_model_runner_mixin and no longer exists anywhere in the tree). This
+    # function has no callers, so the annotation is quoted to keep the module
+    # importable rather than guessing at a replacement type.
+    input_batch: "GPUInputBatch",  # noqa: F821
     kv_cache_config: KVCacheConfig,
     forward_context: dict[str, Any],
     mamba_state_copy_funcs: tuple[MambaStateCopyFunc, ...],
