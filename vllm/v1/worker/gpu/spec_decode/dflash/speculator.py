@@ -348,43 +348,6 @@ class DFlashSpeculator(DraftModelSpeculator):
             num_reqs, self.num_speculative_steps
         )
 
-    def _build_draft_attn_metadata(
-        self,
-        num_reqs: int,
-        num_reqs_padded: int,
-        num_tokens_padded: int,
-        seq_lens_cpu_upper_bound: torch.Tensor,
-        step: int,
-        num_query_per_req: int | None = None,
-        causal: bool | Mapping[int, bool] = False,
-        query_start_loc_np: np.ndarray | None = None,
-        dcp_local_seq_lens: torch.Tensor | None = None,
-    ) -> dict[str, Any] | None:
-        if not self.draft_attn_layer_names:
-            return None
-        assert num_query_per_req is None  # Omitted for DFlash, read from self instead
-        if dcp_local_seq_lens is None and self.block_tables.cp_size > 1:
-            prepare_dcp_local_seq_lens(
-                self.input_buffers.dcp_local_seq_lens,
-                self.input_buffers.seq_lens,
-                num_reqs,
-                self.block_tables.cp_size,
-                self.block_tables.cp_rank,
-                self.block_tables.cp_interleave,
-            )
-            dcp_local_seq_lens = self.input_buffers.dcp_local_seq_lens
-        return super()._build_draft_attn_metadata(
-            num_reqs,
-            num_reqs_padded,
-            num_tokens_padded,
-            seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
-            step=step,
-            num_query_per_req=self.num_query_per_req,
-            causal=causal,
-            query_start_loc_np=query_start_loc_np,
-            dcp_local_seq_lens=dcp_local_seq_lens,
-        )
-
     def _reset_draft_side_outputs(self, num_reqs: int) -> None:
         """Invalidate per-step draft outputs the caller reads unconditionally.
 
