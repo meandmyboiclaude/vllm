@@ -14,6 +14,8 @@ from pydantic import (
     Field,
     PrivateAttr,
     SerializeAsAny,
+    ValidationInfo,
+    field_validator,
     model_serializer,
     model_validator,
 )
@@ -452,6 +454,25 @@ class ChatCompletionRequest(OpenAIBaseModel):
             "exactly what was fed into the model."
         ),
     )
+
+    return_assistant_tokens_mask: bool = Field(
+        default=False,
+        description=(
+            "If true, the /render response will include an "
+            "``assistant_tokens_mask`` field — a per-token list of 0/1 "
+            "values indicating which tokens were assistant-generated. "
+            "Requires the chat template to use ``{% generation %}`` "
+            "tags.  When the template does not support it, "
+            "``assistant_tokens_mask`` will be ``null``."
+        ),
+    )
+
+    @field_validator("top_logprobs")
+    @classmethod
+    def normalize_top_logprobs(
+        cls, value: int | None, info: ValidationInfo
+    ) -> int | None:
+        return 0 if value is None and info.data.get("logprobs") else value
 
     cache_salt: str | None = Field(
         default=None,
@@ -1115,6 +1136,13 @@ class BatchChatCompletionRequest(OpenAIBaseModel):
     # matching ChatCompletionRequest.return_tokens_as_token_ids.
     return_tokens_as_token_ids: bool | None = None
     return_token_ids: bool = False
+
+    @field_validator("top_logprobs")
+    @classmethod
+    def normalize_top_logprobs(
+        cls, value: int | None, info: ValidationInfo
+    ) -> int | None:
+        return 0 if value is None and info.data.get("logprobs") else value
 
     @model_validator(mode="before")
     @classmethod
