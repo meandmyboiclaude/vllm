@@ -17,7 +17,7 @@
 #include <torch/headeronly/core/ScalarType.h>
 #include <torch/headeronly/util/Exception.h>
 
-#include "libtorch_stable/torch_utils.h"
+#include "torch_utils.h"
 
 namespace marlin {
 

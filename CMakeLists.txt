@@ -711,7 +711,7 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
         # [0100 PIN80] the instantiations generate_kernels.py pins to sm_80 SASS (sm80pin_kernel_*.cu): compiled with the
         # served "8.0+PTX" whatever MARLIN_BF16_ARCHS is (v4-WIDE: every bf16 wide tile, admission / prefill only on X2).
         cuda_archs_loose_intersection(MARLIN_PIN80_ARCHS "8.0+PTX" "${CUDA_ARCHS}")
-        file(GLOB MARLIN_PIN80_KERNEL_SRC "csrc/libtorch_stable/quantization/marlin/sm80pin_kernel_*.cu")
+        file(GLOB MARLIN_PIN80_KERNEL_SRC "csrc/quantization/marlin/sm80pin_kernel_*.cu")
         if (MARLIN_PIN80_KERNEL_SRC AND MARLIN_PIN80_ARCHS)
           set_gencode_flags_for_srcs(
             SRCS "${MARLIN_PIN80_KERNEL_SRC}"
