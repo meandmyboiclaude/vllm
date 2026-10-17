@@ -50,6 +50,9 @@ __device__ __forceinline__ void ired_add4(FragCT& acc, const int4 a, const int4 
 #include "core/scalar_type.hpp"
 // [0055 KU3S] the LOWBIT int3 unpack (lowbit_unpack.cuh 61472f0052c54b60, verbatim): forceinline device functions only
 #include "lowbit_unpack.cuh"
+#if defined(MARLIN_ZPW13_TWIN) && MARLIN_ZPW13_TWIN
+  #include "zpw13.cuh"  // [ZPW13] field / rzp / sub_rz_and_dequant (a ZPW13 TU only)
+#endif
 
 // [0036 XS-5] XS3: the cross-slice prefetch (XS) is compiled ONLY into the twin kernel MarlinXS<...>, defined when a
 // translation unit sets MARLIN_XS_TWIN 1 before including this header (generate_kernels.py writes exactly one such TU,
@@ -862,6 +865,50 @@ template <const vllm::ScalarTypeId a_type_id,  // A ScalarType id
     #define MARLIN_XS_KNAME MarlinCPF
   #endif
 #endif
+// [ZPW13 cuda-zpw13 2026-10-15] 13-bit ZPP group-word twins (DESIGN-ZPW13.v1). A TU that defines MARLIN_ZPW13_TWIN 1 next to
+// MARLIN_ZPPACK_TWIN 1 (generate_kernels.py generate_zpw13_twins -> sm80_kernel_zpw13*_bfloat16.cu, sm80_kernel_cpf_zpw13*_bfloat16.cu)
+// compiles the ZPP twin of its family -- with its TPF tail / CPF prologue when the TU also defines those -- reading the L64-13b scale
+// stream (v1.3): per (64-column tile, k-group) a 104-byte unit = 26 u32, tile-major: u32 2 cc, 2 cc + 1 = code words 0, 1 of lane chunk
+// cc (the 96-bit chunk of its eight 12-bit codes), u32 16 + cc = its word 2, u32 24 + w = the flips of warp column half w with bit
+// 8 i + lg = the flip of word i of lane group lg; zp = z0 + flip (the W4R2 zero points are two adjacent values). Changes v its ZPP
+// sibling: the scale cp.async copies 13 x 16 B (2 groups per stage) or 13 x 8 B (1 group) per 64-column tile; fetch_scales_to_registers
+// loads the chunk's words 0, 1 (8 B) and 2 instead of the int4 of 16-bit words; fetch_zp_to_registers loads the flip word and keeps the
+// lane group's 4 flips as bytes ((w >> lg) & 0x01010101) instead of the int2; matmul_a8 takes the 8 codes out of the 12-bit fields (the
+// same u -> 4096 restore) and subtracts rz0 + the PRMT-replicated flip byte (== 0x01010101 * (z0 + flip), the value sub_zp_and_dequant
+// subtracts). Same smem layout and size (the 13-bit stage fits in the int16 stage), the same barriers, the same values. z0 arrives in
+// tile_major bits 16..19 next to ZPPACK's u.
+#ifndef MARLIN_ZPW13_TWIN
+  #define MARLIN_ZPW13_TWIN 0
+#endif
+#if MARLIN_ZPW13_TWIN
+  #if !MARLIN_ZPPACK_TWIN
+    #error "[ZPW13] a ZPW13 twin is a ZPP twin: define MARLIN_ZPPACK_TWIN 1 too"
+  #endif
+  #undef MARLIN_XS_KNAME
+  #if MARLIN_CPF_TWIN && MARLIN_TPF_TWIN
+    #if MARLIN_XS_TWIN
+      #define MARLIN_XS_KNAME MarlinXSZPW13CPFTPF(const MarlinTpfDesc tpf, MARLIN_TPF_REST
+    #else
+      #define MARLIN_XS_KNAME MarlinZPW13CPFTPF(const MarlinTpfDesc tpf, MARLIN_TPF_REST
+    #endif
+  #elif MARLIN_CPF_TWIN
+    #if MARLIN_XS_TWIN
+      #define MARLIN_XS_KNAME MarlinXSZPW13CPF
+    #else
+      #define MARLIN_XS_KNAME MarlinZPW13CPF
+    #endif
+  #elif MARLIN_TPF_TWIN
+    #if MARLIN_XS_TWIN
+      #define MARLIN_XS_KNAME MarlinXSZPW13TPF(const MarlinTpfDesc tpf, MARLIN_TPF_REST
+    #else
+      #define MARLIN_XS_KNAME MarlinZPW13TPF(const MarlinTpfDesc tpf, MARLIN_TPF_REST
+    #endif
+  #elif MARLIN_XS_TWIN
+    #define MARLIN_XS_KNAME MarlinXSZPW13
+  #else
+    #define MARLIN_XS_KNAME MarlinZPW13
+  #endif
+#endif
 __global__ void MARLIN_XS_KNAME(
     const int4* __restrict__ A0,  // fp16 input matrix of shape mxk
     const int4* __restrict__ B,   // 4bit quantized weight matrix of shape kxn
@@ -1028,6 +1075,11 @@ __global__ void MARLIN_XS_KNAME(
                     (group_blocks == 2 || group_blocks == 4),
                 "[0051 ZPPACK] ZPP twins cover kS8 x kU4 g32 / g64 only");
   const uint32_t zpp_u = (static_cast<uint32_t>(tile_major) >> 4) & 0xFFFu;
+  #if MARLIN_ZPW13_TWIN
+  // [ZPW13] z0 (the smaller of the two zero points) in tile_major bits 16..19; the twin covers g64 only
+  static_assert(group_blocks == 4, "[ZPW13] ZPW13 twins cover kS8 x kU4 g64 only");
+  const int zpw_z0 = static_cast<int>((static_cast<uint32_t>(tile_major) >> 16) & 0xFu);
+  #endif
   tile_major &= 0xF;
   // Packed-state guard: when the host packed this weight it wrote 0x05100000 | u into the first int of its zp array (never
   // read by a ZPP twin; 0x0510 has zero nibbles, which no served zero-point int has: zp = stored + 1 >= 1). Thread 0 loads it
@@ -1497,6 +1549,28 @@ __global__ void MARLIN_XS_KNAME(
           : 1;
   constexpr int s_sh_stage = s_tb_groups * s_sh_stride;
   int s_gl_rd_delta = s_gl_stride;
+  #if MARLIN_ZPW13_TWIN
+  // [ZPW13] L64-13 scale stream (DESIGN-ZPW13.v1 §5): unit (tile T, group g) = 104 B at byte (T * G + g) * 104. A stage holds, per
+  // 64-column tile p of the CTA, its s_tb_groups units back to back (p * s_tb_groups * 104): 13 copies of 16 B (2 groups) or 8 B
+  // (1 group) per tile. s_gl_rd holds this thread's BYTE offset (thread t < 13 * tiles: tile t / 13, chunk t % 13).
+  static_assert((s_tb_groups == 1 || s_tb_groups == 2) && thread_n_blocks % 4 == 0, "[ZPW13] 1 or 2 k-groups per stage, 64-column tiles");
+  constexpr int zpw_ntile = thread_n_blocks / 4;
+  constexpr int zpw_cp = s_tb_groups == 2 ? 16 : 8;
+  static_assert(13 * zpw_ntile <= threads && 13 * zpw_cp == s_tb_groups * 104 && zpw_ntile * s_tb_groups * 104 <= 16 * s_sh_stage,
+                "[ZPW13] the 13-bit stage must fit the int16 stage and the copying threads");
+  (void)s_gl_rd_delta;  // [ZPW13] the 16-bit stride is not used (the stream advances by 13 copies per stage)
+  static_assert(s_tb_groups * 104 == 13 * zpw_cp, "[ZPW13] a stage's units are 13 copies per tile");
+  const int zpw_g = prob_k / 64;
+  const bool zpw_wr_pred = threadIdx.x < 13 * zpw_ntile;
+  const int zpw_sh_wr = (static_cast<int>(threadIdx.x) / 13) * (s_tb_groups * 104) + (static_cast<int>(threadIdx.x) % 13) * zpw_cp;
+  // [ZPW13 v1.3] s_gl_rd counts zpw_cp-byte copies (an int4 / int2 index: one IMAD.WIDE per address). With 2 groups per stage the unit
+  // index is even (G even, k-group row 2 * row), so unit * 104 / 16 is exact.
+  auto zpw_gl_rd = [&](int col, int row) {
+    const unsigned unit = static_cast<unsigned>((zpw_ntile * col + static_cast<int>(threadIdx.x) / 13) * zpw_g +
+                                                (thread_k_blocks * row) / group_blocks);
+    return static_cast<int>(unit * 104u / zpw_cp) + static_cast<int>(threadIdx.x) % 13;
+  };
+  #endif
 
   constexpr int tb_n_warps = thread_n_blocks / (is_a_8bit ? 2 : 4);
 
@@ -1563,6 +1637,9 @@ __global__ void MARLIN_XS_KNAME(
                              threadIdx.x / s_sh_stride) +
               s_sh_stride * slice_col + threadIdx.x % s_sh_stride;
   }
+  #if MARLIN_ZPW13_TWIN
+  s_gl_rd = zpw_gl_rd(slice_col, slice_row);  // [ZPW13] byte offset of this thread's copy
+  #endif
   auto s_sh_wr = threadIdx.x;
   bool s_sh_wr_pred = threadIdx.x < s_sh_stage;
 
@@ -1634,6 +1711,17 @@ __global__ void MARLIN_XS_KNAME(
   // [0051 ZPPACK] the int2 of the scale stage holding this lane group's 4 zero-point nibbles: the warp's 32-word block starts
   // at int4 4 * (warp % tb_n_warps) (= s_sh_rd's), i.e. int2 8 * (warp % tb_n_warps); lane group lane / 4 takes int2 lane / 4.
   const int zpp_sh_rd = 8 * ((threadIdx.x / 32) % tb_n_warps) + (threadIdx.x % 32) / 4;
+  #endif
+  #if MARLIN_ZPW13_TWIN
+  // [ZPW13 v1.3] stage-relative u32 index of code words 0, 1 (8-B aligned pair) and of word 2 of this lane's chunk s_sh_rd (tile
+  // s_sh_rd / 8, chunk s_sh_rd % 8) and of its lane group's flip word (tile wm / 2, word wm % 2), unit row 0; + gl * 26 for group row gl.
+  // The lane group lg's flips are bits lg, 8 + lg, 16 + lg, 24 + lg of the flip word.
+  const int zpw_s_word = (s_sh_rd / 8) * s_tb_groups * 26 + 2 * (s_sh_rd % 8);
+  const int zpw_s_word2 = (s_sh_rd / 8) * s_tb_groups * 26 + 16 + s_sh_rd % 8;
+  const int zpw_z_word = (((threadIdx.x / 32) % tb_n_warps) / 2) * s_tb_groups * 26 + 24 + ((threadIdx.x / 32) % tb_n_warps) % 2;
+  const int zpw_lg = (threadIdx.x % 32) / 4;
+  const uint32_t zpw_rz0 = 0x01010101u * static_cast<uint32_t>(zpw_z0);
+  (void)zpp_sh_rd;  // [ZPW13] the 16-bit zp read index is not used (the flip word is read at zpw_z_word)
   #endif
 
   // Precompute which thread should not read memory in which iterations; this is
@@ -1831,10 +1919,21 @@ __global__ void MARLIN_XS_KNAME(
 
         // Only fetch scales if this tile starts a new group
         if (pipe % div_ceil(group_blocks, thread_k_blocks) == 0) {
+  #if MARLIN_ZPW13_TWIN
+          // [ZPW13] 13 x 16 B (2 groups) / 13 x 8 B (1 group) per 64-column tile of the tile-major L64-13b stream
+          if (zpw_wr_pred) {
+            if constexpr (zpw_cp == 16)
+              cp_async4(reinterpret_cast<char*>(sh_s_stage) + zpw_sh_wr, reinterpret_cast<const int4*>(scales_ptr) + s_gl_rd);
+            else
+              cp_async2_ca_pred(reinterpret_cast<char*>(sh_s_stage) + zpw_sh_wr, reinterpret_cast<const int2*>(scales_ptr) + s_gl_rd);
+          }
+          s_gl_rd += 13;
+  #else
           if (s_sh_wr_pred) {
             cp_async4(&sh_s_stage[s_sh_wr], &scales_ptr[s_gl_rd]);
           }
           s_gl_rd += s_gl_rd_delta * s_tb_groups;
+  #endif
         }
       }
 
@@ -1924,7 +2023,15 @@ __global__ void MARLIN_XS_KNAME(
       if (pipe % g == 0) {
         if (k % b_sh_wr_iters == 0) {
           int4* sh_s_stage = sh_s + s_sh_stage * (g * (pipe / g));
+  #if MARLIN_ZPW13_TWIN
+          // [ZPW13 v1.3] the chunk's code words 0, 1 (one 8-B load) and 2 (row 0)
+          const uint32_t* zs = reinterpret_cast<const uint32_t*>(sh_s_stage);
+          const uint2 z01 = *reinterpret_cast<const uint2*>(zs + zpw_s_word);
+          reinterpret_cast<int4*>(&frag_s[k % 2])[0] = make_int4(static_cast<int>(z01.x), static_cast<int>(z01.y),
+                                                                 static_cast<int>(zs[zpw_s_word2]), 0);
+  #else
           reinterpret_cast<int4*>(&frag_s[k % 2])[0] = sh_s_stage[s_sh_rd];
+  #endif
         } else {
           reinterpret_cast<int4*>(&frag_s[1])[0] =
               reinterpret_cast<int4*>(&frag_s[0])[0];
@@ -1940,8 +2047,16 @@ __global__ void MARLIN_XS_KNAME(
       int4* sh_s_stage = sh_s + s_sh_stage * pipe;
 
       if constexpr (!is_8bit_scale) {
+  #if MARLIN_ZPW13_TWIN
+        // [ZPW13 v1.3] the chunk's code words 0, 1 (one 8-B load) and 2 of group row cur_group_id (unit + cur_group_id * 26 words)
+        const uint32_t* zs = reinterpret_cast<const uint32_t*>(sh_s_stage) + cur_group_id * 26;
+        const uint2 z01 = *reinterpret_cast<const uint2*>(zs + zpw_s_word);
+        reinterpret_cast<int4*>(&frag_s[k % 2])[0] = make_int4(static_cast<int>(z01.x), static_cast<int>(z01.y),
+                                                               static_cast<int>(zs[zpw_s_word2]), 0);
+  #else
         reinterpret_cast<int4*>(&frag_s[k % 2])[0] =
             sh_s_stage[s_sh_rd + cur_group_id * s_sh_stride];
+  #endif
       } else {
         reinterpret_cast<int2*>(&frag_s[k % 2])[0] = reinterpret_cast<int2*>(
             sh_s_stage)[s_sh_rd + cur_group_id * (2 * s_sh_stride)];
@@ -1977,7 +2092,13 @@ __global__ void MARLIN_XS_KNAME(
   #if MARLIN_ZPPACK_TWIN
           // [0051 ZPPACK] the same k-group row of the SCALE stage (the cp.async group that carried the family's zp row)
           int4* sh_s_stage = sh_s + s_sh_stage * (g * (pipe / g));
+    #if MARLIN_ZPW13_TWIN
+          // [ZPW13 v1.4] the lane group's 4 zero points (row 0) as the bytes of .x: byte i = z0 + the flip of word i
+          frag_zz[k % 2].x =
+              static_cast<int>(((reinterpret_cast<const uint32_t*>(sh_s_stage)[zpw_z_word] >> zpw_lg) & 0x01010101u) + zpw_rz0);
+    #else
           frag_zz[k % 2] = reinterpret_cast<int2*>(sh_s_stage)[zpp_sh_rd];
+    #endif
   #else
           int4* sh_zp_stage = sh_zp + zp_sh_stage * (g * (pipe / g));
   #pragma unroll
@@ -1997,8 +2118,15 @@ __global__ void MARLIN_XS_KNAME(
 
   #if MARLIN_ZPPACK_TWIN
         // [0051 ZPPACK] the k-group row cur_group_id of the scale stage (fetch_scales_to_registers' row for this k)
+    #if MARLIN_ZPW13_TWIN
+        // [ZPW13 v1.4] the lane group's 4 zero points of group row cur_group_id as the bytes of .x (z0 + flip)
+        frag_zz[k % 2].x = static_cast<int>(
+            ((reinterpret_cast<const uint32_t*>(sh_s + s_sh_stage * pipe)[zpw_z_word + cur_group_id * 26] >> zpw_lg) & 0x01010101u) +
+            zpw_rz0);
+    #else
         int4* sh_s_stage = sh_s + s_sh_stage * pipe + cur_group_id * s_sh_stride;
         frag_zz[k % 2] = reinterpret_cast<int2*>(sh_s_stage)[zpp_sh_rd];
+    #endif
   #else
         int4* sh_zp_stage = sh_zp + zp_sh_stage * pipe;
 
@@ -2192,7 +2320,14 @@ __global__ void MARLIN_XS_KNAME(
         dequant_data(frag_b_quant[k2][0][j * 2 + 1],
                      reinterpret_cast<scalar_32bit_t*>(&frag_b) + 2);
       } else if (is_a_8bit && b_type.size_bits() == 4 && has_zp) {
-  #if MARLIN_ZPPACK_TWIN
+  #if MARLIN_ZPW13_TWIN
+        // [ZPW13 v1.4] byte 2 j + h of frag_zz .x = z0 + the flip of word 2 j + h; its PRMT replica == 0x01010101 * (z0 + flip), the
+        // value sub_zp_and_dequant subtracts
+        static_assert(std::is_same_v<scalar_32bit_t, int32_t> && dequant_skip_flop, "[ZPW13] the int8-activation kU4 dequant only");
+        const uint32_t zpw_b = static_cast<uint32_t>(frag_zz[k2].x);
+        zpw13::sub_rz_and_dequant(frag_b_quant[k2][0][j * 2], reinterpret_cast<int32_t*>(&frag_b), zpw13::rzb(zpw_b, 2 * j));
+        zpw13::sub_rz_and_dequant(frag_b_quant[k2][0][j * 2 + 1], reinterpret_cast<int32_t*>(&frag_b) + 2, zpw13::rzb(zpw_b, 2 * j + 1));
+  #elif MARLIN_ZPPACK_TWIN
         // [0051 ZPPACK] word 2 j + h of the lane group's int2 carries the family's nibble 4 * (warp % 2) + 2 j + h
         const int zpp_word = j == 0 ? frag_zz[k2].x : frag_zz[k2].y;
         int zp = (zpp_word >> 12) & 0xF;
@@ -2231,7 +2366,15 @@ __global__ void MARLIN_XS_KNAME(
         if (group_blocks == 2 || k == 1) {
           if constexpr (a_type == vllm::kS8) {
             int2 s_vals[2];
-  #if MARLIN_ZPPACK_TWIN
+  #if MARLIN_ZPW13_TWIN
+            // [ZPW13] fields 4 j .. 4 j + 3 of the chunk's 3 sub-plane words (frag_s words 0..2); the same u -> 4096 restore
+            auto zpp_code = [&](uint32_t f) { return static_cast<int>(f == zpp_u ? 4096u : f); };
+            const uint32_t zw0 = reinterpret_cast<const uint32_t*>(&frag_s[k2])[0];
+            const uint32_t zw1 = reinterpret_cast<const uint32_t*>(&frag_s[k2])[1];
+            const uint32_t zw2 = reinterpret_cast<const uint32_t*>(&frag_s[k2])[2];
+            s_vals[0] = {zpp_code(zpw13::field(4 * j, zw0, zw1, zw2)), zpp_code(zpw13::field(4 * j + 1, zw0, zw1, zw2))};
+            s_vals[1] = {zpp_code(zpw13::field(4 * j + 2, zw0, zw1, zw2)), zpp_code(zpw13::field(4 * j + 3, zw0, zw1, zw2))};
+  #elif MARLIN_ZPPACK_TWIN
             // [0051 ZPPACK] code = the low 12 bits of the word, u -> 4096 (the family reads the int16 word, 0 .. 4096)
             auto zpp_code = [&](uint32_t f) { return static_cast<int>(f == zpp_u ? 4096u : f); };
             const uint32_t zpp_w0 = *reinterpret_cast<uint32_t*>(&frag_s[k2][j * 2][0]);
@@ -2859,7 +3002,12 @@ __global__ void MARLIN_XS_KNAME(
   }
   #endif
   #if MARLIN_ZPPACK_TWIN
+    #if MARLIN_ZPW13_TWIN
+  // [ZPW13] the host wrote 0x0D100000 | z0 << 12 | u (zero nibbles: no served zp int; differs from ZPPACK's 0x05100000 | u both ways)
+  if (threadIdx.x == 0 && zpp_seen != static_cast<int>(0x0D100000u | (static_cast<uint32_t>(zpw_z0) << 12) | zpp_u)) __trap();
+    #else
   if (threadIdx.x == 0 && zpp_seen != static_cast<int>(0x05100000u | zpp_u)) __trap();  // [0051 ZPPACK] guard (see top)
+    #endif
   #endif
 
   // Main loop.
@@ -2964,6 +3112,9 @@ __global__ void MARLIN_XS_KNAME(
                                   threadIdx.x / zp_sh_stride) +
                   zp_sh_stride * n_col + threadIdx.x % zp_sh_stride;
             }
+    #if MARLIN_ZPW13_TWIN
+            s_gl_rd = zpw_gl_rd(n_col, n_row);  // [ZPW13] the predicted segment's byte offset
+    #endif
     #pragma unroll
             for (int i = 0; i < stages - 1; i++) {
               fetch_to_shared(i, i, i < n_iters);
@@ -3253,6 +3404,9 @@ __global__ void MARLIN_XS_KNAME(
                               threadIdx.x / zp_sh_stride) +
               zp_sh_stride * slice_col + threadIdx.x % zp_sh_stride;
         }
+  #if MARLIN_ZPW13_TWIN
+        s_gl_rd = zpw_gl_rd(slice_col, slice_row);  // [ZPW13] the new slice's byte offset
+  #endif
         start_pipes();
       }
     }

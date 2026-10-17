@@ -622,7 +622,7 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
     # Family-conditional 12.0f (one cubin for SM12x family) requires CUDA >= 13.0;
     # fall back to architecture-specific 12.0a;12.1a on CUDA < 13.0 (e.g. 12.8).
     if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 13.0)
-      cuda_archs_loose_intersection(MARLIN_ARCHS "8.0+PTX;12.0f" "${CUDA_ARCHS}")
+      cuda_archs_loose_intersection(MARLIN_ARCHS "8.9;12.0f" "${CUDA_ARCHS}")
     else()
       cuda_archs_loose_intersection(MARLIN_ARCHS "8.0+PTX;12.0a;12.1a" "${CUDA_ARCHS}")
     endif()
@@ -630,7 +630,7 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
     cuda_archs_loose_intersection(MARLIN_SM75_ARCHS "7.5" "${CUDA_ARCHS}")
     # marlin arches for bf16 output (we need 9.0 for bf16 atomicAdd PTX)
     if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 13.0)
-      cuda_archs_loose_intersection(MARLIN_BF16_ARCHS "8.0+PTX;9.0+PTX;12.0f" "${CUDA_ARCHS}")
+      cuda_archs_loose_intersection(MARLIN_BF16_ARCHS "8.9;9.0+PTX;12.0f" "${CUDA_ARCHS}")
     else()
       cuda_archs_loose_intersection(MARLIN_BF16_ARCHS "8.0+PTX;9.0+PTX;12.0a;12.1a" "${CUDA_ARCHS}")
     endif()
@@ -707,6 +707,23 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
             PROPERTIES COMPILE_FLAGS "-static-global-template-stub=false")
         endif()
         list(APPEND VLLM_STABLE_EXT_SRC ${MARLIN_TEMPLATE_BF16_KERNEL_SRC})
+
+        # [0100 PIN80] the instantiations generate_kernels.py pins to sm_80 SASS (sm80pin_kernel_*.cu): compiled with the
+        # served "8.0+PTX" whatever MARLIN_BF16_ARCHS is (v4-WIDE: every bf16 wide tile, admission / prefill only on X2).
+        cuda_archs_loose_intersection(MARLIN_PIN80_ARCHS "8.0+PTX" "${CUDA_ARCHS}")
+        file(GLOB MARLIN_PIN80_KERNEL_SRC "csrc/libtorch_stable/quantization/marlin/sm80pin_kernel_*.cu")
+        if (MARLIN_PIN80_KERNEL_SRC AND MARLIN_PIN80_ARCHS)
+          set_gencode_flags_for_srcs(
+            SRCS "${MARLIN_PIN80_KERNEL_SRC}"
+            CUDA_ARCHS "${MARLIN_PIN80_ARCHS}")
+          if(${CMAKE_CUDA_COMPILER_VERSION} VERSION_GREATER_EQUAL 12.8)
+            set_source_files_properties(${MARLIN_PIN80_KERNEL_SRC}
+              PROPERTIES COMPILE_FLAGS "-static-global-template-stub=false")
+          endif()
+          list(APPEND VLLM_STABLE_EXT_SRC ${MARLIN_PIN80_KERNEL_SRC})
+        elseif (MARLIN_PIN80_KERNEL_SRC)
+          message(FATAL_ERROR "[0100 PIN80] sm80pin_kernel_*.cu generated but no 8.0 arch in CUDA_ARCHS=${CUDA_ARCHS}")
+        endif()
       endif()
 
       if (MARLIN_SM75_ARCHS)

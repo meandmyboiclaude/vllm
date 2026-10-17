@@ -72,6 +72,16 @@
 #ifndef MARLIN_ZPPACK
   #define MARLIN_ZPPACK 1
 #endif
+// [ZPW13 cuda-zpw13 2026-10-15] Build switch for the 13-bit ZPP group-word twins (default 1): generate_kernels.py's TUs
+// sm80_kernel_zpw13*_<c_type>.cu / sm80_kernel_cpf_zpw13*_<c_type>.cu instantiate MarlinZPW13 / MarlinXSZPW13 (+ TPF / CPF forms,
+// MARLIN_ZPW13_TWIN 1) under it and marlin.cu carries the L64-13 repack and the twin maps (DESIGN-ZPW13.v1). The RUN switch is the env
+// VLLM_MARLIN_ZPW13 (unset/0 = OFF = the 0051 ZPPACK packs and launches, byte for byte). Needs MARLIN_ZPPACK.
+#ifndef MARLIN_ZPW13
+  #define MARLIN_ZPW13 1
+#endif
+#if MARLIN_ZPW13 && !MARLIN_ZPPACK
+  #error "[ZPW13] MARLIN_ZPW13 needs MARLIN_ZPPACK"
+#endif
 // [0056 IRED cuda 10-10, BUG-559 Marlin site] Build switch (default 1 in an IRED build): int8-activation GROUPED instances
 // (a_type kS8, group_blocks != -1) reduce split-K partials in int32 and convert to fp32 once, in the column's final slice.
 // The group scales are int16 codes (marlin_act_int8_process_scales: code = round(s / s.max() * 4096), the one fp factor per tensor

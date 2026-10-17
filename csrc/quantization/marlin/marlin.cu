@@ -1954,6 +1954,24 @@ static int kt_zpg_mode() {
   return -1;
 }
 static const int KT_ZPG = kt_zpg_mode();
+  #if MARLIN_ZPW13
+// [ZPW13 cuda-zpw13 2026-10-15] VLLM_MARLIN_ZPW13 = unset / 0 (OFF: every weight packs the 0051 16-bit words) | 1 (every g64 weight packs
+// the 13-bit L64-13 stream [flip:1][code:12] and runs the ZPW13 twins; it must be W4R2 -- zero points 7/8, N % 64 == 0, G even -- else the
+// load refuses (ZPW13 REFUSED, fail-closed); non-g64 weights keep the 0051 words) | else a hard error at the ZPPACK gate. DESIGN-ZPW13.v1.
+static int kt_zpw13_mode() {
+  const char* v = getenv("VLLM_MARLIN_ZPW13");
+  if (v == nullptr || *v == '\0' || (v[0] == '0' && v[1] == '\0')) return 0;
+  if (v[0] == '1' && v[1] == '\0') return 1;
+  return -1;
+}
+static const int KT_ZPW13 = kt_zpw13_mode();
+  #else
+static const int KT_ZPW13 = 0;
+  #endif
+// The packed-state guard of a registry state st: 0x05100000 | u (0051) or, for a ZPW13 state 0x10000 | z0 << 12 | u, 0x0D100000 | z0 << 12 | u.
+static inline int32_t kt_zpp_magic(int st) {
+  return static_cast<int32_t>(st >= 0x10000 ? (0x0D100000u | (static_cast<uint32_t>(st) & 0xFFFFu)) : (0x05100000u | static_cast<uint32_t>(st)));
+}
 struct KtZppGate {
   bool all_n = false;
   std::vector<int> ns;
@@ -2015,6 +2033,14 @@ static const KtZppGate& kt_zpp_gate() {
     STD_TORCH_CHECK(KT_ZPG >= 0, "VLLM_MARLIN_ZPPACK_ZPGUARD: malformed value '", zg != nullptr ? zg : "", "' (want 0 or 1)");
     if (KT_ZPG == 1)
       fprintf(stderr, "[marlin-ZPPACK] ZPGUARD ARMED VLLM_MARLIN_ZPPACK_ZPGUARD=1 (a zp array shared by two live scale tensors refuses)\n");
+  #if MARLIN_ZPW13
+    // [ZPW13] strict switch, read with the ZPPACK gate (only while ZPPACK is armed); OFF prints nothing
+    const char* zw = getenv("VLLM_MARLIN_ZPW13");
+    STD_TORCH_CHECK(KT_ZPW13 >= 0, "VLLM_MARLIN_ZPW13: malformed value '", zw != nullptr ? zw : "", "' (want 0 or 1)");
+    if (KT_ZPW13 == 1)
+      fprintf(stderr, "[marlin-ZPPACK] ZPW13 ARMED VLLM_MARLIN_ZPW13=1 (every g64 weight packs 13-bit words [flip:1][code:12], L64-13, "
+                      "and must be W4R2: zero points 7/8, else the load refuses; non-g64 weights keep the 0051 words)\n");
+  #endif
     return r;
   }();
   return g;
@@ -2046,6 +2072,55 @@ static uint64_t kt_zpp_pack(const int16_t* codes, const int32_t* zp, int G, int 
   }
   return h;
 }
+  #if MARLIN_ZPW13
+// [ZPW13 cuda-zpw13 2026-10-15] The L64-13 repack, host side (DESIGN-ZPW13.v1 §5; numpy twin zpw13/emu/zpw13_lib.py zpw13_pack). words
+// [G, N] = this tensor's 0051 ZPP words ([zp:4][code:12], 4096 already stored as u) -> out = (N / 64) * G units of 26 u32, tile-major
+// (unit (T, g) at u32 (T * G + g) * 26), layout L64-13b (v1.3): word i (0..2) of chunk cc (0..7) = bits 32 i .. 32 i + 31 of the
+// 96-bit value sum_e fld[g][64 T + 8 cc + e] << 12 e (fld = the word's low 12 bits) sits at u32 2 cc + i (i < 2) / 16 + cc (i = 2);
+// u32 24 + w = the flips (zp nibble - z0) of words 64 T + 32 w .. + 31, word 64 T + 32 w + 4 lg + i at bit 8 i + lg. Qualifies iff N % 64 == 0, G even (16-B copies of 2-group stages) and the zero points are {z0} or {z0, z0 + 1},
+// z0 <= 14; else returns false with the reason (the weight keeps the 0051 words).
+static bool kt_zpw13_pack(const uint16_t* words, int G, int N, uint32_t* out, int* z0_out, long long* flips_out, const char** why) {
+  if (N % 64 != 0) { *why = "N % 64 != 0"; return false; }
+  if (G % 2 != 0) { *why = "G odd"; return false; }
+  int lo = 15, hi = 0;
+  for (size_t i = 0; i < (size_t)G * N; i++) {
+    const int z = words[i] >> 12;
+    lo = z < lo ? z : lo;
+    hi = z > hi ? z : hi;
+  }
+  if (hi - lo > 1) { *why = "zero points span more than two adjacent values"; return false; }
+  if (lo > 14) { *why = "z0 > 14"; return false; }
+  long long flips = 0;
+  for (int T = 0; T < N / 64; T++)
+    for (int g = 0; g < G; g++) {
+      const uint16_t* w = words + (size_t)g * N + 64 * (size_t)T;
+      uint32_t* u = out + ((size_t)T * G + g) * 26;
+      for (int cc = 0; cc < 8; cc++) {
+        uint32_t f[8];
+        for (int e = 0; e < 8; e++) f[e] = w[8 * cc + e] & 0xFFFu;
+        u[2 * cc] = f[0] | (f[1] << 12) | ((f[2] & 0xFFu) << 24);
+        u[2 * cc + 1] = (f[2] >> 8) | (f[3] << 4) | (f[4] << 16) | ((f[5] & 0xFu) << 28);
+        u[16 + cc] = (f[5] >> 4) | (f[6] << 8) | (f[7] << 20);
+      }
+      u[24] = 0;
+      u[25] = 0;
+      for (int b = 0; b < 64; b++) {
+        const uint32_t fl = static_cast<uint32_t>((w[b] >> 12) - lo);
+        u[24 + b / 32] |= fl << (8 * (b % 4) + (b % 32) / 4);
+        flips += fl;
+      }
+    }
+  *z0_out = lo;
+  *flips_out = flips;
+  return true;
+}
+// zw64 tell: sum_i (out[i] + 1) * (splitmix64(i) | 1) over the u32 stream (the emulator prints the same value per tensor)
+static uint64_t kt_zpw13_hash(const uint32_t* out, size_t n) {
+  uint64_t h = 0;
+  for (size_t i = 0; i < n; i++) h += ((uint64_t)out[i] + 1) * (kt_zpp_splitmix64(i) | 1ull);
+  return h;
+}
+  #endif
 // [0060 ZPPGUARD] one registration per zero-point array per device (kt_zpp_state's lock guards the map)
 struct KtZpgReg {
   const void* s;
@@ -2089,7 +2164,7 @@ static uint64_t kt_zpg_check(const void* b_s, const void* zp, int G, int N, int 
   }
   bool live = !r.known || zps == nullptr;
   if (!live && r.numel == static_cast<long long>(nz))
-    live = d == r.d0 || (r.st >= 0 && zps[0] == static_cast<int32_t>(0x05100000u | static_cast<uint32_t>(r.st)) &&
+    live = d == r.d0 || (r.st >= 0 && zps[0] == kt_zpp_magic(r.st) &&
                          kt_zpg_fnv(zps, nz, true, r.zp0) == r.d0);
   if (live) {
     snprintf(msg, sizeof msg, "[marlin-ZPPACK] ZPGUARD REFUSED: zp array %p (numel %lld, dev %d) is shared by LIVE scale tensors %p "
@@ -2163,6 +2238,50 @@ static int kt_zpp_state(void* b_s, void* zp, int G, int N, int K, cudaStream_t s
       why = "no unused code u in 0..4095 (kept served)";
     } else {
       const uint64_t h = kt_zpp_pack(codes.data(), zps.data(), G, N, u, words.data());
+  #if MARLIN_ZPW13
+      // [ZPW13] a qualifying g64 weight stores the L64-13 stream (G * N * 13 / 8 bytes, in place at the head of the scale tensor) and the
+      // ZPW13 guard; registry state 0x10000 | z0 << 12 | u (tile_major << 4 carries u, z0 and the flag; the twin masks u and z0)
+      bool zpw_done = false;
+      if (KT_ZPW13 == 1) {
+        const char* zwhy = "not g64 (K != 64 * G)";
+        int z0 = 0;
+        long long flips = 0;
+        std::vector<uint32_t> w13(nw * 13 / 32);
+        const bool g64 = K == 64 * G;
+        const bool packed13 = g64 && kt_zpw13_pack(words.data(), G, N, w13.data(), &z0, &flips, &zwhy);
+        // [ZPW13 v1.2, corruption-1 pre-review 10-15 conditions 1-2] fail-closed: with the knob on, EVERY g64 weight must be W4R2 --
+        // zero points within {7, 8} (stored {6, 7}), N % 64 == 0, G even -- or the load refuses (named FATAL, no fallback, no mask, no
+        // clamp). Only a non-g64 weight (lm_head g32) keeps the 0051 words, with the SKIP tell.
+        STD_TORCH_CHECK(!g64 || (packed13 && (z0 == 7 || (z0 == 8 && flips == 0))),
+                        "[marlin-ZPPACK] ZPW13 REFUSED N=", N, " K=", K, " G=", G, ": ",
+                        !packed13 ? zwhy : "zero points outside {7, 8} (stored {6, 7})",
+                        " -- VLLM_MARLIN_ZPW13=1 packs only g64 W4R2 weights; unset it for this arm");
+        if (packed13) {
+          const int st13 = 0x10000 | (z0 << 12) | u;
+          const int32_t magic13 = kt_zpp_magic(st13);
+          STD_TORCH_CHECK(cudaMemcpyAsync(b_s, w13.data(), w13.size() * 4, cudaMemcpyHostToDevice, stream) == cudaSuccess &&
+                              cudaMemcpyAsync(zp, &magic13, 4, cudaMemcpyHostToDevice, stream) == cudaSuccess &&
+                              cudaStreamSynchronize(stream) == cudaSuccess,
+                          "[marlin-ZPPACK] ZPW13 pack copy failed N=", N, " K=", K);
+          st = st13;
+          npacked++;
+          zp_bytes_off += (long long)nw / 2;
+          static long long zpw_s_bytes_off = 0;
+          static int n13 = 0;
+          zpw_s_bytes_off += (long long)nw * 2 - (long long)w13.size() * 4;
+          n13++;
+          fprintf(stderr,
+                  "[marlin-ZPPACK] PACK13 N=%d K=%d G=%d u=%d z0=%d flips=%lld c4096=%lld distinct=%d zpk64=%016llx zw64=%016llx guard=%08x "
+                  "(#%d, zpw13 #%d, zp bytes not read %lld, scale bytes not read %lld)\n",
+                  N, K, G, u, z0, flips, hist[4096], distinct, (unsigned long long)h,
+                  (unsigned long long)kt_zpw13_hash(w13.data(), w13.size()), (unsigned)magic13, npacked, n13, zp_bytes_off, zpw_s_bytes_off);
+          zpw_done = true;
+        } else {
+          fprintf(stderr, "[marlin-ZPPACK] ZPW13 SKIP N=%d K=%d G=%d: %s (0051 words)\n", N, K, G, zwhy);
+        }
+      }
+      if (!zpw_done) {
+  #endif
       // the packed-state guard the twin checks (marlin_template.h zpp_seen): the zp array is never read again for this weight
       const int32_t magic = static_cast<int32_t>(0x05100000u | static_cast<uint32_t>(u));
       STD_TORCH_CHECK(cudaMemcpyAsync(b_s, words.data(), nw * 2, cudaMemcpyHostToDevice, stream) == cudaSuccess &&
@@ -2175,6 +2294,9 @@ static int kt_zpp_state(void* b_s, void* zp, int G, int N, int K, cudaStream_t s
       fprintf(stderr,
               "[marlin-ZPPACK] PACK N=%d K=%d G=%d u=%d c4096=%lld distinct=%d zpk64=%016llx guard=%08x (#%d, zp bytes not read %lld)\n",
               N, K, G, u, hist[4096], distinct, (unsigned long long)h, (unsigned)magic, npacked, zp_bytes_off);
+  #if MARLIN_ZPW13
+      }
+  #endif
     }
     if (KT_ZPG == 1) kt_zpg_record(b_s, zp, G, N, K, zps.data(), nw / 8, zgd, st);  // [0060 ZPPGUARD] the owner, after its decision
   }
@@ -2210,6 +2332,9 @@ static void kt_zpp_tell_on(int m, int n, int k, const char* twin) {
   #include "kernel_selector_zpp.h"
   #if MARLIN_TAILPF
     #include "kernel_selector_zpptpf.h"  // [0052 ZPPTPF] get_marlin_zpptpf_twin: the TAILPF twin of a ZPP twin
+  #endif
+  #if MARLIN_ZPW13
+    #include "kernel_selector_zpw13.h"  // [ZPW13] get_marlin_zpw13_twin / zpw13tpf / zpw13_cpf / zpw13_cpf_tpf
   #endif
 #endif
 #if MARLIN_COLFPF
@@ -2972,6 +3097,17 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
                       prob_m_split, ", thread_m_blocks ", thread_m_blocks, ", thread_n ", thread_n, ", thread_k ", thread_k,
                       ", threads ", num_threads, ", group_blocks ", group_blocks, ", XS ", (int)kt_xs_selected,
                       ") selected a kernel with no ZPP twin");
+  #if MARLIN_ZPW13
+      // [ZPW13] a 13-bit packed weight (state >= 0x10000) runs the ZPW13 twin of the ZPP twin; there is no fallback (the scale
+      // tensor holds the L64-13 stream): no ZPW13 twin = a hard error
+      const bool kt_zpw13_on = kt_zpp_u >= 0x10000;
+      if (kt_zpw13_on) {
+        const char* zpp_sib = zpp_name;
+        zpp_kernel = get_marlin_zpw13_twin(zpp_kernel, &zpp_name);
+        STD_TORCH_CHECK(zpp_kernel != nullptr, "[marlin-ZPPACK] ZPW13-packed weight N=", prob_n, " K=", prob_k, ": the ZPP twin ",
+                        zpp_sib, " (M ", prob_m_split, ") has no ZPW13 twin");
+      }
+  #endif
       kt_zpp_tell_on(prob_m_split, prob_n, prob_k, zpp_name);
       kernel = zpp_kernel;
       tile_major = (tile_major & 0xF) | (kt_zpp_u << 4);
@@ -2979,7 +3115,12 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
       // [0052 ZPPTPF] the TPF twin chosen above wraps the FAMILY kernel, which would read these packed words as the family's
       // words: take the TPF twin of the ZPP twin instead (nullptr = none: the launch keeps its ZPP twin and still reports
       // itself to the successor registry). TAILPF unarmed: tpf_kernel stays nullptr (one untaken branch).
+    #if MARLIN_ZPW13
+      if (KT_TPF) tpf_kernel = kt_zpw13_on ? get_marlin_zpw13tpf_twin(zpp_kernel, &tpf_name)  // [ZPW13] the ZPW13TPF twin
+                                           : get_marlin_zpptpf_twin(zpp_kernel, &tpf_name);
+    #else
       if (KT_TPF) tpf_kernel = get_marlin_zpptpf_twin(zpp_kernel, &tpf_name);
+    #endif
   #endif
   #if MARLIN_FOLDS
       // [0051 ZPPACK-4 BUG-554] the 0048 FOLDS launch passes kt_folds_tm, snapshotted BEFORE the ZPP u bits above; without this
@@ -3002,12 +3143,18 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
         kt_colf = true;
         const char* cpf_name = "none";
         MarlinFuncPtr cpf_kernel = get_marlin_cpf_twin(kernel, &cpf_name);
+  #if MARLIN_ZPPACK && MARLIN_ZPW13
+        if (cpf_kernel == nullptr) cpf_kernel = get_marlin_zpw13_cpf_twin(kernel, &cpf_name);  // [ZPW13] a ZPW13 twin's CPF twin
+  #endif
         if (cpf_kernel != nullptr) kernel = cpf_kernel;
         const char* cpf_tpf_name = "none";
         bool cpf_tpf_on = false;
   #if MARLIN_TAILPF
         if (tpf_kernel != nullptr) {
           MarlinTpfFuncPtr cpf_tpf = get_marlin_cpf_tpf_twin(tpf_kernel, &cpf_tpf_name);
+    #if MARLIN_ZPPACK && MARLIN_ZPW13
+          if (cpf_tpf == nullptr) cpf_tpf = get_marlin_zpw13_cpf_tpf_twin(tpf_kernel, &cpf_tpf_name);  // [ZPW13] ZPW13TPF -> ZPW13CPFTPF
+    #endif
     #if MARLIN_KU3STPF
           // [0063 KU3STPF] a kU3S TPF twin's CPF twin (none: the launch keeps its TPF twin, TAILPF precedence; Part C below still puts
           // the factor in the predecessor's tail). Knob off: tpf_kernel is nullptr for every kU3S launch, this line is never reached.
@@ -3185,7 +3332,14 @@ void marlin_mm(const void* A, const void* B, void* C, void* C_tmp, void* b_bias,
       tpf_self.k = prob_k;
       tpf_self.m = prob_m_split;
       const int tpf_pack = 32 / num_bits;
-      const long long tpf_s_bytes = (long long)num_groups * prob_n * (long long)s_type.size_bits() / 8;
+      const long long tpf_s_bytes_16 = (long long)num_groups * prob_n * (long long)s_type.size_bits() / 8;
+  #if MARLIN_ZPPACK && MARLIN_ZPW13
+      // [ZPW13] a 13-bit packed weight's scale stream is G * N * 13 / 8 bytes at the head of the tensor: its predecessor's tail
+      // prefetches that span only (the 3/16 tail is dead)
+      const long long tpf_s_bytes = kt_zpp_u >= 0x10000 ? (long long)num_groups * prob_n * 13 / 8 : tpf_s_bytes_16;
+  #else
+      const long long tpf_s_bytes = tpf_s_bytes_16;
+  #endif
       const long long tpf_zp_bytes = !has_zp ? 0
                                      : is_zp_float ? (long long)num_groups * prob_n * 2
                                                    : (long long)num_groups * (prob_n / tpf_pack) * 4;

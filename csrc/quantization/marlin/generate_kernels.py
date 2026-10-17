@@ -981,7 +981,9 @@ def generate_engage_names(here):
     # [0061 COLFPF v2] kernel_selector_cpf.h last: its maps name the ZPP / ZPPTPF / XS siblings too, and a kernel keeps the place it
     # was first named at, so reading it last leaves every earlier line of kernel_engage_names.h where it was (CPF rows appended)
     # [0063 KU3STPF] kernel_selector_ku3stpf.h after it, for the same reason (its rows are appended after the CPF rows)
-    for h in sorted(sites, key=lambda x: (x != "kernel_selector.h", x == "kernel_selector_ku3stpf.h", x == "kernel_selector_cpf.h", x)):
+    # [ZPW13] kernel_selector_zpw13.h after both (its rows are appended last; every earlier line stays where it was)
+    for h in sorted(sites, key=lambda x: (x != "kernel_selector.h", x == "kernel_selector_zpw13.h", x == "kernel_selector_ku3stpf.h",
+                                          x == "kernel_selector_cpf.h", x)):
         feat, other = sites[h]
         assert other == own, f"[0047] {h} is included under {other}, kernel_engage_names.h under {own}"
         with open(os.path.join(here, h)) as f:
@@ -1570,6 +1572,143 @@ def generate_cpf_twins():
     with open(os.path.join(here, "kernel_selector_cpf.h"), "w") as f:
         f.write(selector)
 
+# [ZPW13 cuda-zpw13 2026-10-15] 13-bit ZPP group-word twins (DESIGN-ZPW13.v1): <family>ZPW13<...> = the ZPP twin of its family reading the
+# L64-13 scale stream ([flip:1][code:12] per k-group, 64-column tiles, tile-major) instead of the 16-bit ZPP words (the TU defines
+# MARLIN_ZPPACK_TWIN 1 + MARLIN_ZPW13_TWIN 1 + the family's macros), plus its TPF form (<family>ZPW13TPF, MARLIN_TPF_TWIN 1, the
+# ZPPTPF configs) and its CPF forms (<family>ZPW13CPF / <family>ZPW13CPFTPF at the CPF_SITES site of the matching ZPP CPF twin).
+# Configs = the g64 ZPP configs (group_blocks 4; g32 is lm_head, whose zero points are not two adjacent values). A ZPW13-packed
+# tensor has no served fallback, so every g64 ZPP config gets its ZPW13 twin (closure asserted against kernel_selector_zpp.h).
+# kernel_selector_zpw13.h: get_marlin_zpw13_twin (ZPP twin -> ZPW13 twin), get_marlin_zpw13tpf_twin (ZPW13 twin -> ZPW13TPF twin),
+# get_marlin_zpw13_cpf_twin / get_marlin_zpw13_cpf_tpf_twin (ZPW13 / ZPW13TPF -> their CPF twins). Every other TU is unchanged.
+ZPW13_TWINS = [tw for tw in ZPP_TWINS if tw[7] == 4]
+
+
+def generate_zpw13_twins():
+    here = os.path.dirname(__file__)
+    xs_cfgs = [t for t in ZPW13_TWINS if t in XS_TWINS]
+    tpf_cfgs = [t for t in ZPPTPF_TWINS if t[7] == 4 and ("Marlin", t) not in ZPPTPF_EXCLUDE]
+    tpf_xs = [t for t in ZPPTPF_TWINS if t[7] == 4 and t in XS_TWINS and ("MarlinXS", t) not in ZPPTPF_EXCLUDE]
+    inst_tpf = TEMPLATE.replace("( MARLIN_KERNEL_PARAMS )", "( MarlinTpfDesc, MARLIN_KERNEL_PARAMS )")
+    assert inst_tpf != TEMPLATE, "[ZPW13] TEMPLATE parameter list moved"
+    # (twin, sibling it maps from, TU name stem, macros, build guard, configs, ZPP CPF_SITES row name (CPF forms) or None, TPF signature,
+    #  selector function, sibling's selector file + the text that proves the sibling)
+    fams = [
+        ("MarlinZPW13", "MarlinZPP", "zpw13", ["MARLIN_ZPPACK_TWIN", "MARLIN_ZPW13_TWIN"], "MARLIN_ZPPACK && MARLIN_ZPW13",
+         ZPW13_TWINS, None, False, "zpw13", ("kernel_selector_zpp.h", "return MarlinZPP")),
+        ("MarlinXSZPW13", "MarlinXSZPP", "zpw13_xs", ["MARLIN_ZPPACK_TWIN", "MARLIN_ZPW13_TWIN", "MARLIN_XS_TWIN"],
+         "MARLIN_ZPPACK && MARLIN_ZPW13 && MARLIN_XSLICE", xs_cfgs, None, False, "zpw13", ("kernel_selector_zpp.h", "return MarlinXSZPP")),
+        ("MarlinZPW13TPF", "MarlinZPW13", "zpw13tpf", ["MARLIN_ZPPACK_TWIN", "MARLIN_ZPW13_TWIN", "MARLIN_TPF_TWIN"],
+         "MARLIN_ZPPACK && MARLIN_ZPW13 && MARLIN_TAILPF", tpf_cfgs, None, True, "zpw13tpf",
+         ("kernel_selector_zpptpf.h", "return MarlinZPPTPF")),
+        ("MarlinXSZPW13TPF", "MarlinXSZPW13", "zpw13tpf_xs", ["MARLIN_ZPPACK_TWIN", "MARLIN_ZPW13_TWIN", "MARLIN_TPF_TWIN", "MARLIN_XS_TWIN"],
+         "MARLIN_ZPPACK && MARLIN_ZPW13 && MARLIN_TAILPF && MARLIN_XSLICE", tpf_xs, None, True, "zpw13tpf",
+         ("kernel_selector_zpptpf.h", "return MarlinXSZPPTPF")),
+        ("MarlinZPW13CPF", "MarlinZPW13", "cpf_zpw13", ["MARLIN_ZPPACK_TWIN", "MARLIN_ZPW13_TWIN"],
+         "MARLIN_COLFPF && MARLIN_ZPPACK && MARLIN_ZPW13", ZPW13_TWINS, "MarlinZPPCPF", False, "zpw13_cpf", None),
+        ("MarlinXSZPW13CPF", "MarlinXSZPW13", "cpf_zpw13_xs", ["MARLIN_ZPPACK_TWIN", "MARLIN_ZPW13_TWIN", "MARLIN_XS_TWIN"],
+         "MARLIN_COLFPF && MARLIN_ZPPACK && MARLIN_ZPW13 && MARLIN_XSLICE", xs_cfgs, "MarlinXSZPPCPF", False, "zpw13_cpf", None),
+        ("MarlinZPW13CPFTPF", "MarlinZPW13TPF", "cpf_zpw13tpf", ["MARLIN_ZPPACK_TWIN", "MARLIN_ZPW13_TWIN", "MARLIN_TPF_TWIN"],
+         "MARLIN_COLFPF && MARLIN_ZPPACK && MARLIN_ZPW13 && MARLIN_TAILPF", tpf_cfgs, "MarlinZPPCPFTPF", True, "zpw13_cpf_tpf", None),
+        ("MarlinXSZPW13CPFTPF", "MarlinXSZPW13TPF", "cpf_zpw13tpf_xs",
+         ["MARLIN_ZPPACK_TWIN", "MARLIN_ZPW13_TWIN", "MARLIN_TPF_TWIN", "MARLIN_XS_TWIN"],
+         "MARLIN_COLFPF && MARLIN_ZPPACK && MARLIN_ZPW13 && MARLIN_TAILPF && MARLIN_XSLICE", tpf_xs, "MarlinXSZPPCPFTPF", True,
+         "zpw13_cpf_tpf", None),
+    ]
+    maps = {"zpw13": [], "zpw13tpf": [], "zpw13_cpf": [], "zpw13_cpf_tpf": []}
+    if SUPPORT_SM80:
+        sels = {}
+        for sel in ("kernel_selector_zpp.h", "kernel_selector_zpptpf.h"):
+            with open(os.path.join(here, sel)) as f:
+                sels[sel] = f.read()
+        # closure: every g64 ZPP twin the ZPP selector maps to has a ZPW13 twin (a ZPW13-packed launch has no fallback)
+        zpp_g64 = set(re.findall(r"return (MarlinZPP|MarlinXSZPP)<vllm::kS8\.id\(\), vllm::kU4\.id\(\), vllm::kBFloat16\.id\(\), "
+                                 r"vllm::kBFloat16\.id\(\), (\d+), (\d+), (\d+), (\d+), false, 4, 4, false>;", sels["kernel_selector_zpp.h"]))
+        have = {("MarlinZPP", str(t[3]), str(t[4]), str(t[5]), str(t[6])) for t in ZPW13_TWINS} | \
+               {("MarlinXSZPP", str(t[3]), str(t[4]), str(t[5]), str(t[6])) for t in xs_cfgs}
+        assert zpp_g64 == have, ("[ZPW13] the g64 ZPP twin set is not covered", sorted(zpp_g64 - have), sorted(have - zpp_g64))
+        for twin, sib, stem, macros, guard, cfgs, cpf_row, tpf, fn, proof in fams:
+            templates, fmaps = {}, []
+            for tw in cfgs:
+                site = None
+                if cpf_row is not None:
+                    site = CPF_SITES.get((cpf_row, tw))
+                    if site is None:
+                        continue          # the ZPP sibling has no CPF twin at this config: neither has the ZPW13 one
+                a_type, b_type, c_type, threads, m_blocks, n_blocks, k_blocks, group_blocks = tw
+                assert (a_type, b_type, c_type, group_blocks) == ("kS8", "kU4", "kBFloat16", 4), ("[ZPW13] not a g64 ZPP config", tw)
+                ids = dict(
+                    a_type_id=f"vllm::{a_type}.id()",
+                    b_type_id=f"vllm::{b_type}.id()",
+                    c_type_id=f"vllm::{c_type}.id()",
+                    s_type_id=f"vllm::{c_type}.id()",
+                    threads=threads,
+                    thread_m_blocks=m_blocks,
+                    thread_n_blocks=n_blocks,
+                    thread_k_blocks=k_blocks,
+                    m_block_size_8="false",
+                    stages=4,
+                    group_blocks=group_blocks,
+                    is_zp_float="false",
+                )
+                args = jinja2.Template(
+                    "<{{a_type_id}}, {{b_type_id}}, {{c_type_id}}, "
+                    "{{s_type_id}}, {{threads}}, {{thread_m_blocks}}, "
+                    "{{thread_n_blocks}}, {{thread_k_blocks}}, "
+                    "{{m_block_size_8}}, {{stages}}, {{group_blocks}}, "
+                    "{{is_zp_float}}>"
+                ).render(**ids)
+                if proof is not None:   # a twin must shadow a ZPP / ZPPTPF twin of its family, never add a new config
+                    assert f"{proof[1]}{args};" in sels[proof[0]], ("[ZPW13] twin without a ZPP sibling", twin, args)
+                templates.setdefault(site, []).append(
+                    jinja2.Template((inst_tpf if tpf else TEMPLATE).replace("void Marlin<", f"void {twin}<")).render(**ids))
+                fmaps.append(f'  if (base == {sib}{args}) {{ *name = "{twin}"; return {twin}{args}; }}')
+            if not templates:
+                continue
+            for site, tpls in sorted(templates.items(), key=lambda kv: (kv[0] is not None, kv[0] or 0)):
+                head = (FILE_HEAD_COMMENT
+                        + f"// [ZPW13] {twin} twins (13-bit ZPP group words, DESIGN-ZPW13.v1)"
+                        + (f", column-factor prefetch site {site}" if site is not None else "") + ": this TU alone compiles\n"
+                        + "// marlin_template.h for the L64-13 scale stream.\n"
+                        + ("#define MARLIN_CPF_TWIN 1\n" + f"#define MARLIN_CPF_SITE {site}\n" if site is not None else "")
+                        + "".join(f"#define {m} 1\n" for m in macros))
+                file_content = (head + FILE_HEAD[len(FILE_HEAD_COMMENT):] + f"\n#if {guard}\n\n" + "\n\n".join(tpls)
+                                + "\n\n#endif\n\n}\n")
+                filename = f"sm80_kernel_{stem}" + (f"_s{site}" if site is not None else "") + "_bfloat16.cu"
+                with open(os.path.join(here, filename), "w") as f:
+                    f.write(file_content)
+            maps[fn].append(f"#if {guard}\n" + "\n".join(fmaps) + "\n#endif")
+    decls = [f"{SP_TPL_PARAMS}\n__global__ void {fam}(MARLIN_KERNEL_PARAMS);"
+             for fam in ("MarlinZPP", "MarlinXSZPP", "MarlinZPW13", "MarlinXSZPW13", "MarlinZPW13CPF", "MarlinXSZPW13CPF")]
+    tpf_decls = [f"{SP_TPL_PARAMS}\n__global__ void {fam}(MarlinTpfDesc, MARLIN_KERNEL_PARAMS);"
+                 for fam in ("MarlinZPW13TPF", "MarlinXSZPW13TPF", "MarlinZPW13CPFTPF", "MarlinXSZPW13CPFTPF")]
+
+    def fn(sig, body):
+        return sig + " {\n" + "\n".join(body) + ("\n" if body else "") + "  return nullptr;\n}\n"
+
+    selector = (
+        FILE_HEAD_COMMENT
+        + "// [ZPW13] included by marlin.cu (namespace MARLIN_NAMESPACE_NAME, under #if MARLIN_ZPPACK and #if MARLIN_ZPW13, after the ZPP and\n"
+        + "// ZPPTPF selectors). The declarations repeat the other selectors' (harmless).\n"
+        + "\n".join(decls)
+        + "\n#if MARLIN_TAILPF\n" + "\n".join(tpf_decls) + "\n#endif\n\n"
+        + "// The ZPW13 twin of the ZPP twin a 13-bit packed launch selected, or nullptr (marlin_mm hard-fails: no fallback).\n"
+        + fn("static MarlinFuncPtr get_marlin_zpw13_twin(MarlinFuncPtr base, const char** name)", maps["zpw13"])
+        + "#if MARLIN_TAILPF\n"
+        + "// The ZPW13TPF twin of a ZPW13 twin, or nullptr (the launch keeps its ZPW13 twin, as 0052 keeps a ZPP twin).\n"
+        + fn("static MarlinTpfFuncPtr get_marlin_zpw13tpf_twin(MarlinFuncPtr base, const char** name)", maps["zpw13tpf"])
+        + "#endif\n"
+        + "#if MARLIN_COLFPF\n"
+        + "// The CPF twin of a ZPW13 twin, or nullptr (no twin: the launch keeps its kernel, as 0061).\n"
+        + fn("static MarlinFuncPtr get_marlin_zpw13_cpf_twin(MarlinFuncPtr base, const char** name)", maps["zpw13_cpf"])
+        + "#endif\n"
+        + "#if MARLIN_COLFPF && MARLIN_TAILPF\n"
+        + "// The CPF twin of a ZPW13TPF twin, or nullptr (the launch keeps its ZPW13TPF twin).\n"
+        + fn("static MarlinTpfFuncPtr get_marlin_zpw13_cpf_tpf_twin(MarlinTpfFuncPtr base, const char** name)", maps["zpw13_cpf_tpf"])
+        + "#endif\n"
+    )
+    with open(os.path.join(here, "kernel_selector_zpw13.h"), "w") as f:
+        f.write(selector)
+
 
 # [0063 KU3STPF cuda 2026-10-11] TAILPF twins of the kS8 x kU3S (0055 int3) bodies: <family>TPF<...kU3S...> = the kU3S family kernel
 # (Marlin, MarlinXS) with TAILPF's next-launch tail prefetch and MarlinTpfDesc first (the TU defines MARLIN_TPF_TWIN 1 + MARLIN_TPF_KU3S
@@ -1778,10 +1917,86 @@ def g2_off_tus(here=None):
             f.write(src)
 
 
+# [0100 PIN80 v4-WIDE, cuda fzp89 2026-10-15] With 0099 (Marlin bf16 TUs at sm_89) kat552 (10-06, stock, bitwise 144/144) measured every
+# served tile faster EXCEPT the asym kS8 x kU4 g64 wide tile at thread_m_blocks 4 (M2064 +0.9 %: gate_up/down; PIN80 v1-v3 pinned it).
+# The X2 arm's wide tiles (MarlinZPPCPF kU4 g64, MarlinCPF kU3S g64, MarlinZPP kU4 g32, Marlin kU4B8 g64) were never measured at sm_89.
+# A wide tile {threads 256, thread_n_blocks 16, thread_k_blocks 4} runs only when thread_m_blocks > 1 and neither the SM-fill nor the
+# A8 narrow-tile override fires (marlin.cu determine_exec_config + overrides): on the served X2 env that is admission / prefill
+# (M >= 128) only -- RID 1138 ENGAGE, arms R and K9: the 4 wide instantiations above first engage at M 128/512/1024, 0 wide at M <= 80.
+# This post-pass moves EVERY wide instantiation of every sm80_kernel_*_bfloat16.cu into sm80pin_<rest>.cu (same preamble and closing
+# lines; a TU left with no instantiation is moved whole). CMake compiles sm80pin_kernel_*.cu with the served "8.0+PTX", so admission
+# keeps the served sm_80 SASS and every decode tile moves to sm_89. Selectors, kernel_engage_names.h (it globs *kernel_*.cu) and the
+# union of instantiations over all TUs are unchanged. Without 0099 both lists compile at sm_80 and this pass only moves lines.
+PIN80_WIDE = (256, 16, 4)  # (threads, thread_n_blocks, thread_k_blocks)
+PIN80_SERVED = [  # (family, a_type, b_type, thread_m_blocks, group_blocks): the X2 served wide instantiations; each MUST be pinned
+    ("Marlin", "kS8", "kU4B8", 4, 4), ("MarlinCPF", "kS8", "kU3S", 4, 4),
+    ("MarlinZPPCPF", "kS8", "kU4", 4, 4), ("MarlinZPP", "kS8", "kU4", 4, 2)]
+PIN80_INST_RE = re.compile(r"^template __global__ void (Marlin[A-Z0-9]*)<(.*)>\( (?:MarlinTpfDesc, )?MARLIN_KERNEL_PARAMS \);$")
+PIN80_ARGS_RE = re.compile(r"^vllm::(k\w+)\.id\(\), vllm::(k\w+)\.id\(\), vllm::(k\w+)\.id\(\), vllm::(k\w+)\.id\(\), "
+                           r"(\d+), (\d+), (\d+), (\d+), (true|false), (\d+), (-?\d+), (true|false)$")
+
+
+def _pin80_at_exit(here):
+    """atexit swallows exceptions (see _engage_at_exit): a failed split must fail CMake's generation step."""
+    try:
+        split_pin80(here)
+    except BaseException:  # noqa: BLE001
+        import traceback
+        traceback.print_exc()
+        sys.stderr.flush()
+        os._exit(1)
+
+
+def split_pin80(here):
+    moved, served = [], set()
+    for path in sorted(glob.glob(os.path.join(here, "sm80_kernel_*_bfloat16.cu"))):
+        with open(path) as f:
+            lines = f.read().split("\n")
+        inst = [(i, PIN80_INST_RE.match(ln)) for i, ln in enumerate(lines)]
+        inst = [(i, m) for i, m in inst if m]
+        pin = []
+        for i, m in inst:
+            a = PIN80_ARGS_RE.match(m.group(2))
+            assert a, f"[0100 PIN80] {os.path.basename(path)}:{i + 1}: unparsed template arguments {m.group(2)!r}"
+            if (int(a.group(5)), int(a.group(7)), int(a.group(8))) == PIN80_WIDE:
+                pin.append((i, m, a))
+        if not pin:
+            continue
+        first, last = inst[0][0], inst[-1][0]
+        # the pinned TU gets the source TU's preamble and closing lines only: refuse a body that interleaves anything else
+        odd = [ln for ln in lines[first:last + 1] if ln.strip() and not PIN80_INST_RE.match(ln)]
+        assert not odd, f"[0100 PIN80] {os.path.basename(path)}: non-instantiation lines between instantiations {odd[:3]}"
+        name = os.path.basename(path)
+        dst = os.path.join(here, "sm80pin_" + name[len("sm80_"):])
+        assert not os.path.exists(dst), f"[0100 PIN80] {os.path.basename(dst)} exists before the split"
+        head, tail = lines[:first], lines[last + 1:]
+        pinned = {i for i, _, _ in pin}
+        if len(pinned) == len(inst):
+            os.replace(path, dst)  # every instantiation of this TU is wide: the TU moves whole (no empty object)
+        else:
+            keep_body = "\n".join(ln for i, ln in enumerate(lines[first:last + 1], first) if i not in pinned)
+            while "\n\n\n" in keep_body:  # the TU joins instantiations with one blank line: drop the gaps a moved line leaves
+                keep_body = keep_body.replace("\n\n\n", "\n\n")
+            with open(path, "w") as f:
+                f.write("\n".join(head) + "\n" + keep_body.strip("\n") + "\n" + "\n".join(tail))
+            with open(dst, "w") as f:
+                f.write("\n".join(head) + "\n" + "\n\n".join(lines[i] for i, _, _ in pin) + "\n" + "\n".join(tail))
+        for _, m, a in pin:
+            moved.append(f"{m.group(1)}<{m.group(2)}> {name} -> {os.path.basename(dst)}")
+            if a.group(3) == "kBFloat16" and a.group(4) == "kBFloat16":
+                served.add((m.group(1), a.group(1), a.group(2), int(a.group(6)), int(a.group(11))))
+    # every X2 served wide instantiation must be pinned (a stale list fails the generation, never pins nothing)
+    missing = [t for t in PIN80_SERVED if t not in served]
+    assert not missing, f"[0100 PIN80] served wide instantiation(s) not found in any bf16 TU: {missing}"
+    print(f"[0100 PIN80 v4-WIDE] pinned {len(moved)} wide instantiation(s) to sm_80 (served {len(PIN80_SERVED)}/{len(PIN80_SERVED)}):",
+          *moved, sep="\n  ")
+
+
 if __name__ == "__main__":
     remove_old_kernels()
     import atexit  # [0047 ENGAGE-TELL] after every generate_* call below, including ones a later patch appends
     atexit.register(_engage_at_exit, os.path.dirname(os.path.abspath(__file__)))
+    atexit.register(_pin80_at_exit, os.path.dirname(os.path.abspath(__file__)))  # [0100 PIN80 v4] LIFO: runs before 0047's
     generate_new_kernels()
     generate_l2pf_twins()  # [0045 L2PF] reads only the kernel_selector.h written above; writes only its own files
     generate_opr_twins()
@@ -1796,5 +2011,6 @@ if __name__ == "__main__":
     generate_zpp_twins()
     generate_zpptpf_twins()  # [0052 ZPPTPF] reads kernel_selector_zpp.h
     generate_cpf_twins()  # [0061 COLFPF v2] reads kernel_selector.h / _xs.h / _zpp.h / _zpptpf.h
+    generate_zpw13_twins()  # [ZPW13] reads kernel_selector_zpp.h / _zpptpf.h + CPF_SITES; writes only its own files
     generate_ku3stpf_twins()  # [0063 KU3STPF] reads kernel_selector.h / _xs.h
     g2_off_tus()  # [0071b G2-QKVOFF] last: rewrites only the G2_OFF_TUS files the calls above wrote
