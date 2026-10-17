@@ -3,6 +3,7 @@
 import glob
 import itertools
 import os
+import re  # [0047 ENGAGE-TELL]
 import subprocess
 import sys
 
@@ -60,7 +61,15 @@ TEMPLATE = (
 
 THREAD_CONFIGS = [(128, 128, 256), (64, 256, 256), (64, 128, 128), (128, 64, 128)]
 
-THREAD_M_BLOCKS = [0.5, 1, 2, 3, 4]
+# [cuda-lane 2026-09-19] 5 and 6 added: the one-pass ceiling is 16*tmb rows, so tmb=6 serves M<=96
+# (= K=11 at 8 seats) in ONE weight pass. Measured spill/thread on sm_89 at the served config:
+# tmb=4 12/12 B, tmb=5 122/200, tmb=6 234/356, tmb=8 2502/2608 -- 7 and 8 deliberately not built.
+THREAD_M_BLOCKS = [0.5, 1, 2, 3, 4, 5, 6]
+# ⚠ THE INT8-ACTIVATION CONFIGS BELOW DO NOT USE THE CONSTANT ABOVE -- they hardcode their own
+# list, and the SERVED W4A8 path is one of them. A first attempt patched only the constant and
+# built tmb 5/6 for sm_80 (51+51) and NONE for sm_89, i.e. a wheel that could not answer the
+# question it was built for. Same one-change-N-consumers shape as the c_tmp sizing.
+THREAD_M_BLOCKS_A8 = [1, 2, 3, 4, 5, 6]
 
 QUANT_CONFIGS = [
     # AWQ-INT4
@@ -122,7 +131,7 @@ QUANT_CONFIGS = [
         "a_type": ["kS8"],
         "b_type": "kU4",
         "thread_configs": THREAD_CONFIGS,
-        "thread_m_blocks": [1, 2, 3, 4],
+        "thread_m_blocks": THREAD_M_BLOCKS_A8,
         "group_blocks": [-1, 2, 4, 8],
     },
     # GPTQ-INT4 with INT8 activation
@@ -130,7 +139,7 @@ QUANT_CONFIGS = [
         "a_type": ["kS8"],
         "b_type": "kU4B8",
         "thread_configs": THREAD_CONFIGS,
-        "thread_m_blocks": [1, 2, 3, 4],
+        "thread_m_blocks": THREAD_M_BLOCKS_A8,
         "group_blocks": [-1, 2, 4, 8],
     },
     # GPTQ-INT4 with FP8 activation
@@ -159,7 +168,34 @@ QUANT_CONFIGS = [
         "thread_m_blocks": [1, 2, 3, 4],
         "group_blocks": [2],
     },
+    # [0055 KU3S] symmetric int3 (LOWBIT words) with INT8 activation, bf16 out, g64 / g128, the served thread_m_blocks 1-4 and every
+    # served tile: its own TU sm80_kernel_s8_u3s_bfloat16.cu, appended last (every earlier file / selector entry keeps its bytes)
+    {
+        "a_type": ["kS8"],
+        "b_type": "kU3S",
+        "c_type": ["kBFloat16"],
+        "thread_configs": THREAD_CONFIGS,
+        "thread_m_blocks": [1, 2, 3, 4],
+        "group_blocks": [2, 4, 8],  # [0055 KU3S-5] + g32 (gb 2: the kS8 group path already special-cases gb 2)
+    },
 ]
+
+
+# [0036 XS-5] XS3 twins: MarlinXS<...> = Marlin<...> with the cross-slice prefetch compiled in (the TU defines
+# MARLIN_XS_TWIN 1 before including marlin_template.h). ONLY the configs the deploy gate selects get one: TC38 W4A8
+# (kS8 activations, bf16 out) with VLLM_MARLIN_XSLICE_N=34816,16384, _MIN_M=32, _MAX_M=64 and the served knobs (incl.
+# VLLM_MARLIN_A8_NARROW_MIN_N=14336 -> the narrow {thread_k 128, thread_n 64, 128 threads} tile), as the XS2 card
+# (xs2card-20261003T184950Z, main/served) recorded: gate_up kS8 x kU4 g64 (group_blocks 4), in_qkvz kS8 x kU4 g32 (2),
+# d_gate_up kS8 x kU4B8 g64 (4), at thread_m_blocks 2..4 (M 17..64). Every other config exists only as the served
+# Marlin<...>, untouched; a gated launch whose config has no twin runs the served kernel (marlin_mm).
+# (a_type, b_type, c_type, threads, thread_m_blocks, thread_n_blocks, thread_k_blocks, group_blocks)
+XS_TWINS = [
+    *[("kS8", "kU4", "kBFloat16", 128, m, 4, 8, g) for g in (2, 4) for m in (2, 3, 4)],
+    *[("kS8", "kU4B8", "kBFloat16", 128, m, 4, 8, 4) for m in (2, 3, 4)],
+]
+# [0055 KU3S] MarlinXS twins of kU3S at the XS decode tile, g64 / g128: their own TU sm80_kernel_xs_u3s_<c_type>.cu (the 0036 TU keeps its
+# bytes) and entries appended to kernel_selector_xs.h. Kept OUT of XS_TWINS: XSOPR_TWINS = [*XS_TWINS, ...] must stay OPR twins.
+KU3S_XS_TWINS = [("kS8", "kU3S", "kBFloat16", 128, m, 4, 8, g) for g in (2, 4, 8) for m in (2, 3, 4)]  # [0055 KU3S-5] + g32
 
 # Kernels are written next to the kernel.h / marlin_template.h they include.
 OUTPUT_DIR = sys.argv[2] if len(sys.argv) > 2 else os.path.dirname(__file__)
@@ -170,6 +206,9 @@ def remove_old_kernels():
         subprocess.call(["rm", "-f", filename])
 
     filename = OUTPUT_DIR + "/kernel_selector.h"
+    subprocess.call(["rm", "-f", filename])
+
+    filename = os.path.dirname(__file__) + "/kernel_selector_xs.h"
     subprocess.call(["rm", "-f", filename])
 
 
@@ -313,7 +352,1449 @@ def generate_new_kernels():
     with open(os.path.join(OUTPUT_DIR, "kernel_selector.h"), "w") as f:
         f.write(kernel_selector_str)
 
+    generate_xs_twins(result_dict)
+
+
+def generate_xs_twins(result_dict):
+    """[0036 XS-5] sm80_kernel_xs_<c_type>.cu (explicit MarlinXS instantiations, compiled with MARLIN_XS_TWIN 1) and
+    kernel_selector_xs.h (marlin.cu's get_marlin_xs_kernel). Writes nothing else; the served files above are unchanged."""
+    selector = FILE_HEAD_COMMENT
+    by_c_type = {}
+    if SUPPORT_SM80:
+        for a_type, b_type, c_type, threads, m_blocks, n_blocks, k_blocks, group_blocks in XS_TWINS + KU3S_XS_TWINS:
+            config = {
+                "threads": threads,
+                "s_type": c_type,
+                "thread_m_blocks": m_blocks,
+                "thread_k_blocks": k_blocks,
+                "thread_n_blocks": n_blocks,
+                "m_block_size_8": "false",
+                "stages": 4,
+                "group_blocks": group_blocks,
+                "is_zp_float": "false",
+            }
+            # a twin must shadow a served instantiation (same template arguments), never add a new config
+            assert config in result_dict.get((a_type, b_type, c_type), []), (a_type, b_type, c_type, config)
+            ids = dict(
+                a_type_id=f"vllm::{a_type}.id()",
+                b_type_id=f"vllm::{b_type}.id()",
+                c_type_id=f"vllm::{c_type}.id()",
+                s_type_id=f"vllm::{c_type}.id()",
+                **config,
+            )
+            by_c_type.setdefault((c_type, "_u3s" if b_type == "kU3S" else ""), []).append(  # [0055 KU3S] own TU
+                jinja2.Template(TEMPLATE.replace("void Marlin<", "void MarlinXS<")).render(**ids)
+            )
+            conditions = " && ".join([
+                f"a_type == vllm::{a_type}",
+                f"b_type == vllm::{b_type}",
+                f"c_type == vllm::{c_type}",
+                f"s_type == vllm::{c_type}",
+                f"threads == {threads}",
+                f"thread_m_blocks == {m_blocks}",
+                f"thread_n_blocks == {n_blocks}",
+                f"thread_k_blocks == {k_blocks}",
+                "m_block_size_8 == false",
+                "stages == 4",
+                f"group_blocks == {group_blocks}",
+                "is_zp_float == false",
+            ])
+            selector += ("if" if selector == FILE_HEAD_COMMENT else "else if") + f" ({conditions})\n  kernel = "
+            selector += (
+                jinja2.Template(
+                    "MarlinXS<{{a_type_id}}, {{b_type_id}}, {{c_type_id}}, "
+                    "{{s_type_id}}, {{threads}}, {{thread_m_blocks}}, "
+                    "{{thread_n_blocks}}, {{thread_k_blocks}}, "
+                    "{{m_block_size_8}}, {{stages}}, {{group_blocks}}, "
+                    "{{is_zp_float}}>;"
+                ).render(**ids)
+                + "\n"
+            )
+    for (c_type, tu_tag), templates in by_c_type.items():
+        file_content = (
+            FILE_HEAD_COMMENT
+            + "// [0036 XS-5] XS twins: this TU alone compiles marlin_template.h with the cross-slice prefetch.\n"
+            + "#define MARLIN_XS_TWIN 1\n"
+            + FILE_HEAD[len(FILE_HEAD_COMMENT):]
+            + "\n#if MARLIN_XSLICE\n\n"
+            + "\n\n".join(templates)
+            + "\n\n#endif\n\n}\n"
+        )
+        filename = f"sm80_kernel_xs{tu_tag}_{c_type[1:]}.cu".lower()
+        with open(os.path.join(os.path.dirname(__file__), filename), "w") as f:
+            f.write(file_content)
+    with open(os.path.join(os.path.dirname(__file__), "kernel_selector_xs.h"), "w") as f:
+        f.write(selector)
+
+
+# [0040 OPR] OPR twins: MarlinOPR<...> = Marlin<...> with the ordered parallel reduce of split columns compiled in (the TU
+# defines MARLIN_OPR_TWIN 1 before including marlin_template.h). Only the configs the OPR host gate can select get one, each
+# the template arguments of a served instantiation (checked against kernel_selector.h below): at M 17..64 (thread_m_blocks
+# 2..4) the 128-thread {thread_k 128, thread_n 64} tile of the W4A8 sites (kS8 x kU4 g32 out_proj / g64 down, kS8 x kU4B8 g64
+# drafter) and of the W8A16 o_proj (kBFloat16 x kU8B128 g128) = v1; the 256-thread {64, 256} W8A16 qkv tile = v2
+# (VLLM_MARLIN_OPR=2; its per-CTA slots fill the served c_tmp exactly). Every other config exists only as the served
+# Marlin<...>, untouched.
+# (a_type, b_type, c_type, threads, thread_m_blocks, thread_n_blocks, thread_k_blocks, group_blocks)
+OPR_TWINS = [
+    *[("kS8", "kU4", "kBFloat16", 128, m, 4, 8, g) for g in (2, 4) for m in (2, 3, 4)],
+    *[("kS8", "kU4B8", "kBFloat16", 128, m, 4, 8, 4) for m in (2, 3, 4)],
+    *[("kBFloat16", "kU8B128", "kBFloat16", 128, m, 4, 8, 8) for m in (2, 3, 4)],
+    *[("kBFloat16", "kU8B128", "kBFloat16", 256, m, 16, 4, 8) for m in (2, 3, 4)],
+]
+
+# [0039 XSOPR] Combined twins: MarlinXSOPR<...> = XS cross-slice prefetch + OPR in one body (the TU defines MARLIN_XS_TWIN 1
+# and MARLIN_OPR_TWIN 1). For the launches BOTH gates claim (VLLM_MARLIN_XSLICE=1 with N in _XSLICE_N, and VLLM_MARLIN_OPR):
+# the OPR v1 configs that XS can run -- the 9 W4A8 configs (= XS_TWINS; sh_red past the stages, as MarlinXS) and the W8A16
+# o_proj tile (sh_red in A stage slot stages-1, see marlin_template.h). Not the 256-thread qkv tile: its sh_red (33 KB) fits
+# neither one A stage (8 KB) nor past the stages. Each asserted to be an OPR twin (hence a served instantiation).
+XSOPR_TWINS = [
+    *XS_TWINS,
+    *[("kBFloat16", "kU8B128", "kBFloat16", 128, m, 4, 8, 8) for m in (2, 3, 4)],
+]
+
+
+def generate_opr_twins(name="MarlinOPR", twins=OPR_TWINS, tag="opr", defines=("MARLIN_OPR_TWIN",), guard="MARLIN_OPR",
+                       what="OPR twins: this TU alone compiles marlin_template.h with the ordered parallel reduce.",
+                       patch="[0040 OPR]"):
+    """[0040 OPR] sm80_kernel_opr_<c_type>.cu (explicit MarlinOPR instantiations, compiled with MARLIN_OPR_TWIN 1) and
+    kernel_selector_opr.h (marlin.cu's get_marlin_opr_kernel). Reads the generated kernel_selector.h to assert that every twin
+    shadows a served instantiation; writes nothing else, so the served files and the XS twins are unchanged.
+    [0039 XSOPR] The same writer, parameterised, also emits sm80_kernel_xsopr_<c_type>.cu (MarlinXSOPR, both twin macros,
+    under #if MARLIN_XSLICE && MARLIN_OPR) and kernel_selector_xsopr.h; the defaults reproduce the 0040 files byte for byte."""
+    here = os.path.dirname(__file__)
+    selector = FILE_HEAD_COMMENT
+    by_c_type = {}
+    if SUPPORT_SM80:
+        with open(os.path.join(here, "kernel_selector.h")) as f:
+            served = f.read()
+        for twin in twins:
+            if name != "MarlinOPR":
+                assert twin in OPR_TWINS, (f"{patch} {name} twin without an OPR sibling", twin)
+        for a_type, b_type, c_type, threads, m_blocks, n_blocks, k_blocks, group_blocks in twins:
+            ids = dict(
+                a_type_id=f"vllm::{a_type}.id()",
+                b_type_id=f"vllm::{b_type}.id()",
+                c_type_id=f"vllm::{c_type}.id()",
+                s_type_id=f"vllm::{c_type}.id()",
+                threads=threads,
+                thread_m_blocks=m_blocks,
+                thread_n_blocks=n_blocks,
+                thread_k_blocks=k_blocks,
+                m_block_size_8="false",
+                stages=4,
+                group_blocks=group_blocks,
+                is_zp_float="false",
+            )
+            args = jinja2.Template(
+                "<{{a_type_id}}, {{b_type_id}}, {{c_type_id}}, "
+                "{{s_type_id}}, {{threads}}, {{thread_m_blocks}}, "
+                "{{thread_n_blocks}}, {{thread_k_blocks}}, "
+                "{{m_block_size_8}}, {{stages}}, {{group_blocks}}, "
+                "{{is_zp_float}}>"
+            ).render(**ids)
+            # a twin must shadow a served instantiation (same template arguments), never add a new config
+            assert f"kernel = Marlin{args};" in served, (f"{patch} twin without a served sibling", args)
+            by_c_type.setdefault(c_type, []).append(
+                jinja2.Template(TEMPLATE.replace("void Marlin<", f"void {name}<")).render(**ids)
+            )
+            conditions = " && ".join([
+                f"a_type == vllm::{a_type}",
+                f"b_type == vllm::{b_type}",
+                f"c_type == vllm::{c_type}",
+                f"s_type == vllm::{c_type}",
+                f"threads == {threads}",
+                f"thread_m_blocks == {m_blocks}",
+                f"thread_n_blocks == {n_blocks}",
+                f"thread_k_blocks == {k_blocks}",
+                "m_block_size_8 == false",
+                "stages == 4",
+                f"group_blocks == {group_blocks}",
+                "is_zp_float == false",
+            ])
+            selector += ("if" if selector == FILE_HEAD_COMMENT else "else if") + f" ({conditions})\n  kernel = "
+            selector += f"{name}{args};\n"
+    for c_type, templates in by_c_type.items():
+        file_content = (
+            FILE_HEAD_COMMENT
+            + f"// {patch} {what}\n"
+            + "".join(f"#define {d} 1\n" for d in defines)
+            + FILE_HEAD[len(FILE_HEAD_COMMENT):]
+            + f"\n#if {guard}\n\n"
+            + "\n\n".join(templates)
+            + "\n\n#endif\n\n}\n"
+        )
+        filename = f"sm80_kernel_{tag}_{c_type[1:]}.cu".lower()
+        with open(os.path.join(here, filename), "w") as f:
+            f.write(file_content)
+    with open(os.path.join(here, f"kernel_selector_{tag}.h"), "w") as f:
+        f.write(selector)
+
+
+# [0041 MR14] Group-scale L2 prefetch twins: <family>SP<...> = the family kernel (Marlin, MarlinXS, MarlinOPR, MarlinXSOPR) with the
+# stripe prefetch of its group-scale / grouped zero-point rows compiled in (the TU defines MARLIN_SP_TWIN 1 next to the
+# family's own macros). Configs: the 128-thread {thread_k 128, thread_n 64} W4A8 tile at M 17..64 (thread_m_blocks 2..4) that
+# serves gate_up / down (kS8 x kU4 g64), in_qkvz / out_proj (kS8 x kU4 g32) and the drafter (kS8 x kU4B8 g64): the sites
+# whose cold-L2 penalty is the group-scale stream (kat462). Each family gets an SP twin for every SP config it instantiates
+# itself, so a family (here also 0039's combined MarlinXSOPR) is ONE SP_FAMILIES row, not a new template branch.
+# (a_type, b_type, c_type, threads, thread_m_blocks, thread_n_blocks, thread_k_blocks, group_blocks)
+SP_TWINS = [
+    *[("kS8", "kU4", "kBFloat16", 128, m, 4, 8, g) for g in (2, 4) for m in (2, 3, 4)],
+    *[("kS8", "kU4B8", "kBFloat16", 128, m, 4, 8, 4) for m in (2, 3, 4)],
+]
+# (family kernel name, TU suffix, macros the family's TU defines, build switch of the family, the family's configs or None =
+# every served instantiation). The SP kernel name = family name + "SP" (marlin_template.h MARLIN_SP_TWIN name block).
+SP_FAMILIES = [
+    ("Marlin", "", [], "1", None),
+    ("MarlinXS", "_xs", ["MARLIN_XS_TWIN"], "MARLIN_XSLICE", XS_TWINS),
+    ("MarlinOPR", "_opr", ["MARLIN_OPR_TWIN"], "MARLIN_OPR", OPR_TWINS),
+    ("MarlinXSOPR", "_xsopr", ["MARLIN_XS_TWIN", "MARLIN_OPR_TWIN"], "MARLIN_XSLICE && MARLIN_OPR", XSOPR_TWINS),
+]
+SP_TPL_PARAMS = (
+    "template <const vllm::ScalarTypeId a_type_id, const vllm::ScalarTypeId b_type_id, "
+    "const vllm::ScalarTypeId c_type_id, const vllm::ScalarTypeId s_type_id, const int threads, "
+    "const int thread_m_blocks, const int thread_n_blocks, const int thread_k_blocks, "
+    "const bool m_block_size_8, const int stages, const int group_blocks, const bool is_zp_float>"
+)
+
+
+def generate_sp_twins():
+    """[0041 MR14] one TU per family, sm80_kernel_sp<suffix>_<c_type>.cu (explicit <family>SP instantiations, compiled with
+    MARLIN_SP_TWIN 1 + the family's macros), and kernel_selector_sp.h (marlin.cu: the declarations and get_marlin_sp_twin, the
+    map from the kernel a launch selected to its SP twin). Reads the generated kernel_selector.h to assert that every twin
+    shadows a served instantiation; writes nothing else, so the served files and the XS / OPR twins are unchanged."""
+    here = os.path.dirname(__file__)
+    decls = [f"{SP_TPL_PARAMS}\n__global__ void {fam}{sp}(MARLIN_KERNEL_PARAMS);"
+             for fam, _, _, _, _ in SP_FAMILIES for sp in ("", "SP")]
+    body = []
+    if SUPPORT_SM80:
+        with open(os.path.join(here, "kernel_selector.h")) as f:
+            served = f.read()
+        for fam, suffix, macros, switch, fam_configs in SP_FAMILIES:
+            templates, maps = [], []
+            for tw in SP_TWINS:
+                if fam_configs is not None and tw not in fam_configs:
+                    continue
+                a_type, b_type, c_type, threads, m_blocks, n_blocks, k_blocks, group_blocks = tw
+                ids = dict(
+                    a_type_id=f"vllm::{a_type}.id()",
+                    b_type_id=f"vllm::{b_type}.id()",
+                    c_type_id=f"vllm::{c_type}.id()",
+                    s_type_id=f"vllm::{c_type}.id()",
+                    threads=threads,
+                    thread_m_blocks=m_blocks,
+                    thread_n_blocks=n_blocks,
+                    thread_k_blocks=k_blocks,
+                    m_block_size_8="false",
+                    stages=4,
+                    group_blocks=group_blocks,
+                    is_zp_float="false",
+                )
+                args = jinja2.Template(
+                    "<{{a_type_id}}, {{b_type_id}}, {{c_type_id}}, "
+                    "{{s_type_id}}, {{threads}}, {{thread_m_blocks}}, "
+                    "{{thread_n_blocks}}, {{thread_k_blocks}}, "
+                    "{{m_block_size_8}}, {{stages}}, {{group_blocks}}, "
+                    "{{is_zp_float}}>"
+                ).render(**ids)
+                # a twin must shadow a served instantiation (same template arguments), never add a new config
+                assert f"kernel = Marlin{args};" in served, ("[0041 MR14] twin without a served sibling", args)
+                templates.append(jinja2.Template(TEMPLATE.replace("void Marlin<", f"void {fam}SP<")).render(**ids))
+                maps.append(f'  if (base == {fam}{args}) {{ *name = "{fam}SP"; return {fam}SP{args}; }}')
+            if not templates:
+                continue
+            guard = "MARLIN_SCALE_PF" + ("" if switch == "1" else f" && {switch}")
+            file_content = (
+                FILE_HEAD_COMMENT
+                + f"// [0041 MR14] SP twins of {fam}: this TU alone compiles marlin_template.h with the group-scale L2 prefetch.\n"
+                + "#define MARLIN_SP_TWIN 1\n"
+                + "".join(f"#define {m} 1\n" for m in macros)
+                + FILE_HEAD[len(FILE_HEAD_COMMENT):]
+                + f"\n#if {guard}\n\n"
+                + "\n\n".join(templates)
+                + "\n\n#endif\n\n}\n"
+            )
+            filename = f"sm80_kernel_sp{suffix}_{c_type[1:]}.cu".lower()
+            with open(os.path.join(here, filename), "w") as f:
+                f.write(file_content)
+            body.append(f"#if {guard}\n" + "\n".join(maps) + "\n#endif")
+    selector = (
+        FILE_HEAD_COMMENT
+        + "// [0041 MR14] included by marlin.cu (namespace MARLIN_NAMESPACE_NAME, under #if MARLIN_SCALE_PF). The declarations\n"
+        + "// repeat marlin.cu's own (harmless) so this header does not depend on where the family blocks sit.\n"
+        + "\n".join(decls)
+        + "\n\n// The SP twin of the kernel a launch selected (served / XS / OPR ...), or nullptr (no twin: keep the kernel).\n"
+        + "static MarlinFuncPtr get_marlin_sp_twin(MarlinFuncPtr base, const char** name) {\n"
+        + "\n".join(body)
+        + ("\n" if body else "")
+        + "  return nullptr;\n}\n"
+    )
+    with open(os.path.join(here, "kernel_selector_sp.h"), "w") as f:
+        f.write(selector)
+
+
+# [0042 FOLD] Remainder-fold twins: MarlinFOLD<...> = Marlin<...> whose last 64-row problem copy may start at prob_m - 64 (the TU
+# defines MARLIN_FOLD_TWIN 1 before including marlin_template.h). Only the configs a folded launch selects get one, each the
+# template arguments of a served instantiation (checked against kernel_selector.h below). marlin_mm folds at thread_m_blocks 4
+# with prob_m_split = the remainder rest_m > 64; its config there is the large-batch table's first valid entry (the SM-fill
+# override needs prob_n / thread_n * ceil(rest_m / 64) * 4 <= sms and the A8 narrow tile rest_m <= 64: neither holds on the
+# served shapes), the 256-thread {thread_k 64, thread_n 256} tile: kS8 x kU4 g64 (gate_up, down) and g32 (in_qkvz, out_proj,
+# lm_head), kS8 x kU4B8 g64 (the dflash2 drafter), kBFloat16 x kU8B128 g128 (W8A16 attention qkv, o_proj). fold_proof.py
+# (cuda lane) derives this list from a port of the host plan for the 12 served shapes at M 65..2064 and checks it. A config
+# without a twin is never folded (marlin_mm re-plans it on the served path).
+# (a_type, b_type, c_type, threads, thread_m_blocks, thread_n_blocks, thread_k_blocks, group_blocks)
+FOLD_TWINS = [
+    ("kS8", "kU4", "kBFloat16", 256, 4, 16, 4, 4),
+    ("kS8", "kU4", "kBFloat16", 256, 4, 16, 4, 2),
+    ("kS8", "kU4B8", "kBFloat16", 256, 4, 16, 4, 4),
+    ("kBFloat16", "kU8B128", "kBFloat16", 256, 4, 16, 4, 8),
+]
+
+
+def generate_fold_twins():
+    """[0042 FOLD] sm80_kernel_fold_<c_type>.cu (explicit MarlinFOLD instantiations, compiled with MARLIN_FOLD_TWIN 1, under
+    #if MARLIN_FOLD) and kernel_selector_fold.h (marlin.cu's get_marlin_fold_kernel). Reads the generated kernel_selector.h to
+    assert that every twin shadows a served instantiation; writes nothing else, so every other generated file is unchanged."""
+    here = os.path.dirname(__file__)
+    selector = FILE_HEAD_COMMENT
+    by_c_type = {}
+    if SUPPORT_SM80:
+        with open(os.path.join(here, "kernel_selector.h")) as f:
+            served = f.read()
+        for a_type, b_type, c_type, threads, m_blocks, n_blocks, k_blocks, group_blocks in FOLD_TWINS:
+            ids = dict(
+                a_type_id=f"vllm::{a_type}.id()",
+                b_type_id=f"vllm::{b_type}.id()",
+                c_type_id=f"vllm::{c_type}.id()",
+                s_type_id=f"vllm::{c_type}.id()",
+                threads=threads,
+                thread_m_blocks=m_blocks,
+                thread_n_blocks=n_blocks,
+                thread_k_blocks=k_blocks,
+                m_block_size_8="false",
+                stages=4,
+                group_blocks=group_blocks,
+                is_zp_float="false",
+            )
+            args = jinja2.Template(
+                "<{{a_type_id}}, {{b_type_id}}, {{c_type_id}}, "
+                "{{s_type_id}}, {{threads}}, {{thread_m_blocks}}, "
+                "{{thread_n_blocks}}, {{thread_k_blocks}}, "
+                "{{m_block_size_8}}, {{stages}}, {{group_blocks}}, "
+                "{{is_zp_float}}>"
+            ).render(**ids)
+            # a twin must shadow a served instantiation (same template arguments), never add a new config
+            assert f"kernel = Marlin{args};" in served, ("[0042 FOLD] twin without a served sibling", args)
+            by_c_type.setdefault(c_type, []).append(
+                jinja2.Template(TEMPLATE.replace("void Marlin<", "void MarlinFOLD<")).render(**ids)
+            )
+            conditions = " && ".join([
+                f"a_type == vllm::{a_type}",
+                f"b_type == vllm::{b_type}",
+                f"c_type == vllm::{c_type}",
+                f"s_type == vllm::{c_type}",
+                f"threads == {threads}",
+                f"thread_m_blocks == {m_blocks}",
+                f"thread_n_blocks == {n_blocks}",
+                f"thread_k_blocks == {k_blocks}",
+                "m_block_size_8 == false",
+                "stages == 4",
+                f"group_blocks == {group_blocks}",
+                "is_zp_float == false",
+            ])
+            selector += ("if" if selector == FILE_HEAD_COMMENT else "else if") + f" ({conditions})\n  kernel = "
+            selector += f"MarlinFOLD{args};\n"
+    for c_type, templates in by_c_type.items():
+        file_content = (
+            FILE_HEAD_COMMENT
+            + "// [0042 FOLD] FOLD twins: this TU alone compiles marlin_template.h with the remainder fold.\n"
+            + "#define MARLIN_FOLD_TWIN 1\n"
+            + FILE_HEAD[len(FILE_HEAD_COMMENT):]
+            + "\n#if MARLIN_FOLD\n\n"
+            + "\n\n".join(templates)
+            + "\n\n#endif\n\n}\n"
+        )
+        filename = f"sm80_kernel_fold_{c_type[1:]}.cu".lower()
+        with open(os.path.join(here, filename), "w") as f:
+            f.write(file_content)
+    with open(os.path.join(here, "kernel_selector_fold.h"), "w") as f:
+        f.write(selector)
+
+
+
+# [0048 FOLDS] Served-partition remainder-fold twins: MarlinFOLDS<...> = Marlin<...> that runs the served launch of par_count
+# 64-row copies (its config, grid, partition, locks and reduction order, so those rows are bitwise) plus the < 64-row remainder
+# as a second item per CTA (the TU defines MARLIN_FOLDS_TWIN 1 before including marlin_template.h). A twin per config the SERVED
+# launch of par_count * 64 rows selects on the served A8 shapes (fs_model.py / fs_proof.py P1 derive this list from a port of the
+# host plan at every M 1..2112): par_count 1 -> the 128-thread {thread_k 128, thread_n 64} tile (SM-fill on N 5120 / 6144, the
+# A8 narrow tile on N >= 14336), par_count >= 2 -> the 256-thread {thread_k 64, thread_n 256} tile; kS8 x kU4 g64 (gate_up,
+# down), g32 (in_qkvz, out_proj, lm_head), kS8 x kU4B8 g64 (the dflash2 drafter). A16 (bf16-activation) GEMMs never fold.
+# (a_type, b_type, c_type, threads, thread_m_blocks, thread_n_blocks, thread_k_blocks, group_blocks)
+FOLDS_TWINS = [
+    ("kS8", "kU4", "kBFloat16", 256, 4, 16, 4, 4),
+    ("kS8", "kU4", "kBFloat16", 256, 4, 16, 4, 2),
+    ("kS8", "kU4B8", "kBFloat16", 256, 4, 16, 4, 4),
+    ("kS8", "kU4", "kBFloat16", 128, 4, 4, 8, 4),
+    ("kS8", "kU4", "kBFloat16", 128, 4, 4, 8, 2),
+    ("kS8", "kU4B8", "kBFloat16", 128, 4, 4, 8, 4),
+]
+
+
+def generate_folds_twins():
+    """[0048 FOLDS] sm80_kernel_folds_<c_type>.cu (explicit MarlinFOLDS instantiations, compiled with MARLIN_FOLDS_TWIN 1, under
+    #if MARLIN_FOLDS) and kernel_selector_folds.h (marlin.cu's get_marlin_folds_kernel). Reads the generated kernel_selector.h to
+    assert that every twin shadows a served instantiation; writes nothing else, so every other generated file is unchanged."""
+    here = os.path.dirname(__file__)
+    selector = FILE_HEAD_COMMENT
+    by_c_type = {}
+    if SUPPORT_SM80:
+        with open(os.path.join(here, "kernel_selector.h")) as f:
+            served = f.read()
+        for a_type, b_type, c_type, threads, m_blocks, n_blocks, k_blocks, group_blocks in FOLDS_TWINS:
+            ids = dict(
+                a_type_id=f"vllm::{a_type}.id()",
+                b_type_id=f"vllm::{b_type}.id()",
+                c_type_id=f"vllm::{c_type}.id()",
+                s_type_id=f"vllm::{c_type}.id()",
+                threads=threads,
+                thread_m_blocks=m_blocks,
+                thread_n_blocks=n_blocks,
+                thread_k_blocks=k_blocks,
+                m_block_size_8="false",
+                stages=4,
+                group_blocks=group_blocks,
+                is_zp_float="false",
+            )
+            args = jinja2.Template(
+                "<{{a_type_id}}, {{b_type_id}}, {{c_type_id}}, "
+                "{{s_type_id}}, {{threads}}, {{thread_m_blocks}}, "
+                "{{thread_n_blocks}}, {{thread_k_blocks}}, "
+                "{{m_block_size_8}}, {{stages}}, {{group_blocks}}, "
+                "{{is_zp_float}}>"
+            ).render(**ids)
+            # a twin must shadow a served instantiation (same template arguments), never add a new config
+            assert f"kernel = Marlin{args};" in served, ("[0048 FOLDS] twin without a served sibling", args)
+            by_c_type.setdefault(c_type, []).append(
+                jinja2.Template(TEMPLATE.replace("void Marlin<", "void MarlinFOLDS<")).render(**ids)
+            )
+            conditions = " && ".join([
+                f"a_type == vllm::{a_type}",
+                f"b_type == vllm::{b_type}",
+                f"c_type == vllm::{c_type}",
+                f"s_type == vllm::{c_type}",
+                f"threads == {threads}",
+                f"thread_m_blocks == {m_blocks}",
+                f"thread_n_blocks == {n_blocks}",
+                f"thread_k_blocks == {k_blocks}",
+                "m_block_size_8 == false",
+                "stages == 4",
+                f"group_blocks == {group_blocks}",
+                "is_zp_float == false",
+            ])
+            selector += ("if" if selector == FILE_HEAD_COMMENT else "else if") + f" ({conditions})\n  kernel = "
+            selector += f"MarlinFOLDS{args};\n"
+    for c_type, templates in by_c_type.items():
+        file_content = (
+            FILE_HEAD_COMMENT
+            + "// [0048 FOLDS] FOLDS twins: this TU alone compiles marlin_template.h with the served-partition remainder fold.\n"
+            + "#define MARLIN_FOLDS_TWIN 1\n"
+            + FILE_HEAD[len(FILE_HEAD_COMMENT):]
+            + "\n#if MARLIN_FOLDS\n\n"
+            + "\n\n".join(templates)
+            + "\n\n#endif\n\n}\n"
+        )
+        filename = f"sm80_kernel_folds_{c_type[1:]}.cu".lower()
+        with open(os.path.join(here, filename), "w") as f:
+            f.write(file_content)
+    with open(os.path.join(here, "kernel_selector_folds.h"), "w") as f:
+        f.write(selector)
+
+# [0045 L2PF] B-stream L2 prefetch-size twins: <family>L2PF<...> = the family kernel (Marlin, MarlinXS, MarlinOPR, MarlinXSOPR
+# and their MR14 SP twins) whose weight-stream copy (fetch_to_shared's B loop) carries the cp.async .L2::256B prefetch-size hint
+# (marlin.cuh cp_async4_stream_l2pf; the TU defines MARLIN_L2PF_TWIN 1 next to the family's own macros). Same values, same
+# evict_first policy, same instruction stream: in SASS the B-stream LDGSTS gain LTC256B and nothing else changes. Configs:
+# OPR_TWINS = every M 17..64 decode config of the served model (W4A8 {thread_k 128, thread_n 64} kS8 x kU4 g32 / g64 and
+# kS8 x kU4B8 g64; W8A16 o_proj {128, 64} and qkv {64, 256} kBFloat16 x kU8B128 g128; thread_m_blocks 2..4). Each family row
+# keeps only the configs it instantiates itself; an SP row = exactly the SP twins generate_sp_twins() emits. Not covered: M <= 16 / M > 64 configs, MarlinFOLD, TAILPF twins (one L2PF_TWINS line / one row each).
+# 0047's kernel_engage_names.h names every twin from kernel_selector_l2pf.h (same signature as the family: its own address).
+L2PF_TWINS = OPR_TWINS
+# (family kernel name, TU suffix, macros the family's TU defines, build switch of the family, the family's configs or None =
+# every served instantiation). The L2PF kernel name = family name + "L2PF" (marlin_template.h MARLIN_L2PF_TWIN name block).
+L2PF_FAMILIES = [
+    *SP_FAMILIES,
+    *[
+        (fam + "SP", "_sp" + suffix, ["MARLIN_SP_TWIN", *macros],
+         "MARLIN_SCALE_PF" + ("" if switch == "1" else f" && {switch}"),
+         [tw for tw in SP_TWINS if (configs is None or tw in configs)])
+        for fam, suffix, macros, switch, configs in SP_FAMILIES
+    ],
+]
+
+
+def generate_l2pf_twins():
+    """[0045 L2PF] one TU per family row, sm80_kernel_l2pf<suffix>_<c_type>.cu (explicit <family>L2PF instantiations, compiled
+    with MARLIN_L2PF_TWIN 1 + the family's macros), and kernel_selector_l2pf.h (marlin.cu: the declarations and
+    get_marlin_l2pf_twin, the map from the kernel a launch selected to its L2PF twin). Reads the generated kernel_selector.h to
+    assert that every twin shadows a served instantiation; writes nothing else, so every earlier generated file is unchanged."""
+    here = os.path.dirname(__file__)
+    decls = [f"{SP_TPL_PARAMS}\n__global__ void {fam}{l2}(MARLIN_KERNEL_PARAMS);"
+             for fam, _, _, _, _ in L2PF_FAMILIES for l2 in ("", "L2PF")]
+    body = []
+    if SUPPORT_SM80:
+        with open(os.path.join(here, "kernel_selector.h")) as f:
+            served = f.read()
+        for fam, suffix, macros, switch, fam_configs in L2PF_FAMILIES:
+            by_c_type, maps = {}, []
+            for tw in L2PF_TWINS:
+                if fam_configs is not None and tw not in fam_configs:
+                    continue
+                a_type, b_type, c_type, threads, m_blocks, n_blocks, k_blocks, group_blocks = tw
+                ids = dict(
+                    a_type_id=f"vllm::{a_type}.id()",
+                    b_type_id=f"vllm::{b_type}.id()",
+                    c_type_id=f"vllm::{c_type}.id()",
+                    s_type_id=f"vllm::{c_type}.id()",
+                    threads=threads,
+                    thread_m_blocks=m_blocks,
+                    thread_n_blocks=n_blocks,
+                    thread_k_blocks=k_blocks,
+                    m_block_size_8="false",
+                    stages=4,
+                    group_blocks=group_blocks,
+                    is_zp_float="false",
+                )
+                args = jinja2.Template(
+                    "<{{a_type_id}}, {{b_type_id}}, {{c_type_id}}, "
+                    "{{s_type_id}}, {{threads}}, {{thread_m_blocks}}, "
+                    "{{thread_n_blocks}}, {{thread_k_blocks}}, "
+                    "{{m_block_size_8}}, {{stages}}, {{group_blocks}}, "
+                    "{{is_zp_float}}>"
+                ).render(**ids)
+                # a twin must shadow a served instantiation (same template arguments), never add a new config
+                assert f"kernel = Marlin{args};" in served, ("[0045 L2PF] twin without a served sibling", args)
+                by_c_type.setdefault(c_type, []).append(
+                    jinja2.Template(TEMPLATE.replace("void Marlin<", f"void {fam}L2PF<")).render(**ids)
+                )
+                maps.append(f'  if (base == {fam}{args}) {{ *name = "{fam}L2PF"; return {fam}L2PF{args}; }}')
+            if not maps:
+                continue
+            guard = "MARLIN_L2PF" + ("" if switch == "1" else f" && {switch}")
+            for c_type, templates in by_c_type.items():
+                file_content = (
+                    FILE_HEAD_COMMENT
+                    + f"// [0045 L2PF] L2PF twins of {fam}: this TU alone compiles the B-stream cp.async with the .L2::256B hint.\n"
+                    + "#define MARLIN_L2PF_TWIN 1\n"
+                    + "".join(f"#define {m} 1\n" for m in macros)
+                    + FILE_HEAD[len(FILE_HEAD_COMMENT):]
+                    + f"\n#if {guard}\n\n"
+                    + "\n\n".join(templates)
+                    + "\n\n#endif\n\n}\n"
+                )
+                filename = f"sm80_kernel_l2pf{suffix}_{c_type[1:]}.cu".lower()
+                with open(os.path.join(here, filename), "w") as f:
+                    f.write(file_content)
+            body.append(f"#if {guard}\n" + "\n".join(maps) + "\n#endif")
+    selector = (
+        FILE_HEAD_COMMENT
+        + "// [0045 L2PF] included by marlin.cu (namespace MARLIN_NAMESPACE_NAME, under #if MARLIN_L2PF). The declarations\n"
+        + "// repeat marlin.cu's own (harmless) so this header does not depend on where the family blocks sit.\n"
+        + "\n".join(decls)
+        + "\n\n// The L2PF twin of the kernel a launch selected (served / XS / OPR / XSOPR and their SP twins), or nullptr (no twin:\n"
+        + "// keep the kernel).\n"
+        + "static MarlinFuncPtr get_marlin_l2pf_twin(MarlinFuncPtr base, const char** name) {\n"
+        + "\n".join(body)
+        + ("\n" if body else "")
+        + "  return nullptr;\n}\n"
+    )
+    with open(os.path.join(here, "kernel_selector_l2pf.h"), "w") as f:
+        f.write(selector)
+
+
+# [0047 ENGAGE-TELL cuda 10-06] kernel_engage_names.h for marlin.cu's VLLM_MARLIN_ENGAGE_TELL tell: one {kernel, "<Family><args>"}
+# entry per kernel expression of every generated kernel_selector*.h (the text each selector assigns or maps to; args as written
+# here, `vllm::kS8.id()` -> `kS8`, no spaces), under the MARLIN_* conditions that selector entry is compiled under (its #include
+# site in marlin.cu + any #if inside the header). Other conditionals at the include site (the __CUDA_ARCH__ < 750 split) must be
+# the table's own (asserted). A #else / #elif of a MARLIN_* #if is refused. A kernel named in several selectors gets the weakest
+# condition (fewest MARLIN_* macros) of those it is named under.
+# Registered with atexit in __main__: it runs after every generate_* call, including calls a later patch appends.
+ENGAGE_RE = re.compile(r"\b(Marlin[A-Z0-9]*)<(vllm::k\w+\.id\(\), vllm::k\w+\.id\(\), vllm::k\w+\.id\(\), vllm::k\w+\.id\(\), [^<>;]*)>")
+ENGAGE_FAMILY_DECL = (
+    "template <const vllm::ScalarTypeId a_type_id, const vllm::ScalarTypeId b_type_id, const vllm::ScalarTypeId c_type_id, "
+    "const vllm::ScalarTypeId s_type_id, const int threads, const int thread_m_blocks, const int thread_n_blocks, "
+    "const int thread_k_blocks, const bool m_block_size_8, const int stages, const int group_blocks, const bool is_zp_float>\n"
+    "__global__ void FAMILY(MARLIN_KERNEL_PARAMS);"
+)
+
+
+def _engage_conds(lines, what):
+    """per line: (MARLIN_* '#if' lines in force, every other conditional in force, MARLIN_* '#if's in their #else)."""
+    stack, out = [], []
+    for i, ln in enumerate(lines):
+        s = ln.strip()
+        if s.startswith(("#if ", "#ifdef ", "#ifndef ")):
+            stack.append([s, False])
+        elif s.startswith(("#else", "#elif")):
+            assert stack, f"[0047] {what}:{i + 1}: {s} without #if"
+            stack[-1][1] = True
+        elif s.startswith("#endif"):
+            assert stack, f"[0047] {what}:{i + 1}: #endif without #if"
+            stack.pop()
+        is_feat = [re.fullmatch(r"#if MARLIN_[A-Z0-9_]+( && MARLIN_[A-Z0-9_]+)*", c) is not None for c, _ in stack]
+        out.append((tuple(c for (c, e), f in zip(stack, is_feat) if f and not e),
+                    tuple(c + (" #else" if e else "") for (c, e), f in zip(stack, is_feat) if not f),
+                    [c for (c, e), f in zip(stack, is_feat) if f and e]))
+    assert not stack, f"[0047] {what}: unterminated #if"
+    return out
+
+
+def _engage_at_exit(here):
+    """atexit runs after the module's __file__ is gone and swallows exceptions (exit status 0): take the dir as an argument and
+    turn any failure into a non-zero exit, so CMake's generation step fails instead of a missing header later."""
+    try:
+        generate_engage_names(here)
+    except BaseException:  # noqa: BLE001
+        import traceback
+        traceback.print_exc()
+        sys.stderr.flush()
+        os._exit(1)
+
+
+def generate_engage_names(here):
+    with open(os.path.join(here, "marlin.cu")) as f:
+        cu = f.read().splitlines()
+    conds = _engage_conds(cu, "marlin.cu")
+    sites, own = {}, None
+    for i, ln in enumerate(cu):
+        m = re.match(r'\s*#include "(kernel_selector\w*\.h|kernel_engage_names\.h)"', ln)
+        if not m:
+            continue
+        feat, other, bad = conds[i]
+        assert not bad, f"[0047] marlin.cu:{i + 1}: {m.group(1)} sits in the #else of {bad}"
+        if m.group(1) == "kernel_engage_names.h":
+            assert own is None and not feat, "[0047] kernel_engage_names.h: included once, outside every MARLIN_* #if"
+            own = other
+        else:
+            assert m.group(1) not in sites, f"[0047] {m.group(1)} included twice"
+            sites[m.group(1)] = (feat, other)
+    assert own is not None, "[0047] marlin.cu does not include kernel_engage_names.h"
+    assert "kernel_selector.h" in sites, "[0047] marlin.cu does not include kernel_selector.h"
+    entries, seen, fams = [], {}, []
+    # [0061 COLFPF v2] kernel_selector_cpf.h last: its maps name the ZPP / ZPPTPF / XS siblings too, and a kernel keeps the place it
+    # was first named at, so reading it last leaves every earlier line of kernel_engage_names.h where it was (CPF rows appended)
+    # [0063 KU3STPF] kernel_selector_ku3stpf.h after it, for the same reason (its rows are appended after the CPF rows)
+    for h in sorted(sites, key=lambda x: (x != "kernel_selector.h", x == "kernel_selector_ku3stpf.h", x == "kernel_selector_cpf.h", x)):
+        feat, other = sites[h]
+        assert other == own, f"[0047] {h} is included under {other}, kernel_engage_names.h under {own}"
+        with open(os.path.join(here, h)) as f:
+            hl = f.read().splitlines()
+        for j, (ln, (hf, ho, hb)) in enumerate(zip(hl, _engage_conds(hl, h))):
+            if ln.lstrip().startswith("#"):
+                continue
+            for fam, args in ENGAGE_RE.findall(ln):
+                assert not ho and not hb, f"[0047] {h}:{j + 1}: a kernel under {ho or hb}"
+                expr = f"{fam}<{args}>"
+                if expr in seen:   # named again (e.g. a base kernel in the SP map): keep the weakest condition it is compiled under
+                    i = seen[expr]
+                    if sum(c.count("MARLIN_") for c in feat + hf) < sum(c.count("MARLIN_") for c in entries[i][0]):
+                        entries[i] = (feat + hf, expr, entries[i][2])
+                    continue
+                seen[expr] = len(entries)
+                if fam not in fams:
+                    fams.append(fam)
+                text = fam + "<" + ",".join(a.strip().replace("vllm::", "").replace(".id()", "") for a in args.split(",")) + ">"
+                entries.append((feat + hf, expr, text))
+    assert entries, "[0047] no kernel expression in any kernel_selector*.h"
+    out = [FILE_HEAD_COMMENT.rstrip("\n"),
+           "// [0047 ENGAGE-TELL] included by marlin.cu (namespace MARLIN_NAMESPACE_NAME) after struct KtEngageName: the template text",
+           "// of every kernel a selector can choose, keyed by the kernel. The declarations repeat marlin.cu's own (harmless).", ""]
+    # [0043 TAILPF] TPF families take MarlinTpfDesc first: declared with that signature under MARLIN_TAILPF (tailpf_desc.h),
+    # like their entries; every other family as 0047 declares it
+    out += [ENGAGE_FAMILY_DECL.replace("FAMILY", fam) for fam in fams if not fam.endswith("TPF")]
+    if any(fam.endswith("TPF") for fam in fams):
+        out += ["#if MARLIN_TAILPF", '#include "tailpf_desc.h"']
+        out += [ENGAGE_FAMILY_DECL.replace("FAMILY(MARLIN_KERNEL_PARAMS)", fam + "(MarlinTpfDesc, MARLIN_KERNEL_PARAMS)")
+                for fam in fams if fam.endswith("TPF")]
+        out += ["#endif"]
+    out += ["", "static const KtEngageName kt_engage_names[] = {"]
+    cur = ()
+    for g, expr, text in entries:
+        if g != cur:
+            out += ["#endif"] * len(cur) + list(g)
+            cur = g
+        if expr.split("<", 1)[0].endswith("TPF"):  # [0043 TAILPF] identity key of a twin with the descriptor parameter
+            assert any("MARLIN_TAILPF" in c for c in g), f"[0043] {expr} outside MARLIN_TAILPF"
+            out.append(f'  {{reinterpret_cast<MarlinFuncPtr>(&{expr}), "{text}"}},')
+        else:
+            out.append(f'  {{{expr}, "{text}"}},')
+    out += ["#endif"] * len(cur) + ["  {nullptr, nullptr}};", ""]
+    with open(os.path.join(here, "kernel_engage_names.h"), "w") as f:
+        f.write("\n".join(out))
+
+
+# [0043 TAILPF] Next-launch prefetch twins: <family>TPF<...> = the family kernel (Marlin, MarlinXS, MarlinOPR, MarlinXSOPR) with the
+# tail prefetch of the NEXT Marlin launch's group scales / zero points (+ its first B stages) compiled in (the TU defines
+# MARLIN_TPF_TWIN 1 next to the family's own macros) and MarlinTpfDesc as its FIRST parameter. Configs = every M 17..64
+# (thread_m_blocks 2..4) decode config of the served model, i.e. OPR_TWINS: the 128-thread {thread_k 128, thread_n 64} W4A8 tile
+# (kS8 x kU4 g64 gate_up / down, g32 in_qkvz / out_proj / lm_head, kS8 x kU4B8 g64 drafter), the W8A16 o_proj tile on the same
+# shape (kBFloat16 x kU8B128 g128) and the 256-thread {64, 256} W8A16 qkv tile. A family gets a TPF twin for every TPF config it
+# instantiates itself (one TPF_FAMILIES row per family). Not covered: M <= 16 (256-thread tnb-8 tiles) and the prefill tiles.
+# + the W4A16 attention decode tiles of the W8 / W9 arms (TC38-Q3A-SQ75c4v2-A4G64-r1: kU4 g32; A64G64/A16: kU4 g64; reach
+# tables 200dcfc0 / aa074f7a: o_proj {128, 64, 128}, qkv {64, 256, 256} at M 17..64 run the served Marlin<kBFloat16, kU4, ...>);
+# no XS / OPR / XSOPR twin has these configs, so only the plain family gets them
+# [0062 A16TPF] + thread_m_blocks 1 of the 128-thread tile: 0057 A16FS pins the served attention shapes (14336x5120, 5120x6144)
+# to {128, 64, 128} at EVERY M with m_block_size_8 = 0, so its M <= 16 launches run Marlin<kBFloat16, kU4, ..., 128, 1, 4, 8,
+# false, 4, g, false> (a served instantiation, asserted below like every twin)
+TPF_A16W4 = ([("kBFloat16", "kU4", "kBFloat16", 128, m, 4, 8, g) for g in (2, 4) for m in (1, 2, 3, 4)]
+             + [("kBFloat16", "kU4", "kBFloat16", 256, m, 16, 4, g) for g in (2, 4) for m in (2, 3, 4)])
+TPF_TWINS = list(OPR_TWINS) + TPF_A16W4
+# (family, config) pairs with NO TPF twin: no instantiation, no selector entry -> get_marlin_tpf_twin() returns nullptr and the
+# launch keeps its family kernel (still a successor other launches prefetch for). These four 255-register tmb-4 bodies spill
+# 1..3 more registers than their siblings with ANY instruction after the main loop -- one unpredicated prefetch already does,
+# an empty asm volatile does not; laundered inputs, a loop-free / unrolled tail and an out-of-line tail (scalar arguments,
+# __grid_constant__ pointer, by value) all keep the spills (tailpf/exp_tail.run*.out). The twin screen (tpf_twin_check)
+# admits no extra spill, so they stay on the family kernel (the 0041-MR14-4 pattern).
+TPF_EXCLUDE = {
+    ("MarlinOPR", ("kS8", "kU4", "kBFloat16", 128, 4, 4, 8, 2)),
+    ("MarlinOPR", ("kBFloat16", "kU8B128", "kBFloat16", 128, 4, 4, 8, 8)),
+    ("MarlinOPR", ("kBFloat16", "kU8B128", "kBFloat16", 256, 4, 16, 4, 8)),
+    ("MarlinXSOPR", ("kS8", "kU4", "kBFloat16", 128, 4, 4, 8, 2)),
+}
+TPF_FAMILIES = [
+    ("Marlin", "", [], "1", None),
+    ("MarlinXS", "_xs", ["MARLIN_XS_TWIN"], "MARLIN_XSLICE", XS_TWINS),
+    ("MarlinOPR", "_opr", ["MARLIN_OPR_TWIN"], "MARLIN_OPR", OPR_TWINS),
+    ("MarlinXSOPR", "_xsopr", ["MARLIN_XS_TWIN", "MARLIN_OPR_TWIN"], "MARLIN_XSLICE && MARLIN_OPR", XSOPR_TWINS),
+]
+
+
+def generate_tpf_twins():
+    """[0043 TAILPF] one TU per family, sm80_kernel_tpf<suffix>_<c_type>.cu (explicit <family>TPF instantiations with the
+    descriptor parameter, compiled with MARLIN_TPF_TWIN 1 + the family's macros), and kernel_selector_tpf.h (marlin.cu: the
+    declarations and get_marlin_tpf_twin, the map from the kernel a launch selected to its TPF twin). Reads the generated
+    kernel_selector.h to assert that every twin shadows a served instantiation; writes nothing else."""
+    here = os.path.dirname(__file__)
+    decls = ([f"{SP_TPL_PARAMS}\n__global__ void {fam}(MARLIN_KERNEL_PARAMS);" for fam, _, _, _, _ in TPF_FAMILIES]
+             + [f"{SP_TPL_PARAMS}\n__global__ void {fam}TPF(MarlinTpfDesc, MARLIN_KERNEL_PARAMS);"
+                for fam, _, _, _, _ in TPF_FAMILIES])
+    inst = TEMPLATE.replace("( MARLIN_KERNEL_PARAMS )", "( MarlinTpfDesc, MARLIN_KERNEL_PARAMS )")
+    assert inst != TEMPLATE, "[0043 TAILPF] TEMPLATE parameter list moved"
+    body = []
+    if SUPPORT_SM80:
+        with open(os.path.join(here, "kernel_selector.h")) as f:
+            served = f.read()
+        for fam, suffix, macros, switch, fam_configs in TPF_FAMILIES:
+            templates, maps = [], []
+            for tw in TPF_TWINS:
+                if fam_configs is not None and tw not in fam_configs:
+                    continue
+                if (fam, tw) in TPF_EXCLUDE:
+                    continue
+                a_type, b_type, c_type, threads, m_blocks, n_blocks, k_blocks, group_blocks = tw
+                ids = dict(
+                    a_type_id=f"vllm::{a_type}.id()",
+                    b_type_id=f"vllm::{b_type}.id()",
+                    c_type_id=f"vllm::{c_type}.id()",
+                    s_type_id=f"vllm::{c_type}.id()",
+                    threads=threads,
+                    thread_m_blocks=m_blocks,
+                    thread_n_blocks=n_blocks,
+                    thread_k_blocks=k_blocks,
+                    m_block_size_8="false",
+                    stages=4,
+                    group_blocks=group_blocks,
+                    is_zp_float="false",
+                )
+                args = jinja2.Template(
+                    "<{{a_type_id}}, {{b_type_id}}, {{c_type_id}}, "
+                    "{{s_type_id}}, {{threads}}, {{thread_m_blocks}}, "
+                    "{{thread_n_blocks}}, {{thread_k_blocks}}, "
+                    "{{m_block_size_8}}, {{stages}}, {{group_blocks}}, "
+                    "{{is_zp_float}}>"
+                ).render(**ids)
+                # a twin must shadow a served instantiation (same template arguments), never add a new config
+                assert f"kernel = Marlin{args};" in served, ("[0043 TAILPF] twin without a served sibling", args)
+                templates.append(jinja2.Template(inst.replace("void Marlin<", f"void {fam}TPF<")).render(**ids))
+                maps.append(f'  if (base == {fam}{args}) {{ *name = "{fam}TPF"; return {fam}TPF{args}; }}')
+            if not templates:
+                continue
+            guard = "MARLIN_TAILPF" + ("" if switch == "1" else f" && {switch}")
+            file_content = (
+                FILE_HEAD_COMMENT
+                + f"// [0043 TAILPF] TPF twins of {fam}: this TU alone compiles marlin_template.h with the next-launch prefetch.\n"
+                + "#define MARLIN_TPF_TWIN 1\n"
+                + "".join(f"#define {m} 1\n" for m in macros)
+                + FILE_HEAD[len(FILE_HEAD_COMMENT):]
+                + f"\n#if {guard}\n\n"
+                + "\n\n".join(templates)
+                + "\n\n#endif\n\n}\n"
+            )
+            filename = f"sm80_kernel_tpf{suffix}_{c_type[1:]}.cu".lower()
+            with open(os.path.join(here, filename), "w") as f:
+                f.write(file_content)
+            body.append(f"#if {guard}\n" + "\n".join(maps) + "\n#endif")
+    selector = (
+        FILE_HEAD_COMMENT
+        + "// [0043 TAILPF] included by marlin.cu (namespace MARLIN_NAMESPACE_NAME, under #if MARLIN_TAILPF, after tailpf_desc.h and\n"
+        + "// MarlinTpfFuncPtr). The family declarations repeat marlin.cu's own (harmless).\n"
+        + "\n".join(decls)
+        + "\n\n// The TPF twin of the kernel a launch selected (served / XS / OPR / XSOPR), or nullptr (no twin: keep the kernel).\n"
+        + "static MarlinTpfFuncPtr get_marlin_tpf_twin(MarlinFuncPtr base, const char** name) {\n"
+        + "\n".join(body)
+        + ("\n" if body else "")
+        + "  return nullptr;\n}\n"
+    )
+    with open(os.path.join(here, "kernel_selector_tpf.h"), "w") as f:
+        f.write(selector)
+
+
+# [0051 ZPPACK] Zero-point-in-scale-word twins: <family>ZPP<...> = the family kernel (Marlin, MarlinXS) reading a packed scale
+# tensor, every 16-bit word [zp:4][code:12] (the TU defines MARLIN_ZPPACK_TWIN 1 next to the family's own macros): no zero-point
+# cp.async, the zp nibbles come out of the scale stage, the u -> 4096 fix restores the 13-bit code. Configs = EVERY int8-activation
+# x asymmetric uint4 (kS8 x kU4, bf16 out) instantiation with group_blocks 2 (g32: lm_head) or 4 (g64: gate_up, down, in_qkvz,
+# out_proj) that the served host can select at thread_m_blocks <= 4 (VLLM_MARLIN_MAX_TMB <= 4; the gate refuses a higher
+# ceiling): the 128-thread {thread_k 128, thread_n 64} and {64, 128} tiles at tmb 1..4, the 256-thread {128, 128} tile at tmb 1
+# and {64, 256} at tmb 2..4. A packed tensor has no served fallback (its scale words are not the family's), so the set is closed:
+# marlin_mm hard-fails a packed launch whose kernel has no ZPP twin. The XS family gets a twin for every ZPP config it
+# instantiates itself (XS_TWINS). (a_type, b_type, c_type, threads, thread_m_blocks, thread_n_blocks, thread_k_blocks, group_blocks)
+ZPP_TWINS = [
+    *[("kS8", "kU4", "kBFloat16", 128, m, n, k, g) for g in (2, 4) for m in (1, 2, 3, 4) for n, k in ((4, 8), (8, 4))],
+    *[("kS8", "kU4", "kBFloat16", 256, 1, 8, 8, g) for g in (2, 4)],
+    *[("kS8", "kU4", "kBFloat16", 256, m, 16, 4, g) for g in (2, 4) for m in (2, 3, 4)],
+]
+# (family kernel name, TU suffix, macros the family's TU defines, build switch of the family, the family's configs or None =
+# every served instantiation). The ZPP kernel name = family name + "ZPP" (marlin_template.h MARLIN_ZPPACK_TWIN name block).
+ZPP_FAMILIES = [
+    ("Marlin", "", [], "1", None),
+    ("MarlinXS", "_xs", ["MARLIN_XS_TWIN"], "MARLIN_XSLICE", XS_TWINS),
+]
+
+
+def generate_zpp_twins():
+    """[0051 ZPPACK] one TU per family, sm80_kernel_zpp<suffix>_<c_type>.cu (explicit <family>ZPP instantiations, compiled with
+    MARLIN_ZPPACK_TWIN 1 + the family's macros), and kernel_selector_zpp.h (marlin.cu: the declarations and get_marlin_zpp_twin,
+    the map from the kernel a launch selected to its ZPP twin). Reads the generated kernel_selector.h to assert that every twin
+    shadows a served instantiation; writes nothing else, so every other generated file is unchanged (kernel_engage_names.h gains
+    the ZPP rows through the [0047] atexit pass)."""
+    here = os.path.dirname(__file__)
+    decls = [f"{SP_TPL_PARAMS}\n__global__ void {fam}{z}(MARLIN_KERNEL_PARAMS);"
+             for fam, _, _, _, _ in ZPP_FAMILIES for z in ("", "ZPP")]
+    body = []
+    if SUPPORT_SM80:
+        with open(os.path.join(here, "kernel_selector.h")) as f:
+            served = f.read()
+        # closure: EVERY served kS8 x kU4 -> bf16 config with group_blocks 2 / 4 at thread_m_blocks <= 4 has a twin (a packed
+        # launch has no served fallback, so a config the host can select must never be missing)
+        reach = set(re.findall(r"kernel = Marlin<vllm::kS8\.id\(\), vllm::kU4\.id\(\), vllm::kBFloat16\.id\(\), "
+                               r"vllm::kBFloat16\.id\(\), (\d+), ([1-4]), (\d+), (\d+), false, 4, ([24]), false>;", served))
+        have = {(str(t[3]), str(t[4]), str(t[5]), str(t[6]), str(t[7])) for t in ZPP_TWINS}
+        assert reach == have, ("[0051 ZPPACK] ZPP_TWINS is not the served kS8 x kU4 g32/g64 tmb<=4 set",
+                               sorted(reach - have), sorted(have - reach))
+        for fam, suffix, macros, switch, fam_configs in ZPP_FAMILIES:
+            templates, maps = [], []
+            for tw in ZPP_TWINS:
+                if fam_configs is not None and tw not in fam_configs:
+                    continue
+                a_type, b_type, c_type, threads, m_blocks, n_blocks, k_blocks, group_blocks = tw
+                ids = dict(
+                    a_type_id=f"vllm::{a_type}.id()",
+                    b_type_id=f"vllm::{b_type}.id()",
+                    c_type_id=f"vllm::{c_type}.id()",
+                    s_type_id=f"vllm::{c_type}.id()",
+                    threads=threads,
+                    thread_m_blocks=m_blocks,
+                    thread_n_blocks=n_blocks,
+                    thread_k_blocks=k_blocks,
+                    m_block_size_8="false",
+                    stages=4,
+                    group_blocks=group_blocks,
+                    is_zp_float="false",
+                )
+                args = jinja2.Template(
+                    "<{{a_type_id}}, {{b_type_id}}, {{c_type_id}}, "
+                    "{{s_type_id}}, {{threads}}, {{thread_m_blocks}}, "
+                    "{{thread_n_blocks}}, {{thread_k_blocks}}, "
+                    "{{m_block_size_8}}, {{stages}}, {{group_blocks}}, "
+                    "{{is_zp_float}}>"
+                ).render(**ids)
+                # a twin must shadow a served instantiation (same template arguments), never add a new config
+                assert f"kernel = Marlin{args};" in served, ("[0051 ZPPACK] twin without a served sibling", args)
+                templates.append(jinja2.Template(TEMPLATE.replace("void Marlin<", f"void {fam}ZPP<")).render(**ids))
+                maps.append(f'  if (base == {fam}{args}) {{ *name = "{fam}ZPP"; return {fam}ZPP{args}; }}')
+            if not templates:
+                continue
+            guard = "MARLIN_ZPPACK" + ("" if switch == "1" else f" && {switch}")
+            file_content = (
+                FILE_HEAD_COMMENT
+                + f"// [0051 ZPPACK] ZPP twins of {fam}: this TU alone compiles marlin_template.h for the packed scale words.\n"
+                + "#define MARLIN_ZPPACK_TWIN 1\n"
+                + "".join(f"#define {m} 1\n" for m in macros)
+                + FILE_HEAD[len(FILE_HEAD_COMMENT):]
+                + f"\n#if {guard}\n\n"
+                + "\n\n".join(templates)
+                + "\n\n#endif\n\n}\n"
+            )
+            filename = f"sm80_kernel_zpp{suffix}_{c_type[1:]}.cu".lower()
+            with open(os.path.join(here, filename), "w") as f:
+                f.write(file_content)
+            body.append(f"#if {guard}\n" + "\n".join(maps) + "\n#endif")
+    selector = (
+        FILE_HEAD_COMMENT
+        + "// [0051 ZPPACK] included by marlin.cu (namespace MARLIN_NAMESPACE_NAME, under #if MARLIN_ZPPACK). The declarations\n"
+        + "// repeat marlin.cu's own (harmless) so this header does not depend on where the family blocks sit.\n"
+        + "\n".join(decls)
+        + "\n\n// The ZPP twin of the kernel a launch selected (served / XS), or nullptr (no twin).\n"
+        + "static MarlinFuncPtr get_marlin_zpp_twin(MarlinFuncPtr base, const char** name) {\n"
+        + "\n".join(body)
+        + ("\n" if body else "")
+        + "  return nullptr;\n}\n"
+    )
+    with open(os.path.join(here, "kernel_selector_zpp.h"), "w") as f:
+        f.write(selector)
+
+
+# [0052 ZPPTPF] ZPPACK x TAILPF twins: <family>ZPPTPF<...> = the ZPP twin of the family (Marlin, MarlinXS: packed scale words, no
+# zero-point cp.async) compiled with TAILPF's next-launch tail prefetch and MarlinTpfDesc as its FIRST parameter (the TU defines
+# MARLIN_ZPPACK_TWIN 1, MARLIN_TPF_TWIN 1 and the family's macros). Configs = the ZPP configs TAILPF covers (ZPP_TWINS that are
+# TPF_TWINS: the M 17..64 decode tiles, 128 threads {thread_k 128, thread_n 64}, kS8 x kU4 g32 / g64, tmb 2..4), per family as in
+# ZPP_FAMILIES (MarlinXS: XS_TWINS). marlin.cu maps the ZPP twin a packed launch selected to its ZPPTPF twin
+# (get_marlin_zpptpf_twin) only when VLLM_MARLIN_TAIL_PREFETCH is armed. ZPPTPF_EXCLUDE: (family, config) pairs whose twin
+# spills more than its ZPP sibling or fails the twin screen against it (TPF_EXCLUDE's rule): no instantiation, no map line ->
+# the launch keeps its ZPP twin. MarlinXS g32 tmb 4: both bodies sit at the 255-register cap and the twin's value-op multiset
+# lost one LDC.S8 + PRMT of the sibling (precheck 10-07 11:24Z); g32 is not a served group size.
+ZPPTPF_TWINS = [tw for tw in ZPP_TWINS if tw in TPF_TWINS]
+ZPPTPF_EXCLUDE = {("MarlinXS", ("kS8", "kU4", "kBFloat16", 128, 4, 4, 8, 2))}
+
+
+def generate_zpptpf_twins():
+    """[0052 ZPPTPF] one TU per ZPP family, sm80_kernel_zpptpf<suffix>_<c_type>.cu (explicit <family>ZPPTPF instantiations with
+    the descriptor parameter, compiled with MARLIN_ZPPACK_TWIN 1 + MARLIN_TPF_TWIN 1 + the family's macros), and
+    kernel_selector_zpptpf.h (marlin.cu: get_marlin_zpptpf_twin, the map from a ZPP twin to its ZPPTPF twin). Reads the generated
+    kernel_selector_zpp.h to assert that every twin shadows a ZPP twin of its family; writes nothing else."""
+    here = os.path.dirname(__file__)
+    decls = ([f"{SP_TPL_PARAMS}\n__global__ void {fam}ZPP(MARLIN_KERNEL_PARAMS);" for fam, _, _, _, _ in ZPP_FAMILIES]
+             + [f"{SP_TPL_PARAMS}\n__global__ void {fam}ZPPTPF(MarlinTpfDesc, MARLIN_KERNEL_PARAMS);"
+                for fam, _, _, _, _ in ZPP_FAMILIES])
+    inst = TEMPLATE.replace("( MARLIN_KERNEL_PARAMS )", "( MarlinTpfDesc, MARLIN_KERNEL_PARAMS )")
+    assert inst != TEMPLATE, "[0052 ZPPTPF] TEMPLATE parameter list moved"
+    assert ZPPTPF_TWINS, "[0052 ZPPTPF] no ZPP config is a TPF config"
+    body = []
+    if SUPPORT_SM80:
+        with open(os.path.join(here, "kernel_selector_zpp.h")) as f:
+            zsel = f.read()
+        for fam, suffix, macros, switch, fam_configs in ZPP_FAMILIES:
+            templates, maps = [], []
+            for tw in ZPPTPF_TWINS:
+                if fam_configs is not None and tw not in fam_configs:
+                    continue
+                if (fam, tw) in ZPPTPF_EXCLUDE:
+                    continue
+                a_type, b_type, c_type, threads, m_blocks, n_blocks, k_blocks, group_blocks = tw
+                ids = dict(
+                    a_type_id=f"vllm::{a_type}.id()",
+                    b_type_id=f"vllm::{b_type}.id()",
+                    c_type_id=f"vllm::{c_type}.id()",
+                    s_type_id=f"vllm::{c_type}.id()",
+                    threads=threads,
+                    thread_m_blocks=m_blocks,
+                    thread_n_blocks=n_blocks,
+                    thread_k_blocks=k_blocks,
+                    m_block_size_8="false",
+                    stages=4,
+                    group_blocks=group_blocks,
+                    is_zp_float="false",
+                )
+                args = jinja2.Template(
+                    "<{{a_type_id}}, {{b_type_id}}, {{c_type_id}}, "
+                    "{{s_type_id}}, {{threads}}, {{thread_m_blocks}}, "
+                    "{{thread_n_blocks}}, {{thread_k_blocks}}, "
+                    "{{m_block_size_8}}, {{stages}}, {{group_blocks}}, "
+                    "{{is_zp_float}}>"
+                ).render(**ids)
+                # a twin must shadow a ZPP twin of its family (same template arguments), never add a new config
+                assert f"return {fam}ZPP{args};" in zsel, ("[0052 ZPPTPF] twin without a ZPP sibling", fam, args)
+                templates.append(jinja2.Template(inst.replace("void Marlin<", f"void {fam}ZPPTPF<")).render(**ids))
+                maps.append(f'  if (base == {fam}ZPP{args}) {{ *name = "{fam}ZPPTPF"; return {fam}ZPPTPF{args}; }}')
+            if not templates:
+                continue
+            guard = "MARLIN_ZPPACK && MARLIN_TAILPF" + ("" if switch == "1" else f" && {switch}")
+            file_content = (
+                FILE_HEAD_COMMENT
+                + f"// [0052 ZPPTPF] ZPPTPF twins of {fam}: this TU alone compiles marlin_template.h for the packed scale words\n"
+                + "// with the next-launch tail prefetch.\n"
+                + "#define MARLIN_ZPPACK_TWIN 1\n"
+                + "#define MARLIN_TPF_TWIN 1\n"
+                + "".join(f"#define {m} 1\n" for m in macros)
+                + FILE_HEAD[len(FILE_HEAD_COMMENT):]
+                + f"\n#if {guard}\n\n"
+                + "\n\n".join(templates)
+                + "\n\n#endif\n\n}\n"
+            )
+            filename = f"sm80_kernel_zpptpf{suffix}_{c_type[1:]}.cu".lower()
+            with open(os.path.join(here, filename), "w") as f:
+                f.write(file_content)
+            body.append(f"#if {guard}\n" + "\n".join(maps) + "\n#endif")
+    selector = (
+        FILE_HEAD_COMMENT
+        + "// [0052 ZPPTPF] included by marlin.cu (namespace MARLIN_NAMESPACE_NAME, under #if MARLIN_ZPPACK and #if MARLIN_TAILPF,\n"
+        + "// after tailpf_desc.h, MarlinTpfFuncPtr and kernel_selector_zpp.h). The declarations repeat the ZPP selector's (harmless).\n"
+        + "\n".join(decls)
+        + "\n\n// The ZPPTPF twin of the ZPP twin a packed launch selected (MarlinZPP / MarlinXSZPP), or nullptr (no twin: keep it).\n"
+        + "static MarlinTpfFuncPtr get_marlin_zpptpf_twin(MarlinFuncPtr base, const char** name) {\n"
+        + "\n".join(body)
+        + ("\n" if body else "")
+        + "  return nullptr;\n}\n"
+    )
+    with open(os.path.join(here, "kernel_selector_zpptpf.h"), "w") as f:
+        f.write(selector)
+
+
+# [0061 COLFPF v2 cuda 2026-10-11] Column-factor L2-prefetch twins: <family>CPF<...> = the kernel a launch with a per-output-column
+# factor runs (fp32 [N] in global_scale: 0059 W4RCOLF on the kS8 x kU4 ZPP / ZPPTPF twins, 0055 KU3S-4 on kS8 x kU3S) with ONE
+# change: the kernel prologue L2-prefetches the factor lines (marlin_template.h MARLIN_CPF_TWIN), so the epilogue's __ldg of the
+# factor hits L2 instead of a DRAM round trip. The TU defines MARLIN_CPF_TWIN 1 next to its family's own macros; every other TU's
+# token stream is unchanged, so no body changes for a launch without the knob or without a factor (0061 v1 put the prefetch in
+# the shared template and moved the main loop of every gated body: kat968 +0.026..+0.039 ms/step dark cost). marlin.cu swaps a
+# factor launch's kernel / TPF twin for its CPF twin (get_marlin_cpf_twin / get_marlin_cpf_tpf_twin) only when
+# VLLM_MARLIN_COLFPF=1; no twin = the launch keeps its kernel (no prefetch, nothing refused). Configs, each a twin of an existing
+# sibling (asserted against the generated selectors): MarlinZPP / MarlinXSZPP = ZPP_TWINS per ZPP_FAMILIES; MarlinZPPTPF /
+# MarlinXSZPPTPF = ZPPTPF_TWINS per ZPP_FAMILIES minus ZPPTPF_EXCLUDE; Marlin kU3S = every served kS8 x kU3S instantiation;
+# MarlinXS kU3S = KU3S_XS_TWINS. The twin of a TPF twin is named <family>ZPPCPFTPF: the name ends in TPF, so 0047's
+# kernel_engage_names.h declares it with the descriptor parameter and keys it by identity.
+# CPF_SITES: (CPF twin, config) -> the SITE of its prefetch (marlin_template.h `MARLIN_CPF_SITE == k` blocks). Every site issues
+# the same prefetches -- each factor line once, grid-strided, before the main loop -- written inline or as an out-of-line call at
+# one prologue position. ptxas allocates and schedules the whole kernel at once: one more live register in the prologue re-colours
+# the main loop of most bodies, differently per body and per site. The site of a config is one whose twin's MMA region (first ..
+# last IMMA) the screen found identical to its sibling's (EXACT / REGNORM / REGBLIND) with equal REG / STACK and the prefetch
+# present. A config with no such site has NO twin (no instantiation, no map line): the launch keeps its sibling (no in-kernel
+# prefetch; with TAILPF its predecessor's tail can still prefetch the factor, marlin.cu). One TU per (family, site).
+CPF_SITES = {  # (CPF twin, config) -> prefetch site (marlin_template.h MARLIN_CPF_SITE blocks); the screen's table
+    ("MarlinCPF", ("kS8", "kU3S", "kBFloat16", 128, 1, 4, 8, 2)): 5,
+    ("MarlinCPF", ("kS8", "kU3S", "kBFloat16", 128, 1, 8, 4, 8)): 1,
+    ("MarlinCPF", ("kS8", "kU3S", "kBFloat16", 128, 2, 4, 8, 2)): 4,
+    ("MarlinCPF", ("kS8", "kU3S", "kBFloat16", 128, 2, 4, 8, 4)): 2,
+    ("MarlinCPF", ("kS8", "kU3S", "kBFloat16", 128, 2, 8, 4, 2)): 1,
+    ("MarlinCPF", ("kS8", "kU3S", "kBFloat16", 128, 2, 8, 4, 4)): 1,
+    ("MarlinCPF", ("kS8", "kU3S", "kBFloat16", 128, 2, 8, 4, 8)): 2,
+    ("MarlinCPF", ("kS8", "kU3S", "kBFloat16", 128, 3, 4, 8, 2)): 1,
+    ("MarlinCPF", ("kS8", "kU3S", "kBFloat16", 128, 3, 4, 8, 4)): 1,
+    ("MarlinCPF", ("kS8", "kU3S", "kBFloat16", 128, 3, 4, 8, 8)): 1,
+    ("MarlinCPF", ("kS8", "kU3S", "kBFloat16", 128, 3, 8, 4, 2)): 1,
+    ("MarlinCPF", ("kS8", "kU3S", "kBFloat16", 128, 3, 8, 4, 4)): 3,
+    ("MarlinCPF", ("kS8", "kU3S", "kBFloat16", 128, 4, 4, 8, 2)): 1,
+    ("MarlinCPF", ("kS8", "kU3S", "kBFloat16", 128, 4, 4, 8, 4)): 6,
+    ("MarlinCPF", ("kS8", "kU3S", "kBFloat16", 128, 4, 4, 8, 8)): 6,
+    ("MarlinCPF", ("kS8", "kU3S", "kBFloat16", 128, 4, 8, 4, 2)): 1,
+    ("MarlinCPF", ("kS8", "kU3S", "kBFloat16", 128, 4, 8, 4, 4)): 1,
+    ("MarlinCPF", ("kS8", "kU3S", "kBFloat16", 128, 4, 8, 4, 8)): 4,
+    ("MarlinCPF", ("kS8", "kU3S", "kBFloat16", 256, 2, 16, 4, 2)): 4,
+    ("MarlinCPF", ("kS8", "kU3S", "kBFloat16", 256, 2, 16, 4, 4)): 1,
+    ("MarlinCPF", ("kS8", "kU3S", "kBFloat16", 256, 2, 16, 4, 8)): 8,
+    ("MarlinCPF", ("kS8", "kU3S", "kBFloat16", 256, 3, 16, 4, 2)): 2,
+    ("MarlinCPF", ("kS8", "kU3S", "kBFloat16", 256, 3, 16, 4, 4)): 10,
+    ("MarlinCPF", ("kS8", "kU3S", "kBFloat16", 256, 3, 16, 4, 8)): 2,
+    ("MarlinCPF", ("kS8", "kU3S", "kBFloat16", 256, 4, 16, 4, 2)): 1,
+    ("MarlinCPF", ("kS8", "kU3S", "kBFloat16", 256, 4, 16, 4, 4)): 1,
+    ("MarlinCPF", ("kS8", "kU3S", "kBFloat16", 256, 4, 16, 4, 8)): 1,
+    ("MarlinXSCPF", ("kS8", "kU3S", "kBFloat16", 128, 2, 4, 8, 2)): 1,
+    ("MarlinXSCPF", ("kS8", "kU3S", "kBFloat16", 128, 2, 4, 8, 4)): 1,
+    ("MarlinXSCPF", ("kS8", "kU3S", "kBFloat16", 128, 2, 4, 8, 8)): 1,
+    ("MarlinXSCPF", ("kS8", "kU3S", "kBFloat16", 128, 3, 4, 8, 2)): 1,
+    ("MarlinXSCPF", ("kS8", "kU3S", "kBFloat16", 128, 3, 4, 8, 4)): 1,
+    ("MarlinXSCPF", ("kS8", "kU3S", "kBFloat16", 128, 3, 4, 8, 8)): 1,
+    ("MarlinXSCPF", ("kS8", "kU3S", "kBFloat16", 128, 4, 4, 8, 2)): 1,
+    ("MarlinXSCPF", ("kS8", "kU3S", "kBFloat16", 128, 4, 4, 8, 4)): 1,
+    ("MarlinXSCPF", ("kS8", "kU3S", "kBFloat16", 128, 4, 4, 8, 8)): 1,
+    ("MarlinXSZPPCPF", ("kS8", "kU4", "kBFloat16", 128, 2, 4, 8, 2)): 7,
+    ("MarlinXSZPPCPF", ("kS8", "kU4", "kBFloat16", 128, 2, 4, 8, 4)): 1,
+    ("MarlinXSZPPCPF", ("kS8", "kU4", "kBFloat16", 128, 3, 4, 8, 2)): 1,
+    ("MarlinXSZPPCPF", ("kS8", "kU4", "kBFloat16", 128, 3, 4, 8, 4)): 1,
+    ("MarlinXSZPPCPF", ("kS8", "kU4", "kBFloat16", 128, 4, 4, 8, 2)): 1,
+    ("MarlinXSZPPCPF", ("kS8", "kU4", "kBFloat16", 128, 4, 4, 8, 4)): 1,
+    ("MarlinXSZPPCPFTPF", ("kS8", "kU4", "kBFloat16", 128, 2, 4, 8, 2)): 1,
+    ("MarlinXSZPPCPFTPF", ("kS8", "kU4", "kBFloat16", 128, 3, 4, 8, 2)): 1,
+    ("MarlinXSZPPCPFTPF", ("kS8", "kU4", "kBFloat16", 128, 3, 4, 8, 4)): 1,
+    ("MarlinXSZPPCPFTPF", ("kS8", "kU4", "kBFloat16", 128, 4, 4, 8, 4)): 1,
+    ("MarlinZPPCPF", ("kS8", "kU4", "kBFloat16", 128, 1, 4, 8, 2)): 1,
+    ("MarlinZPPCPF", ("kS8", "kU4", "kBFloat16", 128, 1, 4, 8, 4)): 1,
+    ("MarlinZPPCPF", ("kS8", "kU4", "kBFloat16", 128, 1, 8, 4, 2)): 1,
+    ("MarlinZPPCPF", ("kS8", "kU4", "kBFloat16", 128, 1, 8, 4, 4)): 1,
+    ("MarlinZPPCPF", ("kS8", "kU4", "kBFloat16", 128, 2, 4, 8, 2)): 5,
+    ("MarlinZPPCPF", ("kS8", "kU4", "kBFloat16", 128, 2, 4, 8, 4)): 3,
+    ("MarlinZPPCPF", ("kS8", "kU4", "kBFloat16", 128, 2, 8, 4, 2)): 1,
+    ("MarlinZPPCPF", ("kS8", "kU4", "kBFloat16", 128, 3, 4, 8, 2)): 3,
+    ("MarlinZPPCPF", ("kS8", "kU4", "kBFloat16", 128, 3, 4, 8, 4)): 2,
+    ("MarlinZPPCPF", ("kS8", "kU4", "kBFloat16", 128, 3, 8, 4, 2)): 1,
+    ("MarlinZPPCPF", ("kS8", "kU4", "kBFloat16", 128, 3, 8, 4, 4)): 1,
+    ("MarlinZPPCPF", ("kS8", "kU4", "kBFloat16", 128, 4, 4, 8, 2)): 1,
+    ("MarlinZPPCPF", ("kS8", "kU4", "kBFloat16", 128, 4, 4, 8, 4)): 1,
+    ("MarlinZPPCPF", ("kS8", "kU4", "kBFloat16", 128, 4, 8, 4, 2)): 1,
+    ("MarlinZPPCPF", ("kS8", "kU4", "kBFloat16", 128, 4, 8, 4, 4)): 1,
+    ("MarlinZPPCPF", ("kS8", "kU4", "kBFloat16", 256, 1, 8, 8, 2)): 1,
+    ("MarlinZPPCPF", ("kS8", "kU4", "kBFloat16", 256, 1, 8, 8, 4)): 1,
+    ("MarlinZPPCPF", ("kS8", "kU4", "kBFloat16", 256, 2, 16, 4, 2)): 9,
+    ("MarlinZPPCPF", ("kS8", "kU4", "kBFloat16", 256, 3, 16, 4, 2)): 2,
+    ("MarlinZPPCPF", ("kS8", "kU4", "kBFloat16", 256, 3, 16, 4, 4)): 3,
+    ("MarlinZPPCPF", ("kS8", "kU4", "kBFloat16", 256, 4, 16, 4, 2)): 2,
+    ("MarlinZPPCPF", ("kS8", "kU4", "kBFloat16", 256, 4, 16, 4, 4)): 4,
+    ("MarlinZPPCPFTPF", ("kS8", "kU4", "kBFloat16", 128, 2, 4, 8, 2)): 1,
+    ("MarlinZPPCPFTPF", ("kS8", "kU4", "kBFloat16", 128, 2, 4, 8, 4)): 1,
+    ("MarlinZPPCPFTPF", ("kS8", "kU4", "kBFloat16", 128, 3, 4, 8, 2)): 1,
+    ("MarlinZPPCPFTPF", ("kS8", "kU4", "kBFloat16", 128, 3, 4, 8, 4)): 1,
+    ("MarlinZPPCPFTPF", ("kS8", "kU4", "kBFloat16", 128, 4, 4, 8, 2)): 1,
+    ("MarlinZPPCPFTPF", ("kS8", "kU4", "kBFloat16", 128, 4, 4, 8, 4)): 1,
+}
+
+
+def generate_cpf_twins():
+    """[0061 COLFPF v2] one TU per (CPF family, prefetch site), sm80_kernel_cpf<suffix>_s<site>_bfloat16.cu (explicit <twin>
+    instantiations of the CPF_SITES configs compiled with MARLIN_CPF_TWIN 1, MARLIN_CPF_SITE <site> + the sibling family's macros),
+    and kernel_selector_cpf.h (marlin.cu: get_marlin_cpf_twin, the map from the
+    kernel a factor launch selected to its CPF twin, and under MARLIN_TAILPF get_marlin_cpf_tpf_twin, the map from its ZPPTPF twin).
+    Reads the generated kernel_selector.h / _xs.h / _zpp.h / _zpptpf.h to assert that every twin shadows its sibling; writes
+    nothing else."""
+    here = os.path.dirname(__file__)
+    xs_cfgs = [t for t in ZPP_TWINS if t in XS_TWINS]
+    zpptpf = [t for t in ZPPTPF_TWINS if ("Marlin", t) not in ZPPTPF_EXCLUDE]
+    zpptpf_xs = [t for t in ZPPTPF_TWINS if t in XS_TWINS and ("MarlinXS", t) not in ZPPTPF_EXCLUDE]
+    # (twin, sibling, TU suffix, macros, build guard, configs or None = every served kS8 x kU3S config, selector file the sibling
+    # is mapped in, TPF signature)
+    fams = [
+        ("MarlinZPPCPF", "MarlinZPP", "_zpp", ["MARLIN_ZPPACK_TWIN"], "MARLIN_ZPPACK", ZPP_TWINS, "kernel_selector_zpp.h", False),
+        ("MarlinXSZPPCPF", "MarlinXSZPP", "_zpp_xs", ["MARLIN_ZPPACK_TWIN", "MARLIN_XS_TWIN"], "MARLIN_ZPPACK && MARLIN_XSLICE",
+         xs_cfgs, "kernel_selector_zpp.h", False),
+        ("MarlinCPF", "Marlin", "_u3s", [], "", None, "kernel_selector.h", False),
+        ("MarlinXSCPF", "MarlinXS", "_xs_u3s", ["MARLIN_XS_TWIN"], "MARLIN_XSLICE", KU3S_XS_TWINS, "kernel_selector_xs.h", False),
+        ("MarlinZPPCPFTPF", "MarlinZPPTPF", "_zpptpf", ["MARLIN_ZPPACK_TWIN", "MARLIN_TPF_TWIN"], "MARLIN_ZPPACK && MARLIN_TAILPF",
+         zpptpf, "kernel_selector_zpptpf.h", True),
+        ("MarlinXSZPPCPFTPF", "MarlinXSZPPTPF", "_zpptpf_xs", ["MARLIN_ZPPACK_TWIN", "MARLIN_TPF_TWIN", "MARLIN_XS_TWIN"],
+         "MARLIN_ZPPACK && MARLIN_TAILPF && MARLIN_XSLICE", zpptpf_xs, "kernel_selector_zpptpf.h", True),
+    ]
+    inst_tpf = TEMPLATE.replace("( MARLIN_KERNEL_PARAMS )", "( MarlinTpfDesc, MARLIN_KERNEL_PARAMS )")
+    assert inst_tpf != TEMPLATE, "[0061 COLFPF] TEMPLATE parameter list moved"
+    plain_maps, tpf_maps, used = [], [], set()
+    if SUPPORT_SM80:
+        sels = {}
+        for _, _, _, _, _, _, sel, _ in fams:
+            if sel not in sels:
+                with open(os.path.join(here, sel)) as f:
+                    sels[sel] = f.read()
+        u3s = sorted(set(re.findall(r"kernel = Marlin<vllm::kS8\.id\(\), vllm::kU3S\.id\(\), vllm::kBFloat16\.id\(\), "
+                                    r"vllm::kBFloat16\.id\(\), (\d+), (\d+), (\d+), (\d+), false, 4, (\d+), false>;",
+                                    sels["kernel_selector.h"])),
+                     key=lambda c: tuple(int(x) for x in c))
+        assert u3s, "[0061 COLFPF] no served kS8 x kU3S instantiation in kernel_selector.h"
+        u3s_cfgs = [("kS8", "kU3S", "kBFloat16", int(t), int(m), int(n), int(k), int(g)) for t, m, n, k, g in u3s]
+        for twin, sib, suffix, macros, guard, cfgs, sel, tpf in fams:
+            templates, maps = {}, []
+            for tw in (u3s_cfgs if cfgs is None else cfgs):
+                site = CPF_SITES.get((twin, tw))
+                if site is None:
+                    continue
+                used.add((twin, tw))
+                a_type, b_type, c_type, threads, m_blocks, n_blocks, k_blocks, group_blocks = tw
+                assert a_type == "kS8" and b_type in ("kU4", "kU3S") and group_blocks in (2, 4, 8), ("[0061 COLFPF] not a factor body",
+                                                                                                  twin, tw)
+                ids = dict(
+                    a_type_id=f"vllm::{a_type}.id()",
+                    b_type_id=f"vllm::{b_type}.id()",
+                    c_type_id=f"vllm::{c_type}.id()",
+                    s_type_id=f"vllm::{c_type}.id()",
+                    threads=threads,
+                    thread_m_blocks=m_blocks,
+                    thread_n_blocks=n_blocks,
+                    thread_k_blocks=k_blocks,
+                    m_block_size_8="false",
+                    stages=4,
+                    group_blocks=group_blocks,
+                    is_zp_float="false",
+                )
+                args = jinja2.Template(
+                    "<{{a_type_id}}, {{b_type_id}}, {{c_type_id}}, "
+                    "{{s_type_id}}, {{threads}}, {{thread_m_blocks}}, "
+                    "{{thread_n_blocks}}, {{thread_k_blocks}}, "
+                    "{{m_block_size_8}}, {{stages}}, {{group_blocks}}, "
+                    "{{is_zp_float}}>"
+                ).render(**ids)
+                # a twin must shadow a kernel its sibling's selector can return (same template arguments), never add a new config
+                assert (f"kernel = {sib}{args};" in sels[sel] or f"return {sib}{args};" in sels[sel]), (
+                    "[0061 COLFPF] twin without a sibling", twin, args)
+                templates.setdefault(site, []).append(
+                    jinja2.Template((inst_tpf if tpf else TEMPLATE).replace("void Marlin<", f"void {twin}<")).render(**ids))
+                maps.append(f'  if (base == {sib}{args}) {{ *name = "{twin}"; return {twin}{args}; }}')
+            if not templates:
+                continue
+            full = "MARLIN_COLFPF" + (f" && {guard}" if guard else "")
+            for site, tpls in sorted(templates.items()):
+                file_content = (
+                    FILE_HEAD_COMMENT
+                    + f"// [0061 COLFPF v2] CPF twins of {sib} (prefetch site {site}): this TU alone compiles marlin_template.h with the\n"
+                    + "// column-factor prefetch.\n"
+                    + "#define MARLIN_CPF_TWIN 1\n"
+                    + f"#define MARLIN_CPF_SITE {site}\n"
+                    + "".join(f"#define {m} 1\n" for m in macros)
+                    + FILE_HEAD[len(FILE_HEAD_COMMENT):]
+                    + f"\n#if {full}\n\n"
+                    + "\n\n".join(tpls)
+                    + "\n\n#endif\n\n}\n"
+                )
+                filename = f"sm80_kernel_cpf{suffix}_s{site}_bfloat16.cu"
+                with open(os.path.join(here, filename), "w") as f:
+                    f.write(file_content)
+            block = (f"#if {guard}\n" if guard else "") + "\n".join(maps) + ("\n#endif" if guard else "")
+            (tpf_maps if tpf else plain_maps).append(block)
+        # every table row must become a twin (a row naming a config its family does not carry would silently vanish)
+        assert used == set(CPF_SITES), ("[0061 COLFPF] CPF_SITES rows with no family config", sorted(set(CPF_SITES) - used))
+    decls = ([f"{SP_TPL_PARAMS}\n__global__ void {fam}(MARLIN_KERNEL_PARAMS);"
+              for fam in ("Marlin", "MarlinXS", "MarlinZPP", "MarlinXSZPP", "MarlinCPF", "MarlinXSCPF", "MarlinZPPCPF",
+                          "MarlinXSZPPCPF")])
+    tpf_decls = ([f"{SP_TPL_PARAMS}\n__global__ void {fam}(MarlinTpfDesc, MARLIN_KERNEL_PARAMS);"
+                  for fam in ("MarlinZPPTPF", "MarlinXSZPPTPF", "MarlinZPPCPFTPF", "MarlinXSZPPCPFTPF")])
+    selector = (
+        FILE_HEAD_COMMENT
+        + "// [0061 COLFPF v2] included by marlin.cu (namespace MARLIN_NAMESPACE_NAME, under #if MARLIN_COLFPF, after the TAILPF block\n"
+        + "// (tailpf_desc.h, MarlinTpfFuncPtr) and the ZPPACK selectors). The declarations repeat marlin.cu's own (harmless).\n"
+        + "\n".join(decls)
+        + "\n#if MARLIN_TAILPF\n" + "\n".join(tpf_decls) + "\n#endif"
+        + "\n\n// The CPF twin of the kernel a column-factor launch selected (MarlinZPP / MarlinXSZPP / kU3S Marlin / MarlinXS), or\n"
+        + "// nullptr (no twin: the launch keeps its kernel).\n"
+        + "static MarlinFuncPtr get_marlin_cpf_twin(MarlinFuncPtr base, const char** name) {\n"
+        + "\n".join(plain_maps)
+        + ("\n" if plain_maps else "")
+        + "  return nullptr;\n}\n"
+        + "#if MARLIN_TAILPF\n"
+        + "// The CPF twin of the ZPPTPF twin a packed column-factor launch selected, or nullptr (no twin: the launch keeps it).\n"
+        + "static MarlinTpfFuncPtr get_marlin_cpf_tpf_twin(MarlinTpfFuncPtr base, const char** name) {\n"
+        + "\n".join(tpf_maps)
+        + ("\n" if tpf_maps else "")
+        + "  return nullptr;\n}\n#endif\n"
+    )
+    with open(os.path.join(here, "kernel_selector_cpf.h"), "w") as f:
+        f.write(selector)
+
+
+# [0063 KU3STPF cuda 2026-10-11] TAILPF twins of the kS8 x kU3S (0055 int3) bodies: <family>TPF<...kU3S...> = the kU3S family kernel
+# (Marlin, MarlinXS) with TAILPF's next-launch tail prefetch and MarlinTpfDesc first (the TU defines MARLIN_TPF_TWIN 1 + MARLIN_TPF_KU3S
+# 1 + the family's macros; marlin_template.h MARLIN_TPF_KU3S lifts 0055's no-twin assert for that TU only). 0043's TPF_TWINS hold kU4 /
+# kU4B8 / kU8B128 / A16 configs only and 0052's ZPPTPF twins are kU4: a site converted to kU3S lost the tail (its NEXT launch's scale
+# lines are no longer prefetched). Configs = every kU3S body the four int3 sites select at decode / verify M 1..64 under the served
+# knobs (INT8 activations, A8_NARROW_MIN_N=14336, MAX_TMB=4, XSLICE N 34816,16384 M 32..64; kat828 / kat884 ENGAGE lines): gate_up
+# 34816x5120, down 5120x17408, in_qkvz 16384x5120, out_proj 5120x6144 run Marlin {256 thr, thread_n 128, thread_k 128} at M 1..16
+# (tmb 1) and Marlin / MarlinXS {128 thr, thread_n 64, thread_k 128} at M 17..64 (tmb 2..4), at g32 / g64 / g128. Every other kU3S
+# instantiation (the {64, 128} tile, tmb-1 {128, 64}, the {64, 256} prefill tile) is not selected there: no twin.
+KU3STPF_TWINS = ([("kS8", "kU3S", "kBFloat16", 256, 1, 8, 8, g) for g in (2, 4, 8)]
+                 + [("kS8", "kU3S", "kBFloat16", 128, m, 4, 8, g) for g in (2, 4, 8) for m in (2, 3, 4)])
+# (family, config) pairs whose twin runs the tail out of line (MARLIN_TPF_KU3S_GC: `_gc` TUs, the descriptor a __grid_constant__
+# parameter): tmb 3, where the inline tail made ptxas allocate the body's registers differently from the sibling's (the twin screen's
+# REG bar), and tmb 2 g128, whose CPF twin passes the CPF screen only on the out-of-line form (sites 3 / 5 / 8; none inline).
+KU3STPF_GC = ({("Marlin", ("kS8", "kU3S", "kBFloat16", 128, 3, 4, 8, g)) for g in (2, 4, 8)}
+              | {("Marlin", ("kS8", "kU3S", "kBFloat16", 128, 2, 4, 8, 8))})
+# (family, config) pairs with NO twin: the twin screen failed against the sibling in every tail form (inline, out of line by value /
+# through the __grid_constant__ descriptor, scale-only): one more LDL + STL pair than the sibling (a 255-register body that spills).
+# No instantiation, no map line -> the launch keeps its kernel (NO-TWIN tell).
+KU3STPF_EXCLUDE = {("MarlinXS", ("kS8", "kU3S", "kBFloat16", 128, 4, 4, 8, 2))}
+# (family name, TU suffix, macros, build switch, the family's configs or None = every served kU3S config, sibling selector, its prefix)
+KU3STPF_FAMILIES = [
+    ("Marlin", "_u3s", [], "1", None, "kernel_selector.h", "kernel = "),
+    ("MarlinXS", "_xs_u3s", ["MARLIN_XS_TWIN"], "MARLIN_XSLICE", KU3S_XS_TWINS, "kernel_selector_xs.h", "kernel = "),
+]
+# CPF twins of the kU3S TPF twins (VLLM_MARLIN_COLFPF=1 with the knob: a column-factor launch whose TPF twin has one runs it):
+# <family>CPFTPF = the TPF twin + 0061's prologue factor prefetch at the 0061 site (marlin_template.h MARLIN_CPF_SITE block) the screen
+# found MMA-identical to the TPF twin (EXACT / REGNORM / REGBLIND, equal REG / STACK, prefetch present) -- 0061's rule and sites, the
+# sibling being the TPF twin; the config's 0061 CPF site where that one passes, else the lowest passing site. (twin, config) -> site;
+# a config without a row has no CPFTPF twin (the launch runs its TPF twin: TAILPF precedence, as 0061).
+KU3S_CPFTPF_SITES = {
+    ("MarlinCPFTPF", ("kS8", "kU3S", "kBFloat16", 256, 1, 8, 8, 2)): 2,
+    ("MarlinCPFTPF", ("kS8", "kU3S", "kBFloat16", 256, 1, 8, 8, 4)): 2,
+    ("MarlinCPFTPF", ("kS8", "kU3S", "kBFloat16", 256, 1, 8, 8, 8)): 1,
+    ("MarlinCPFTPF", ("kS8", "kU3S", "kBFloat16", 128, 2, 4, 8, 2)): 4,
+    ("MarlinCPFTPF", ("kS8", "kU3S", "kBFloat16", 128, 2, 4, 8, 4)): 2,
+    ("MarlinCPFTPF", ("kS8", "kU3S", "kBFloat16", 128, 2, 4, 8, 8)): 3,
+    ("MarlinCPFTPF", ("kS8", "kU3S", "kBFloat16", 128, 3, 4, 8, 2)): 1,
+    ("MarlinCPFTPF", ("kS8", "kU3S", "kBFloat16", 128, 3, 4, 8, 4)): 1,
+    ("MarlinCPFTPF", ("kS8", "kU3S", "kBFloat16", 128, 3, 4, 8, 8)): 1,
+    ("MarlinCPFTPF", ("kS8", "kU3S", "kBFloat16", 128, 4, 4, 8, 2)): 1,
+    ("MarlinCPFTPF", ("kS8", "kU3S", "kBFloat16", 128, 4, 4, 8, 4)): 6,
+    ("MarlinCPFTPF", ("kS8", "kU3S", "kBFloat16", 128, 4, 4, 8, 8)): 6,
+    ("MarlinXSCPFTPF", ("kS8", "kU3S", "kBFloat16", 128, 2, 4, 8, 2)): 1,
+    ("MarlinXSCPFTPF", ("kS8", "kU3S", "kBFloat16", 128, 2, 4, 8, 4)): 1,
+    ("MarlinXSCPFTPF", ("kS8", "kU3S", "kBFloat16", 128, 2, 4, 8, 8)): 1,
+    ("MarlinXSCPFTPF", ("kS8", "kU3S", "kBFloat16", 128, 3, 4, 8, 2)): 1,
+    ("MarlinXSCPFTPF", ("kS8", "kU3S", "kBFloat16", 128, 3, 4, 8, 4)): 1,
+    ("MarlinXSCPFTPF", ("kS8", "kU3S", "kBFloat16", 128, 3, 4, 8, 8)): 1,
+    ("MarlinXSCPFTPF", ("kS8", "kU3S", "kBFloat16", 128, 4, 4, 8, 4)): 1,
+    ("MarlinXSCPFTPF", ("kS8", "kU3S", "kBFloat16", 128, 4, 4, 8, 8)): 1,
+}
+
+
+def generate_ku3stpf_twins():
+    """[0063 KU3STPF] sm80_kernel_tpf<suffix>[_gc]_<c_type>.cu (explicit MarlinTPF / MarlinXSTPF kS8 x kU3S instantiations,
+    MARLIN_TPF_TWIN 1 + MARLIN_TPF_KU3S 1 [+ MARLIN_TPF_KU3S_GC 1] + the family's macros), sm80_kernel_cpftpf<suffix>[_gc]_s<site>_
+    <c_type>.cu (their CPF twins, + MARLIN_CPF_TWIN 1 + MARLIN_CPF_SITE) and kernel_selector_ku3stpf.h (marlin.cu: get_marlin_ku3stpf_twin,
+    the map from the kU3S kernel a launch selected to its TPF twin; under MARLIN_COLFPF get_marlin_ku3s_cpftpf_twin, from that TPF twin
+    to its CPF twin). Reads kernel_selector.h / _xs.h to assert that every twin shadows a kernel its family's selector returns; writes
+    nothing else."""
+    here = os.path.dirname(__file__)
+    insts = {False: TEMPLATE.replace("( MARLIN_KERNEL_PARAMS )", "( MarlinTpfDesc, MARLIN_KERNEL_PARAMS )"),
+             True: TEMPLATE.replace("( MARLIN_KERNEL_PARAMS )", "( const __grid_constant__ MarlinTpfDesc, MARLIN_KERNEL_PARAMS )")}
+    assert insts[False] != TEMPLATE, "[0063 KU3STPF] TEMPLATE parameter list moved"
+    tpf_maps, cpf_maps, used_cpf, used_gc, used_ex = [], [], set(), set(), set()
+    if SUPPORT_SM80:
+        for fam, suffix, macros, switch, fam_configs, sel, pre in KU3STPF_FAMILIES:
+            with open(os.path.join(here, sel)) as f:
+                sibs = f.read()
+            groups, maps, cmaps = {}, [], []
+            for tw in KU3STPF_TWINS:
+                if fam_configs is not None and tw not in fam_configs:
+                    continue
+                if (fam, tw) in KU3STPF_EXCLUDE:
+                    used_ex.add((fam, tw))
+                    continue
+                gc = (fam, tw) in KU3STPF_GC
+                if gc:
+                    used_gc.add((fam, tw))
+                templates, cpf_tpls = groups.setdefault(gc, ([], {}))
+                a_type, b_type, c_type, threads, m_blocks, n_blocks, k_blocks, group_blocks = tw
+                assert (a_type, b_type, c_type) == ("kS8", "kU3S", "kBFloat16"), ("[0063 KU3STPF] not a kU3S config", tw)
+                ids = dict(
+                    a_type_id=f"vllm::{a_type}.id()",
+                    b_type_id=f"vllm::{b_type}.id()",
+                    c_type_id=f"vllm::{c_type}.id()",
+                    s_type_id=f"vllm::{c_type}.id()",
+                    threads=threads,
+                    thread_m_blocks=m_blocks,
+                    thread_n_blocks=n_blocks,
+                    thread_k_blocks=k_blocks,
+                    m_block_size_8="false",
+                    stages=4,
+                    group_blocks=group_blocks,
+                    is_zp_float="false",
+                )
+                args = jinja2.Template(
+                    "<{{a_type_id}}, {{b_type_id}}, {{c_type_id}}, "
+                    "{{s_type_id}}, {{threads}}, {{thread_m_blocks}}, "
+                    "{{thread_n_blocks}}, {{thread_k_blocks}}, "
+                    "{{m_block_size_8}}, {{stages}}, {{group_blocks}}, "
+                    "{{is_zp_float}}>"
+                ).render(**ids)
+                # a twin must shadow a kernel its family's selector returns (same template arguments), never add a new config
+                assert f"{pre}{fam}{args};" in sibs, ("[0063 KU3STPF] twin without a sibling", fam, args)
+                templates.append(jinja2.Template(insts[gc].replace("void Marlin<", f"void {fam}TPF<")).render(**ids))
+                maps.append(f'  if (base == {fam}{args}) {{ *name = "{fam}TPF"; return {fam}TPF{args}; }}')
+                site = KU3S_CPFTPF_SITES.get((f"{fam}CPFTPF", tw))
+                if site is not None:
+                    used_cpf.add((f"{fam}CPFTPF", tw))
+                    cpf_tpls.setdefault(site, []).append(
+                        jinja2.Template(insts[gc].replace("void Marlin<", f"void {fam}CPFTPF<")).render(**ids))
+                    cmaps.append(f'  if (base == {fam}TPF{args}) {{ *name = "{fam}CPFTPF"; return {fam}CPFTPF{args}; }}')
+            if not groups:
+                continue
+            guard = "MARLIN_TAILPF && MARLIN_KU3STPF" + ("" if switch == "1" else f" && {switch}")
+            for gc, (templates, cpf_tpls) in sorted(groups.items()):
+                sfx = suffix + ("_gc" if gc else "")
+                defs = ("#define MARLIN_TPF_TWIN 1\n#define MARLIN_TPF_KU3S 1\n" + ("#define MARLIN_TPF_KU3S_GC 1\n" if gc else "")
+                        + "".join(f"#define {m} 1\n" for m in macros))
+                form = " (tail out of line, MARLIN_TPF_KU3S_GC)" if gc else ""
+                file_content = (
+                    FILE_HEAD_COMMENT
+                    + f"// [0063 KU3STPF] TPF twins of the kS8 x kU3S {fam}{form}: this TU alone compiles marlin_template.h for kU3S with\n"
+                    + "// the next-launch prefetch.\n"
+                    + defs
+                    + FILE_HEAD[len(FILE_HEAD_COMMENT):]
+                    + f"\n#if {guard}\n\n"
+                    + "\n\n".join(templates)
+                    + "\n\n#endif\n\n}\n"
+                )
+                with open(os.path.join(here, f"sm80_kernel_tpf{sfx}_bfloat16.cu"), "w") as f:
+                    f.write(file_content)
+                for site, tpls in sorted(cpf_tpls.items()):
+                    file_content = (
+                        FILE_HEAD_COMMENT
+                        + f"// [0063 KU3STPF] CPF twins of the kS8 x kU3S {fam}TPF{form} (0061 prefetch site {site}): this TU alone\n"
+                        + "// compiles marlin_template.h for kU3S with the next-launch prefetch and the column-factor prefetch.\n"
+                        + "#define MARLIN_CPF_TWIN 1\n"
+                        + f"#define MARLIN_CPF_SITE {site}\n"
+                        + defs
+                        + FILE_HEAD[len(FILE_HEAD_COMMENT):]
+                        + f"\n#if MARLIN_COLFPF && {guard}\n\n"
+                        + "\n\n".join(tpls)
+                        + "\n\n#endif\n\n}\n"
+                    )
+                    with open(os.path.join(here, f"sm80_kernel_cpftpf{sfx}_s{site}_bfloat16.cu"), "w") as f:
+                        f.write(file_content)
+            tpf_maps.append(("" if switch == "1" else f"#if {switch}\n") + "\n".join(maps) + ("" if switch == "1" else "\n#endif"))
+            if cmaps:
+                cpf_maps.append(("" if switch == "1" else f"#if {switch}\n") + "\n".join(cmaps)
+                                + ("" if switch == "1" else "\n#endif"))
+        # every table row must take effect (a row naming a config its family does not carry would silently vanish)
+        assert used_cpf == set(KU3S_CPFTPF_SITES), ("[0063 KU3STPF] KU3S_CPFTPF_SITES rows with no twin",
+                                                    sorted(set(KU3S_CPFTPF_SITES) - used_cpf))
+        assert used_gc == KU3STPF_GC and used_ex == KU3STPF_EXCLUDE, ("[0063 KU3STPF] KU3STPF_GC / KU3STPF_EXCLUDE rows matching no twin",
+                                                                      sorted(KU3STPF_GC - used_gc), sorted(KU3STPF_EXCLUDE - used_ex))
+    decls = ([f"{SP_TPL_PARAMS}\n__global__ void {fam}(MARLIN_KERNEL_PARAMS);" for fam in ("Marlin", "MarlinXS")]
+             + [f"{SP_TPL_PARAMS}\n__global__ void {fam}(MarlinTpfDesc, MARLIN_KERNEL_PARAMS);" for fam in ("MarlinTPF", "MarlinXSTPF")])
+    cdecls = [f"{SP_TPL_PARAMS}\n__global__ void {fam}(MarlinTpfDesc, MARLIN_KERNEL_PARAMS);" for fam in ("MarlinCPFTPF", "MarlinXSCPFTPF")]
+    selector = (
+        FILE_HEAD_COMMENT
+        + "// [0063 KU3STPF] included by marlin.cu (namespace MARLIN_NAMESPACE_NAME, under #if MARLIN_TAILPF && MARLIN_KU3STPF, after\n"
+        + "// tailpf_desc.h, MarlinTpfFuncPtr and the TAILPF / COLFPF selectors). The declarations repeat marlin.cu's own (harmless).\n"
+        + "\n".join(decls)
+        + "\n\n// The TPF twin of the kS8 x kU3S kernel a launch selected (Marlin / MarlinXS), or nullptr (no twin: the launch keeps it).\n"
+        + "static MarlinTpfFuncPtr get_marlin_ku3stpf_twin(MarlinFuncPtr base, const char** name) {\n"
+        + "\n".join(tpf_maps)
+        + ("\n" if tpf_maps else "")
+        + "  return nullptr;\n}\n"
+        + "#if MARLIN_COLFPF\n"
+        + "\n".join(cdecls)
+        + "\n// The CPF twin of the kU3S TPF twin a column-factor launch selected, or nullptr (no twin: the launch keeps its TPF twin).\n"
+        + "static MarlinTpfFuncPtr get_marlin_ku3s_cpftpf_twin(MarlinTpfFuncPtr base, const char** name) {\n"
+        + "\n".join(cpf_maps)
+        + ("\n" if cpf_maps else "")
+        + "  return nullptr;\n}\n#endif\n"
+    )
+    with open(os.path.join(here, "kernel_selector_ku3stpf.h"), "w") as f:
+        f.write(selector)
+
+
+# [0071b G2-QKVOFF cuda-g2fin 10-13] TUs compiled with the 0071 G2 detector OFF (MARLIN_G2 0): their kernels keep the served XR9 code
+# byte-for-byte (no mode check, no checked spin loop), and the host prints "[marlin-G2] NOT-COVERED (0071): ... its module has no marlin_g2
+# words" once per such kernel at its first launch. Why: G2 KAT RID 1180 K5 cell qkv/M64 (qkv N14336 = MarlinXSZPPCPFTPF, o_proj N5120 K6144 =
+# MarlinZPPCPFTPF, both 128,4,4,8) timed +1.20 % over the +1.00 % cell bar. A listed TU that is not generated is a hard error.
+G2_OFF_TUS = ("sm80_kernel_cpf_zpptpf_xs_s1_bfloat16.cu", "sm80_kernel_cpf_zpptpf_s1_bfloat16.cu")
+
+
+def g2_off_tus(here=None):
+    here = here or os.path.dirname(os.path.abspath(__file__))
+    for name in G2_OFF_TUS:
+        path = os.path.join(here, name)
+        if not os.path.exists(path):
+            raise SystemExit(f"[0071b G2-QKVOFF] {name} was not generated; refuse to build with an unknown G2 coverage")
+        with open(path) as f:
+            src = f.read()
+        if "#define MARLIN_G2 0" in src:
+            continue
+        if src.count('#include "kernel.h"') != 1:
+            raise SystemExit(f"[0071b G2-QKVOFF] {name}: expected one '#include \"kernel.h\"'")
+        src = src.replace('#include "kernel.h"', '#define MARLIN_G2 0  // [0071b G2-QKVOFF] this TU builds without the 0071 detector\n#include "kernel.h"')
+        with open(path, "w") as f:
+            f.write(src)
+
 
 if __name__ == "__main__":
     remove_old_kernels()
+    import atexit  # [0047 ENGAGE-TELL] after every generate_* call below, including ones a later patch appends
+    atexit.register(_engage_at_exit, os.path.dirname(os.path.abspath(__file__)))
     generate_new_kernels()
+    generate_l2pf_twins()  # [0045 L2PF] reads only the kernel_selector.h written above; writes only its own files
+    generate_opr_twins()
+    generate_opr_twins("MarlinXSOPR", XSOPR_TWINS, "xsopr", ("MARLIN_XS_TWIN", "MARLIN_OPR_TWIN"),
+                       "MARLIN_XSLICE && MARLIN_OPR",
+                       "XS x OPR twins: this TU alone compiles marlin_template.h with the cross-slice prefetch AND the "
+                       "ordered parallel reduce.", "[0039 XSOPR]")
+    generate_sp_twins()
+    generate_fold_twins()
+    generate_folds_twins()
+    generate_tpf_twins()
+    generate_zpp_twins()
+    generate_zpptpf_twins()  # [0052 ZPPTPF] reads kernel_selector_zpp.h
+    generate_cpf_twins()  # [0061 COLFPF v2] reads kernel_selector.h / _xs.h / _zpp.h / _zpptpf.h
+    generate_ku3stpf_twins()  # [0063 KU3STPF] reads kernel_selector.h / _xs.h
+    g2_off_tus()  # [0071b G2-QKVOFF] last: rewrites only the G2_OFF_TUS files the calls above wrote

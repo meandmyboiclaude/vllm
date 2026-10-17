@@ -1422,3 +1422,111 @@ void relu_squared(torch::stable::Tensor& out,    // [..., d]
 {
   LAUNCH_ACTIVATION_KERNEL(vllm::relu_squared_kernel);
 }
+
+// [0044 AQ04 cuda-lane 2026-10-06] SiLU*mul + per-token int8 act-quant for the W4A8 down_proj input in ONE launch,
+// bitwise == silu_and_mul + the served int8 quant (aq04_silu_mul_quant.cuh). Dispatched on M (mode 0): M <= kRSMaxRows
+// (64, the decode capture sizes) -> RS (kRSSplit CTAs per row, last-arriver tail, the three workspaces); M > 64 (prefill)
+// -> RR (one CTA per row, no workspace). mode 1 / 2 force RR / RS (the KAT runs both forms at every M <= 64). Called only
+// by the dark GENESIS_ENABLE_AQ04 model path; adding it changes no other kernel of this TU. [0055 AQ04HQ: RS tail hoist + QF1]
+#include "aq04_silu_mul_quant.cuh"
+
+void aq04_silu_mul_quant(
+    torch::stable::Tensor& out,                 // [M, 17408] int8
+    torch::stable::Tensor& scales,              // [M] / [M, 1] float32
+    torch::stable::Tensor const& input,         // [M, 2 * 17408] bf16 = [gate | up]
+    torch::stable::Tensor const& global_scale,  // [1] float32 = down_proj.input_global_scale
+    torch::stable::Tensor& ws_o,                // RS: [64, 17408] bf16 (one per device and stream)
+    torch::stable::Tensor& ws_mx,               // RS: [64, kRSSplit] float32
+    torch::stable::Tensor& ws_cnt,              // RS: [64] int32, zero at rest (each RS launch resets what it used)
+    int64_t mode)                               // 0 = by M, 1 = RR, 2 = RS
+{
+  using namespace vllm::aq04;
+  using ST = torch::headeronly::ScalarType;
+  STD_TORCH_CHECK(mode >= 0 && mode <= 2, "aq04: mode must be 0 (by M), 1 (RR) or 2 (RS)");
+  STD_TORCH_CHECK(input.scalar_type() == ST::BFloat16, "aq04: input must be bfloat16");
+  STD_TORCH_CHECK(input.dim() == 2 && input.size(1) == 2 * kD && input.is_contiguous(),
+                  "aq04: input must be a contiguous [M, 34816] tensor");
+  const int64_t M = input.size(0);
+  STD_TORCH_CHECK(out.scalar_type() == ST::Char && out.is_contiguous() && out.numel() == M * kD,
+                  "aq04: out must be a contiguous int8 [M, 17408]");
+  STD_TORCH_CHECK(scales.scalar_type() == ST::Float && scales.is_contiguous() && scales.numel() == M,
+                  "aq04: scales must be float32 with one value per row");
+  STD_TORCH_CHECK(global_scale.scalar_type() == ST::Float && global_scale.numel() == 1,
+                  "aq04: global_scale must be one float32 element");
+  STD_TORCH_CHECK(ws_o.scalar_type() == ST::BFloat16 && ws_o.is_contiguous() && ws_o.numel() == kRSMaxRows * kD,
+                  "aq04: ws_o must be a contiguous bf16 [64, 17408]");
+  STD_TORCH_CHECK(ws_mx.scalar_type() == ST::Float && ws_mx.is_contiguous() && ws_mx.numel() == kRSMaxRows * kRSSplit,
+                  "aq04: ws_mx must be a contiguous float32 [64, 4]");
+  STD_TORCH_CHECK(ws_cnt.scalar_type() == ST::Int && ws_cnt.is_contiguous() && ws_cnt.numel() == kRSMaxRows,
+                  "aq04: ws_cnt must be a contiguous int32 [64]");
+  const auto dev = input.get_device_index();
+  STD_TORCH_CHECK(input.is_cuda() && out.is_cuda() && scales.is_cuda() && global_scale.is_cuda() && ws_o.is_cuda() &&
+                      ws_mx.is_cuda() && ws_cnt.is_cuda() && out.get_device_index() == dev &&
+                      scales.get_device_index() == dev && global_scale.get_device_index() == dev &&
+                      ws_o.get_device_index() == dev && ws_mx.get_device_index() == dev &&
+                      ws_cnt.get_device_index() == dev,
+                  "aq04: every tensor must be on the input's CUDA device");
+  const bool rs = (mode == 2) || (mode == 0 && M <= kRSMaxRows);
+  STD_TORCH_CHECK(!rs || M <= kRSMaxRows, "aq04: RS takes at most 64 rows");
+  if (M == 0) return;
+  const torch::stable::accelerator::DeviceGuard device_guard(dev);
+  const cudaStream_t stream = get_current_cuda_stream(dev);
+  const __nv_bfloat16* in = reinterpret_cast<const __nv_bfloat16*>(input.const_data_ptr<c10::BFloat16>());
+  // silu_and_mul's launch arguments (limit, alpha, beta), passed as runtime kernel parameters exactly as served
+  const float limit = 0.0f, alpha = 1.0f, beta = 0.0f;
+  if (rs) {
+    vllm::aq04::aq04_silu_mul_quant_kernel<__nv_bfloat162, vllm::packed_silu_kernel<__nv_bfloat162>, kRSSplit>
+        <<<dim3(static_cast<unsigned>(M), kRSSplit), kThreads, 0, stream>>>(
+            out.mutable_data_ptr<int8_t>(), scales.mutable_data_ptr<float>(), in, global_scale.const_data_ptr<float>(),
+            reinterpret_cast<__nv_bfloat16*>(ws_o.mutable_data_ptr<c10::BFloat16>()), ws_mx.mutable_data_ptr<float>(),
+            reinterpret_cast<unsigned*>(ws_cnt.mutable_data_ptr<int32_t>()), limit, alpha, beta);
+  } else {
+    vllm::aq04::aq04_silu_mul_quant_kernel<__nv_bfloat162, vllm::packed_silu_kernel<__nv_bfloat162>, 1>
+        <<<dim3(static_cast<unsigned>(M)), kThreads, 0, stream>>>(
+            out.mutable_data_ptr<int8_t>(), scales.mutable_data_ptr<float>(), in, global_scale.const_data_ptr<float>(),
+            nullptr, nullptr, nullptr, limit, alpha, beta);
+  }
+}
+
+// [0056 AQ04R64 cuda-lane 2026-10-08] arm B site DN: SiLU*mul + block-64 FWHT (x * D * H64) + per-token int8 quant (QF1) in ONE
+// launch, the RR form at every M (aq04_r64_quant.cuh; RID 737: H64RR is the cheapest rotated form). sgn = the packed D sign bits for
+// d = 17408 (bit e of byte i set <=> D[8i + e] = -1), built and sha-pinned by the host. Called only by the dark
+// GENESIS_ARMB_FWHT64_DN model path; adding it changes no other kernel of this TU.
+#include "aq04_r64_quant.cuh"
+
+void aq04_silu_mul_quant_rot64(
+    torch::stable::Tensor& out,                 // [M, 17408] int8 (codes of the ROTATED row)
+    torch::stable::Tensor& scales,              // [M] / [M, 1] float32
+    torch::stable::Tensor const& input,         // [M, 2 * 17408] bf16 = [gate | up]
+    torch::stable::Tensor const& global_scale,  // [1] float32 = down_proj.input_global_scale
+    torch::stable::Tensor const& sgn)           // [17408 / 8] uint8 packed D sign bits
+{
+  using namespace vllm::aq04;
+  using ST = torch::headeronly::ScalarType;
+  STD_TORCH_CHECK(input.scalar_type() == ST::BFloat16, "aq04r64: input must be bfloat16");
+  STD_TORCH_CHECK(input.dim() == 2 && input.size(1) == 2 * kD && input.is_contiguous(),
+                  "aq04r64: input must be a contiguous [M, 34816] tensor");
+  const int64_t M = input.size(0);
+  STD_TORCH_CHECK(out.scalar_type() == ST::Char && out.is_contiguous() && out.numel() == M * kD,
+                  "aq04r64: out must be a contiguous int8 [M, 17408]");
+  STD_TORCH_CHECK(scales.scalar_type() == ST::Float && scales.is_contiguous() && scales.numel() == M,
+                  "aq04r64: scales must be float32 with one value per row");
+  STD_TORCH_CHECK(global_scale.scalar_type() == ST::Float && global_scale.numel() == 1,
+                  "aq04r64: global_scale must be one float32 element");
+  STD_TORCH_CHECK(sgn.scalar_type() == ST::Byte && sgn.is_contiguous() && sgn.numel() == kD / 8,
+                  "aq04r64: sgn must be a contiguous uint8 [2176] (packed D sign bits)");
+  const auto dev = input.get_device_index();
+  STD_TORCH_CHECK(input.is_cuda() && out.is_cuda() && scales.is_cuda() && global_scale.is_cuda() && sgn.is_cuda() &&
+                      out.get_device_index() == dev && scales.get_device_index() == dev &&
+                      global_scale.get_device_index() == dev && sgn.get_device_index() == dev,
+                  "aq04r64: every tensor must be on the input's CUDA device");
+  if (M == 0) return;
+  const torch::stable::accelerator::DeviceGuard device_guard(dev);
+  const cudaStream_t stream = get_current_cuda_stream(dev);
+  const __nv_bfloat16* in = reinterpret_cast<const __nv_bfloat16*>(input.const_data_ptr<c10::BFloat16>());
+  const float limit = 0.0f, alpha = 1.0f, beta = 0.0f;
+  vllm::aq04r64::aq04r64_rr_kernel<__nv_bfloat162, vllm::packed_silu_kernel<__nv_bfloat162>>
+      <<<dim3(static_cast<unsigned>(M)), kThreads, 0, stream>>>(
+          out.mutable_data_ptr<int8_t>(), scales.mutable_data_ptr<float>(), in, global_scale.const_data_ptr<float>(),
+          sgn.const_data_ptr<uint8_t>(), limit, alpha, beta);
+}

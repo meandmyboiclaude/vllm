@@ -322,6 +322,9 @@ static inline constexpr auto kU4B8 = ScalarType::uint(4, 8);
 static inline constexpr auto kS8 = ScalarType::int_(8);
 static inline constexpr auto kU8 = ScalarType::uint(8);
 static inline constexpr auto kU8B128 = ScalarType::uint(8, 128);
+// [0055 KU3S] symmetric int3 (stored code c = w + 4, w in -4..3) for the int8-activation Marlin path; == Python
+// scalar_types.uint3b4 (same fields, same id). Its Marlin B layout is the LOWBIT 3-word form (marlin_template.h is_u3).
+static inline constexpr auto kU3S = ScalarType::uint(3, 4);
 
 static inline constexpr auto kFE2M1f =
     ScalarType::float_(2, 1, true, ScalarType::NAN_NONE);

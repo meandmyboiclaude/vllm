@@ -737,7 +737,8 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
          "csrc/quantization/marlin/marlin.cu"
          "csrc/quantization/marlin/marlin_int4_fp8_preprocess.cu"
          "csrc/quantization/marlin/gptq_marlin_repack.cu"
-         "csrc/quantization/marlin/awq_marlin_repack.cu")
+         "csrc/quantization/marlin/awq_marlin_repack.cu"
+         "csrc/quantization/marlin/ku3s_repack.cu")
       set_gencode_flags_for_srcs(
         SRCS "${MARLIN_SRCS}"
         CUDA_ARCHS "${MARLIN_OTHER_ARCHS}")

@@ -94,6 +94,10 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
       "SymInt size_k, SymInt size_n, int num_bits, bool is_a_8bit) -> Tensor");
   // conditionally compiled so impl registrations are in source file
 
+  // [0055 KU3S-1] compressed-tensors dense int3 (sym, code = w + 4) -> the kU3S Marlin layout.
+  ops.def("ku3s_repack_ct(Tensor ct_packed, SymInt size_k, SymInt size_n) -> Tensor");
+  // conditionally compiled so impl registrations are in source file
+
   // awq_marlin repack from AWQ.
   ops.def(
       "awq_marlin_repack(Tensor b_q_weight, SymInt size_k, "
@@ -626,6 +630,15 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
   // Activation function used in SwiGLU.
   ops.def("silu_and_mul(Tensor! result, Tensor input) -> ()");
 
+  // [0044 AQ04] SiLU*mul + per-token int8 act-quant for the W4A8 down_proj input (mode 0: RS at M <= 64, RR above)
+  ops.def(
+      "aq04_silu_mul_quant(Tensor! result, Tensor! scale, Tensor input, Tensor global_scale, "
+      "Tensor! ws_o, Tensor! ws_mx, Tensor! ws_cnt, int mode) -> ()");
+
+  // [0056 AQ04R64] arm B site DN: SiLU*mul + block-64 FWHT + int8 act-quant (QF1), RR form at every M
+  ops.def(
+      "aq04_silu_mul_quant_rot64(Tensor! result, Tensor! scale, Tensor input, Tensor global_scale, Tensor sgn) -> ()");
+
   ops.def("mul_and_silu(Tensor! out, Tensor input) -> ()");
 
   // SwiGLU activation with input clamping.
@@ -692,6 +705,12 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
   ops.def(
       "dynamic_scaled_int8_quant(Tensor! result, Tensor input, Tensor! scale, "
       "Tensor!? azp) -> ()");
+
+  // [C3] fused silu_and_mul + dynamic per-token int8 quant; global_scale folds the per-layer
+  // act-scale factor into the stored scales.
+  ops.def(
+      "silu_and_mul_dynamic_int8_quant(Tensor! result, Tensor input, Tensor! scale, "
+      "Tensor? global_scale) -> ()");
 
   // Compute FP8 quantized tensor for given scaling factor.
   // Supports per-tensor, per-channel, per-token, and arbitrary 2D group
@@ -896,6 +915,8 @@ STABLE_TORCH_LIBRARY_IMPL(_C, CUDA, ops) {
   ops.impl("muse_spark_mul_tanh_soft_cap",
            TORCH_BOX(&muse_spark_mul_tanh_soft_cap));
   ops.impl("silu_and_mul", TORCH_BOX(&silu_and_mul));
+  ops.impl("aq04_silu_mul_quant", TORCH_BOX(&aq04_silu_mul_quant));  // [0044 AQ04]
+  ops.impl("aq04_silu_mul_quant_rot64", TORCH_BOX(&aq04_silu_mul_quant_rot64));  // [0056 AQ04R64]
   ops.impl("mul_and_silu", TORCH_BOX(&mul_and_silu));
   ops.impl("gelu_and_mul", TORCH_BOX(&gelu_and_mul));
   ops.impl("gelu_tanh_and_mul", TORCH_BOX(&gelu_tanh_and_mul));
@@ -913,6 +934,7 @@ STABLE_TORCH_LIBRARY_IMPL(_C, CUDA, ops) {
   // INT8 quantization kernels
   ops.impl("static_scaled_int8_quant", TORCH_BOX(&static_scaled_int8_quant));
   ops.impl("dynamic_scaled_int8_quant", TORCH_BOX(&dynamic_scaled_int8_quant));
+  ops.impl("silu_and_mul_dynamic_int8_quant", TORCH_BOX(&silu_and_mul_dynamic_int8_quant));
 
   // FP8 quantization kernels
   ops.impl("static_scaled_fp8_quant", TORCH_BOX(&static_scaled_fp8_quant));

@@ -581,6 +581,15 @@ void muse_spark_mul_tanh_soft_cap(torch::stable::Tensor& out,
 
 // Activation kernels (shared CUDA/ROCm)
 void silu_and_mul(torch::stable::Tensor& out, torch::stable::Tensor& input);
+// [0044 AQ04 cuda-lane 2026-10-06] SiLU*mul + per-token int8 act-quant (W4A8 down_proj input), one launch, by M
+void aq04_silu_mul_quant(torch::stable::Tensor& out, torch::stable::Tensor& scales,
+                         torch::stable::Tensor const& input, torch::stable::Tensor const& global_scale,
+                         torch::stable::Tensor& ws_o, torch::stable::Tensor& ws_mx, torch::stable::Tensor& ws_cnt,
+                         int64_t mode);
+// [0056 AQ04R64 cuda-lane 2026-10-08] arm B site DN: SiLU*mul + block-64 FWHT + int8 act-quant (QF1), RR form at every M
+void aq04_silu_mul_quant_rot64(torch::stable::Tensor& out, torch::stable::Tensor& scales,
+                               torch::stable::Tensor const& input, torch::stable::Tensor const& global_scale,
+                               torch::stable::Tensor const& sgn);
 void silu_and_mul_clamp(torch::stable::Tensor& out,
                         torch::stable::Tensor& input, double limit,
                         double alpha = 1.0, double beta = 0.0);
@@ -635,6 +644,11 @@ void dynamic_scaled_int8_quant(torch::stable::Tensor& out,
                                torch::stable::Tensor const& input,
                                torch::stable::Tensor& scales,
                                std::optional<torch::stable::Tensor> const& azp);
+
+// [C3 cuda-lane 2026-09-21] fused silu_and_mul + dynamic per-token int8 quant (+ optional scalar fold)
+void silu_and_mul_dynamic_int8_quant(torch::stable::Tensor& out, torch::stable::Tensor const& input,
+                                     torch::stable::Tensor& scales,
+                                     std::optional<torch::stable::Tensor> const& global_scale);
 
 // FP8 quantization kernels (shared CUDA/ROCm)
 void static_scaled_fp8_quant(
