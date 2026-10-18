@@ -1193,6 +1193,16 @@ class Scheduler(SchedulerInterface):
                 else:
                     step_skipped_waiting.appendleft(request_to_skip)
 
+            # [rebase-9, intent of fork #53772] Report failed grammar compiles even when
+            # every seat is busy: the loop below can break before it peeks a request, and
+            # only it reaches _handle_blocked_waiting_request, so the client would wait for
+            # a free seat instead of getting the error. Promotion stays with the loop.
+            for blocked in list(self.deferred_waiting):
+                if blocked.status == RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR:
+                    so_req = blocked.structured_output_request
+                    if so_req is not None and isinstance(so_req.grammar, Exception):
+                        self.grammar_compile_error_reqs.add(blocked.request_id)
+
             while token_budget > 0:
                 # Requests holding KV blocks are always drained first, and are
                 # the only ones admitted under PAUSED_NEW (e.g. async KV loads).
@@ -1217,6 +1227,7 @@ class Scheduler(SchedulerInterface):
 
                 if request.is_finished():
                     request_queue.pop_request()
+                    self.deferred_waiting.discard(request)
                     continue
 
                 ready_to_schedule = self._handle_blocked_waiting_request(request)
@@ -2523,9 +2534,6 @@ class Scheduler(SchedulerInterface):
             ec_transfer_params = None
             prefill_stats = None
             status_before_stop = request.status
-            num_output_tokens_before = len(request._output_token_ids)
-            # A streaming continuation can replace request.sampling_params while
-            # handling a stop; keep the parameters for this output step.
 
             # Structured output: grammar masks cover the scheduled draft
             # positions, but an accepted block can still carry an
