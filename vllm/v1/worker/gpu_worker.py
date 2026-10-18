@@ -976,7 +976,8 @@ class Worker(WorkerBase):
             and self.cudagraph_memory_estimate > 0
         ):
             GiB = lambda b: round(b / GiB_bytes, 2)
-            retained = self.model_runner.cudagraph_profiling_retained_memory
+            # MRV2 runners do not define it (only the V1 runner retains capture memory here).
+            retained = getattr(self.model_runner, "cudagraph_profiling_retained_memory", 0)
             actual = cuda_graph_memory_bytes + retained
             diff = abs(actual - self.cudagraph_memory_estimate)
             logger.info(
