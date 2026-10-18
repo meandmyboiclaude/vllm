@@ -180,22 +180,10 @@ def _content_params():
     ):
         for chunk_size in _CHUNK_SIZES:
             for with_token_ids in (True, False):
-                marks = ()
-                if text is _THINK_MARKERS_IN_VALUE and (chunk_size, with_token_ids) == (
-                    1000,
-                    True,
-                ):
-                    marks = pytest.mark.xfail(
-                        strict=True,
-                        reason="separate defect: the tool pass gets the token ids "
-                        "after the LAST </think> of the delta (the quoted one), "
-                        "so its strict token-id mode demotes <tool_call> to content",
-                    )
                 yield pytest.param(
                     text,
                     chunk_size,
                     with_token_ids,
-                    marks=marks,
                     id=f"{case_id}-{chunk_size}-{'ids' if with_token_ids else 'text'}",
                 )
 

@@ -473,6 +473,16 @@ class StreamingParserEngine:
             pending.append((terminal, value, token_count))
             return []
         if self._pending_tool_start is not None:
+            if (
+                self._has_drops
+                and terminal == DROP_TERMINAL
+                and self.state != ParserState.REASONING
+            ):
+                # EOS or another dropped special token decides nothing: an
+                # opener cut off by it stays a truncated call, dropped by
+                # finish(). (In REASONING no tool pass follows at the end of
+                # the stream, so the opener is still released as reasoning.)
+                return []
             next_transition = self.config.transitions.get(
                 (ParserState.TOOL_PREAMBLE, terminal)
             )

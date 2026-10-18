@@ -335,6 +335,24 @@ def _xgrammar_supports(structured_outputs: StructuredOutputsParams) -> bool:
     return True
 
 
+def _spells_terminal_without_its_id(
+    reasoning_parser: ReasoningParser | None,
+    text: str,
+    token_ids: Sequence[int],
+) -> bool:
+    """Whether *text* spells one of the reasoning engine's token-ID terminals
+    more often than its token ID occurs in *token_ids*."""
+    engine = getattr(reasoning_parser, "_parser_engine", None)
+    if engine is None:
+        return False
+    vocab = engine.vocab
+    for literal in engine.parser_engine_config.token_id_terminals.values():
+        token_id = vocab.get(literal)
+        if token_id is not None and text.count(literal) > token_ids.count(token_id):
+            return True
+    return False
+
+
 class DelegatingParser(Parser):
     """A Parser implementation that delegates to separate ReasoningParser and
     ToolParser instances.
@@ -938,6 +956,15 @@ class DelegatingParser(Parser):
                 current_text = (
                     (delta_message.content if delta_message else None) or ""
                 ) + ((flush_delta.content if flush_delta else None) or "")
+                if current_token_ids and _spells_terminal_without_its_id(
+                    reasoning_parser, current_text, current_token_ids
+                ):
+                    # The reasoning parser held a terminal (an implicit-end
+                    # <tool_call>) whose ID came in an earlier delta. These IDs do
+                    # not describe the handed-over text, and the tool parser's
+                    # strict token-ID mode would demote the terminal to content,
+                    # so let it lex the text.
+                    current_token_ids = []
                 if self._engine_based:
                     if self._tool_parser is not None:
                         # The tool-call phase below consumes current_text.
