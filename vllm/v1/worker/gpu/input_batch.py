@@ -84,9 +84,6 @@ class InputBatch:
     # No prefills, or only prefill rows that run as decodes.
     decode_graph_eligible: bool
 
-    # [num_reqs] only populated when pipeline parallelism is enabled.
-    max_seq_len_np: np.ndarray | None
-
     # [num_reqs] bool mask of requests whose drafts can never be scheduled;
     # the drafter may skip proposing for them. None when no such requests.
     no_draft_mask_np: np.ndarray | None
