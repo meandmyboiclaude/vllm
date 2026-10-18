@@ -754,6 +754,27 @@ class VllmConfig:
             )
         )
 
+    def _verify_dflash2_dtype(self) -> None:
+        """Refuse a DFlash2 draft under a float16 target (open upstream #55294, adapted
+        to main's `_is_dflash_candidate_draft` rename and narrowed to DFlash2: it is the
+        BF16-trained grouped-convolution residual stream that overflows to inf/NaN in
+        FP16, after which candidate selection yields invalid drafts and nothing is
+        accepted). The draft inherits the target dtype, so the check reads model_config.
+        """
+        spec = self.speculative_config
+        if spec is None or spec.method != "dflash" or self.model_config is None:
+            return
+        draft_config = getattr(spec, "draft_model_config", None)
+        if draft_config is None or "DFlash2DraftModel" not in (
+            draft_config.architectures or []
+        ):
+            return
+        if self.model_config.dtype == torch.float16:
+            raise ValueError(
+                "DFlash2 speculative drafts do not support float16 because their "
+                "residual stream can overflow. Use --dtype bfloat16 instead."
+            )
+
     def _dflash_needs_multi_kv_group(self) -> bool:
         """Whether a DFlash draft mixes sliding-window and full attention."""
         spec = self.speculative_config
@@ -1536,6 +1557,7 @@ class VllmConfig:
             )
 
         self._verify_sampling_replay_config()
+        self._verify_dflash2_dtype()  # [quant rebase-9] open #55294, adapted
         self._verify_trace_replay_config()
 
         # A NIXL side is either fully replicated or fully DCP-sharded; MLA only.
