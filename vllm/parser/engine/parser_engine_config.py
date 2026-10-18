@@ -130,6 +130,7 @@ class ParserEngineConfig:
 
     # Delay a tool wrapper until its whitespace-only preamble reaches TOOL_NAME.
     validate_tool_preamble: bool = False
+
     def __post_init__(self) -> None:
         if self.arg_value_extender is not None and (
             self.arg_converter is None or not self.stream_arg_deltas

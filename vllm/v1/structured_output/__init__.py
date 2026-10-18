@@ -1,11 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-import itertools
 import multiprocessing
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Iterable, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
-from copy import copy
-from typing import TYPE_CHECKING, NamedTuple, overload
+from typing import TYPE_CHECKING, NamedTuple
 
 import numpy as np
 
@@ -34,60 +32,6 @@ else:
 
 
 logger = init_logger(__name__)
-
-
-class _TokenSequenceView(Sequence[int]):
-    """Read-only concatenation that does not copy committed token history.
-
-    Cost note (#52452 review): skipping the copy moves element access into
-    Python, so what a reader pays depends entirely on which reasoning parser
-    consumes the view, and nothing here is on a plain-decode path.
-
-    * Parsers that inspect only ``delta_ids`` -- the ``BaseThinkingReasoningParser``
-      family, step3p5, gptoss, identity -- never index the view at all.
-    * Parsers inheriting the ``ReasoningParser.is_reasoning_end_streaming``
-      default walk the whole sequence: an element-wise scan through
-      ``__getitem__`` runs about 4-7x a list scan.
-    * The engine-parser adapters (qwen3 among them) go one step further and
-      materialize it -- ``list(input_ids)`` in
-      ``ParserEngineReasoningAdapter.is_reasoning_end`` -- so they pay a full
-      Python-level copy per call. ``__iter__`` below keeps that at C speed.
-
-    All of it is reached only through ``filter_speculative_grammar_tokens``,
-    which returns before building a view unless the request is speculative
-    *and* structured-output *and* has a reasoner; the probe loop then runs at
-    most ``len(new_token_ids)`` (K+1) times per accepted block.
-    """
-
-    def __init__(self, prefix: Sequence[int], suffix: Sequence[int]) -> None:
-        self.prefix = prefix
-        self.suffix = suffix
-
-    def __len__(self) -> int:
-        return len(self.prefix) + len(self.suffix)
-
-    def __iter__(self) -> Iterator[int]:
-        # The Sequence mixin would iterate via __getitem__, one Python call per
-        # token; chaining the two underlying sequences is C-level and yields
-        # exactly the same elements in the same order.
-        return itertools.chain(iter(self.prefix), iter(self.suffix))
-
-    @overload
-    def __getitem__(self, index: int) -> int: ...
-
-    @overload
-    def __getitem__(self, index: slice) -> list[int]: ...
-
-    def __getitem__(self, index: int | slice) -> int | list[int]:
-        if isinstance(index, slice):
-            return [self[i] for i in range(*index.indices(len(self)))]
-        if index < 0:
-            index += len(self)
-        if index < 0 or index >= len(self):
-            raise IndexError(index)
-        if index < len(self.prefix):
-            return self.prefix[index]
-        return self.suffix[index - len(self.prefix)]
 
 
 class ConstraintBounds(NamedTuple):
@@ -588,52 +532,6 @@ class StructuredOutputManager:
         structured_req.reasoning_ended = True
         return grammar.accept_tokens(request.request_id, new_token_ids[grammar_start:])
 
-    @staticmethod
-    def _find_reasoning_end_offset(
-        reasoner: "ReasoningParser",
-        prior_token_ids: Sequence[int],
-        new_token_ids: list[int],
-    ) -> int | None:
-        """Return where a reasoning-end marker completes in a sampled block.
-
-        Sibling of ``_find_reasoning_end_index``, which locates the marker
-        *after* the block has been committed to ``all_token_ids``. This one
-        runs *before* the commit, so it takes the uncommitted block separately
-        and never materializes the concatenation.
-
-        The first parser call keeps reasoning-only blocks at one check. When
-        the block contains a transition, cumulative delta prefixes locate
-        single-token and multi-token markers, including markers that start in
-        ``prior_token_ids`` and finish in ``new_token_ids``.
-
-        Args:
-            reasoner: Request-scoped parser that identifies the transition.
-            prior_token_ids: Tokens committed before the sampled block.
-            new_token_ids: Accepted tokens awaiting commit.
-
-        Returns:
-            The zero-based offset where the marker completes, or ``None`` if
-            the sampled block remains inside reasoning.
-        """
-        complete_tokens = _TokenSequenceView(prior_token_ids, new_token_ids)
-        if not copy(reasoner).is_reasoning_end_streaming(
-            complete_tokens, new_token_ids
-        ):
-            return None
-
-        for offset in range(len(new_token_ids)):
-            delta_ids = new_token_ids[: offset + 1]
-            token_ids = _TokenSequenceView(prior_token_ids, delta_ids)
-            # Streaming parsers may retain request-local transition state.
-            # A probe must not consume that state before the normal commit path.
-            if copy(reasoner).is_reasoning_end_streaming(token_ids, delta_ids):
-                return offset
-
-        # Some parsers report only that the complete block crossed a boundary.
-        # Treating the full block as reasoning avoids exposing an unknown suffix
-        # to the answer grammar.
-        return len(new_token_ids) - 1
-
     def filter_speculative_grammar_tokens(
         self,
         request: "Request",
@@ -684,21 +582,11 @@ class StructuredOutputManager:
             # passes through untouched.
             return new_token_ids, 0
 
-        reasoner = self._get_reasoner(request)
-        grammar_start = 0
-        if (
-            reasoner is not None
-            and not self.enable_in_reasoning
-            and not structured_request.reasoning_ended
-        ):
-            boundary = self._find_reasoning_end_offset(
-                reasoner,
-                request.all_token_ids,
-                new_token_ids,
-            )
-            if boundary is None:
-                return new_token_ids, 0
-            grammar_start = boundary + 1
+        # Upstream's locator: an implicit reasoning end (e.g. a tool-call start)
+        # is content, so the grammar starts at that token, as accept_tokens feeds it.
+        grammar_start, _ = self._get_constraint_bounds(request, new_token_ids)
+        if grammar_start > len(new_token_ids):
+            return new_token_ids, 0
 
         grammar_tokens = new_token_ids[grammar_start:]
         if not grammar_tokens:

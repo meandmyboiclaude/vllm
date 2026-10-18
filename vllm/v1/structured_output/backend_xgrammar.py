@@ -429,11 +429,6 @@ def has_xgrammar_unsupported_json_features(schema: dict[str, Any]) -> bool:
             # Tracking issue: https://github.com/mlc-ai/xgrammar/issues/961
             if obj.get("unevaluatedProperties", True) is not True:
                 return True
-            # [fork, kept in rebase-9] propertyNames + a schema-valued additionalProperties is the same
-            # unsupported xgrammar combination (xgrammar #826 class); upstream lists only properties /
-            # patternProperties / unevaluatedProperties.
-            if isinstance(obj.get("additionalProperties"), dict):
-                return True
 
         # patternProperties is not supported in pair with some constraints
         # in xgrammar

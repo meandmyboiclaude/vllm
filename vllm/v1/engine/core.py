@@ -166,7 +166,9 @@ class EngineCore:
                 # Encoder models without KV cache don't support
                 # chunked prefill. But do SSM models?
                 if vllm_config.scheduler_config.enable_chunked_prefill:
-                    logger.warning("Disabling chunked prefill for model without KVCache")
+                    logger.warning(
+                        "Disabling chunked prefill for model without KVCache"
+                    )
                     vllm_config.scheduler_config.enable_chunked_prefill = False
 
             scheduler_block_size, hash_block_size = resolve_kv_cache_block_sizes(
@@ -221,17 +223,27 @@ class EngineCore:
             # to eliminate pipeline bubbles.
             self.batch_queue_size = vllm_config.max_concurrent_batches
             self.batch_queue: (
-                deque[tuple[Future[ModelRunnerOutput], SchedulerOutput, Future[Any]]] | None
+                deque[
+                    tuple[Future[ModelRunnerOutput], SchedulerOutput, Future[Any]]
+                ]
+                | None
             ) = None
             if self.batch_queue_size > 1:
-                logger.debug("Batch queue is enabled with size %d", self.batch_queue_size)
+                logger.debug(
+                    "Batch queue is enabled with size %d", self.batch_queue_size
+                )
                 self.batch_queue = deque(maxlen=self.batch_queue_size)
 
             self.is_mm_encoder_only = vllm_config.is_mm_encoder_only
             self.is_pooling_model = vllm_config.model_config.runner_type == "pooling"
 
-            self.request_block_hasher: Callable[[Request], list[BlockHash]] | None = None
-            if vllm_config.cache_config.enable_prefix_caching or kv_connector is not None:
+            self.request_block_hasher: Callable[[Request], list[BlockHash]] | None = (
+                None
+            )
+            if (
+                vllm_config.cache_config.enable_prefix_caching
+                or kv_connector is not None
+            ):
                 caching_hash_fn = get_hash_fn_by_name(
                     vllm_config.cache_config.prefix_caching_hash_algo
                 )
