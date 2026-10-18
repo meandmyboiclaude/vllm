@@ -5,7 +5,7 @@
 import math
 from collections import defaultdict
 from collections.abc import Callable, Iterable, Sequence
-from dataclasses import fields, replace
+from dataclasses import replace
 from functools import partial, reduce
 from typing import Any
 
@@ -1034,24 +1034,12 @@ def _promote_local_kv_cache_specs(
                 continue
             assert isinstance(spec, AttentionSpec)
             block_size = full_attention_block_size or spec.block_size
-            # Promoted specs allocate blocks for all tokens and never free
-            # below the window, so the trailing-edge extension is moot.
-            dropped = ["extra_retained_tokens"]
-            if "non_causal_multi_token_decode" not in {
-                f.name for f in fields(target_cls)
-            } or not issubclass(target_cls, MLAAttentionSpec):
-                # MLAAttentionSpec carries the draft marker and keeps it.
-                # FullAttentionSpec carries it too, but promotion folds the
-                # draft into the target's single full-attention group: keeping
-                # the marker there would leave the promoted draft spec unequal
-                # to the target's full-attention specs, and the fallback wants
-                # one uniform spec. The coordinator's flag-all covers the
-                # last-block drop for that group.
-                dropped.append("non_causal_multi_token_decode")
             promoted_specs[layer_name] = replace_as(
                 spec,
                 target_cls,
-                drop=tuple(dropped),
+                # Promoted specs allocate blocks for all tokens and never free
+                # below the window, so the trailing-edge extension is moot.
+                drop=("extra_retained_tokens",),
                 block_size=block_size,
                 page_size_padded=promoted_page_size_padded(spec, block_size),
             )

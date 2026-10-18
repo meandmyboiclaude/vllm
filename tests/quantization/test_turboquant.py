@@ -313,9 +313,8 @@ class TestHybridAttentionIndices:
 
 
 class TestTurboQuantKVCacheSpec:
-    @pytest.mark.parametrize("non_causal_mtd", [False, True])
     @pytest.mark.parametrize("preset", ALL_PRESETS)
-    def test_kv_cache_spec_sets_kv_quant_mode(self, preset, non_causal_mtd, monkeypatch):
+    def test_kv_cache_spec_sets_kv_quant_mode(self, preset, monkeypatch):
         from vllm.model_executor.layers.attention.attention import Attention
         from vllm.model_executor.layers.quantization.turboquant.config import (
             TQ_LAYER_BITS_ENV,
@@ -337,12 +336,8 @@ class TestTurboQuantKVCacheSpec:
             head_size_v=128,
             num_kv_heads=4,
             sliding_window=None,
-            # Every get_kv_cache_spec branch forwards the draft-layer marker
-            # onto the spec (kvutils finding 3, #54041); a target layer is False.
             # KVQ-4 resolves a per-layer preset, so the layer index is read.
             layer_name="model.layers.0.self_attn.attn",
-            # Draft-layer marker read on every get_kv_cache_spec branch.
-            non_causal_multi_token_decode=non_causal_mtd,
             get_attn_backend=lambda: TurboQuantAttentionBackend,
         )
         vllm_config = SimpleNamespace(cache_config=SimpleNamespace(block_size=32))
@@ -355,10 +350,6 @@ class TestTurboQuantKVCacheSpec:
         assert spec.kv_quant_mode.is_turboquant
         expected_slot = TurboQuantConfig.from_cache_dtype(preset, 128).slot_size_aligned
         assert spec.state_content_bytes == expected_slot
-        # A packed-codec draft layer must keep the multi-token-decode marker:
-        # the mixed-layer unify() ORs it across specs, so losing it here would
-        # silently demote a DFlash draft group back to a causal one.
-        assert spec.non_causal_multi_token_decode is non_causal_mtd
 
         # customize_spec must stay idempotent: the worker's spec-collection
         # loop still runs it over every spec, packed or not.

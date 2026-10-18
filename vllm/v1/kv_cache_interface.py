@@ -691,18 +691,6 @@ class FullAttentionSpec(AttentionSpec):
     cache layout itself.
     """
 
-    non_causal_multi_token_decode: bool = False
-    """
-    Same name and meaning as on ``MLAAttentionSpec`` / ``SlidingWindowSpec``:
-    marks a speculative draft group so the hybrid grouping path can set
-    ``KVCacheGroupSpec.is_eagle_group``. Declared here as well because a draft
-    model with mixed ``layer_types`` (e.g. DFlash) publishes full-attention
-    layers next to sliding-window ones; without the field the marker landed on
-    the SWA layers only, and that partial marking suppressed the coordinator's
-    flag-all fallback for the unmarked draft layers. Does not set
-    ``AttentionSpec.non_causal`` (that disables prefix caching).
-    """
-
     def max_memory_usage_bytes(self, vllm_config: VllmConfig) -> int:
         max_model_len = vllm_config.model_config.max_model_len
         dcp_world_size = vllm_config.parallel_config.decode_context_parallel_size
@@ -761,12 +749,6 @@ class FullAttentionSpec(AttentionSpec):
             # If any layer in the group is non-causal, treat the group as
             # non-causal so the engine core disables incompatible scheduling.
             non_causal=any(spec.non_causal for spec in specs),
-            # Same rule as MLAAttentionSpec.merge: a group holding any draft
-            # layer needs the EAGLE last-block drop, so the marker survives the
-            # merge instead of being dropped by omission.
-            non_causal_multi_token_decode=any(
-                spec.non_causal_multi_token_decode for spec in specs
-            ),
         )
         for spec in specs:
             for f in fields(AttentionSpec):
@@ -978,7 +960,6 @@ class RSWASpec(FullAttentionSpec):
             sliding_window=base.sliding_window,
             attention_chunk_size=base.attention_chunk_size,
             non_causal=base.non_causal,
-            non_causal_multi_token_decode=base.non_causal_multi_token_decode,
             rswa_window=rswa_windows.pop(),
         )
 
@@ -1032,10 +1013,6 @@ class SlidingWindowSpec(AttentionSpec):
     # re-prefill the last num_spec_prefill_tokens - 1 tokens from the end
     # of the sequence, and thus needs to delay freeing/caching of blocks.
     extra_retained_tokens: int = 0
-    # Same name as MLAAttentionSpec: marks a speculative draft SWA group so
-    # the general hybrid grouping path can set KVCacheGroupSpec.is_eagle_group.
-    # Does not set AttentionSpec.non_causal (that disables prefix caching).
-    non_causal_multi_token_decode: bool = False
 
     @property
     def num_retained_tokens(self) -> int:
@@ -1173,18 +1150,6 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
         model_version_set = set(spec.model_version for spec in specs)
         sliding_window_set = set(spec.sliding_window for spec in specs)
         extra_retained_set = set(spec.extra_retained_tokens for spec in specs)
-        # ⚠ BOTH SIDES, NOT EITHER. git presented these as alternatives only
-        # because they are adjacent lines; they are INDEPENDENT homogeneity
-        # checks over different spec fields, and taking either side alone
-        # silently drops a real check.
-        # Inherited from SlidingWindowSpec, but no producer sets it on a
-        # SlidingWindowMLASpec today: MLAAttention.get_kv_cache_spec passes the
-        # marker only on its non-sliding branch, and the DeepseekV4 compressor
-        # and sparse-SWA backends never pass it, so this set is always {False}.
-        # Kept in the carry so a future producer is merged rather than silently
-        # dropped; on the DeepseekV4 path the eagle group is flagged by layer
-        # position instead (_annotate_eagle_groups_deepseek_v4).
-        non_causal_mtd_set = set(spec.non_causal_multi_token_decode for spec in specs)
         bounded_replay_set = set(spec.bounded_replay for spec in specs)
         block_stride_alignment_set = {spec.block_stride_alignment for spec in specs}
         assert len({spec.dcp_sharded for spec in specs}) == 1
@@ -1195,14 +1160,12 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
             and len(model_version_set) == 1
             and len(sliding_window_set) == 1
             and len(extra_retained_set) == 1
-            and len(non_causal_mtd_set) == 1
             and len(bounded_replay_set) == 1
             and len(block_stride_alignment_set) == 1
         ), (
             "All attention layers in the same KV cache group must use the same "
             "quantization method, tokens per state, model version, sliding "
-            "window size, retained token count, draft multi-token decode "
-            "marker, and replay policy."
+            "window size, retained token count, and replay policy."
         )
         return cls(
             block_size=specs[0].block_size,
@@ -1217,7 +1180,6 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
             state_content_bytes=specs[0].state_content_bytes,
             sliding_window=sliding_window_set.pop(),
             extra_retained_tokens=extra_retained_set.pop(),
-            non_causal_multi_token_decode=non_causal_mtd_set.pop(),
             cache_dtype_str=cache_dtype_str_set.pop(),
             tokens_per_state=tokens_per_state_set.pop(),
             model_version=model_version_set.pop(),
@@ -1409,9 +1371,6 @@ class SinkFullAttentionSpec(FullAttentionSpec):
             sliding_window=cls.merge_window_sizes(sliding_window),
             attention_chunk_size=cls.merge_window_sizes(attention_chunk_size),
             non_causal=any(spec.non_causal for spec in specs),
-            non_causal_multi_token_decode=any(
-                spec.non_causal_multi_token_decode for spec in specs
-            ),
         )
         for spec in specs:
             for f in fields(AttentionSpec):
