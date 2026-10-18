@@ -23,7 +23,10 @@ from vllm.v1.attention.backends.gdn_attn import (
     GDNAttentionMetadataBuilder,
     plan_flashinfer_checkpoints,
 )
-from vllm.v1.attention.backends.utils import mamba_get_block_table_tensor
+from vllm.v1.attention.backends.utils import (
+    NULL_BLOCK_ID,
+    mamba_get_block_table_tensor,
+)
 from vllm.v1.kv_cache_interface import MambaSpec
 
 BLOCK_SIZE = 16
@@ -182,6 +185,7 @@ def _build(
     batch_spec: BatchSpec,
     num_decode_draft_tokens: list[int] | None = None,
     block_table: torch.Tensor | None = None,
+    num_accepted_tokens: list[int] | None = None,
 ) -> GDNAttentionMetadata:
     """Build GDN attention metadata, optionally with spec-decode kwargs."""
     common = create_common_attn_metadata(batch_spec, BLOCK_SIZE, DEVICE)
@@ -192,9 +196,14 @@ def _build(
         kwargs["num_decode_draft_tokens_cpu"] = torch.tensor(
             num_decode_draft_tokens, dtype=torch.int32
         )
-        kwargs["num_accepted_tokens"] = torch.ones(
-            batch_spec.batch_size, dtype=torch.int32, device=DEVICE
-        )
+        if num_accepted_tokens is None:
+            kwargs["num_accepted_tokens"] = torch.ones(
+                batch_spec.batch_size, dtype=torch.int32, device=DEVICE
+            )
+        else:
+            kwargs["num_accepted_tokens"] = torch.tensor(
+                num_accepted_tokens, dtype=torch.int32, device=DEVICE
+            )
     return builder.build(common_prefix_len=0, common_attn_metadata=common, **kwargs)
 
 
@@ -275,6 +284,60 @@ def test_has_initial_state_after_reclassification():
     assert meta.has_initial_state is not None
     # req0 has context_lens = 65 - 1 = 64 > 0, so has_initial_state[0] = True
     assert meta.has_initial_state[0].item() is True
+
+
+@pytest.mark.parametrize("full_cuda_graph", [False, True])
+def test_zero_accepted_tokens_nulls_state_slots(full_cuda_graph: bool):
+    """A stale row (num_accepted_tokens == 0, produced when async scheduling
+    discards a step's sampled tokens) must have its whole state-index row set
+    to NULL_BLOCK_ID so the kernels skip both the initial-state read and the
+    final-state write, and must have its count clamped into range (#40756).
+    Live rows in the same batch must be left untouched.
+    """
+    builder = _create_gdn_builder(
+        num_speculative_tokens=3, full_cuda_graph=full_cuda_graph
+    )
+    batch = BatchSpec(seq_lens=[80, 96], query_lens=[4, 4])
+    # NULL_BLOCK_ID is 0 and the helper draws random block ids from [0, 1000),
+    # so a live row can hold a genuine 0: pin the table to non-null ids.
+    block_table = torch.arange(1, 13, dtype=torch.int32).reshape(2, 6)
+    # Row 0 is stale (its sampled tokens were discarded); row 1 is live.
+    meta = _build(
+        builder,
+        batch,
+        num_decode_draft_tokens=[3, 3],
+        block_table=block_table,
+        num_accepted_tokens=[0, 2],
+    )
+
+    assert meta.spec_state_indices_tensor is not None
+    assert meta.num_accepted_tokens is not None
+    stale_row = meta.spec_state_indices_tensor[0]
+    live_row = meta.spec_state_indices_tensor[1]
+    assert (stale_row == NULL_BLOCK_ID).all(), stale_row.tolist()
+    assert not (live_row == NULL_BLOCK_ID).any(), live_row.tolist()
+    # The clamp keeps the slot index (num_accepted_tokens - 1) in bounds; the
+    # live row's real count survives it.
+    assert meta.num_accepted_tokens[0].item() == 1
+    assert meta.num_accepted_tokens[1].item() == 2
+
+
+def test_zero_accepted_tokens_does_not_corrupt_block_table():
+    """Nulling stale rows must not write NULL_BLOCK_ID back into the block
+    table the runner reuses across steps (the #58763 pure-spec slice is a
+    view of it, so build() must copy before the in-place null)."""
+    builder = _create_gdn_builder(num_speculative_tokens=3)
+    batch = BatchSpec(seq_lens=[80, 96], query_lens=[4, 4])
+    block_table = torch.arange(1, 13, dtype=torch.int32).reshape(2, 6)
+    block_table_before = block_table.clone()
+    _build(
+        builder,
+        batch,
+        num_decode_draft_tokens=[3, 3],
+        block_table=block_table,
+        num_accepted_tokens=[0, 2],
+    )
+    torch.testing.assert_close(block_table, block_table_before)
 
 
 def test_full_cudagraph_spec_metadata_uses_request_count():
