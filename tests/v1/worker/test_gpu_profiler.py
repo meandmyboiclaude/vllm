@@ -1,7 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import json
 import os
-from contextlib import contextmanager, nullcontext
+import threading
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock, call, patch
 from uuid import UUID
@@ -18,21 +20,18 @@ from vllm.config import (
 )
 from vllm.config.profiler import _is_uri_path
 from vllm.platforms import current_platform
-from vllm.profiler import graph_capture
-from vllm.profiler.graph_capture import (
-    graph_capture_profiler,
-    graph_capture_step,
-    skip_graph_capture_tracing,
-)
 from vllm.profiler.wrapper import (
     ProtonProfilerWrapper,
+    TorchProfilerWrapper,
     WorkerProfiler,
-    default_torch_profiler_activities,
-    graph_capture_profiler_config,
+    create_worker_profiler,
+    validate_worker_profiler_config,
 )
 from vllm.v1.core.sched.output import CachedRequestData
+from vllm.v1.executor.abstract import Executor
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 from vllm.v1.worker.gpu_worker import Worker
+from vllm.v1.worker.xpu_worker import XPUWorker
 
 
 class ConcreteWorkerProfiler(WorkerProfiler):
@@ -63,6 +62,336 @@ def default_profiler_config():
     )
 
 
+def test_torch_profiler_rebuilds_one_shot_profiler_each_round(tmp_path):
+    config = ProfilerConfig(
+        profiler="torch",
+        torch_profiler_dir=str(tmp_path),
+        torch_profiler_activities=["CUDA"],
+        torch_profiler_dump_cuda_time_total=False,
+        warmup_iterations=2,
+    )
+    profilers = [MagicMock(), MagicMock()]
+    for profiler in profilers:
+        profiler.profiler = MagicMock()
+
+    with patch(
+        "vllm.profiler.wrapper.torch.profiler.profile", side_effect=profilers
+    ) as profile:
+        wrapper = TorchProfilerWrapper(
+            config, worker_name="worker", local_rank=0, activities=["CUDA"]
+        )
+        profile.assert_not_called()
+
+        wrapper.start()
+        assert not wrapper.should_annotate
+        assert not wrapper._profiler_step()
+        wrapper.stop()
+        wrapper.start()
+        assert not wrapper._profiler_step()
+        wrapper.stop()
+
+    assert profile.call_count == 2
+    assert profile.call_args.kwargs["activities"] == [
+        torch.profiler.ProfilerActivity.CUDA
+    ]
+    for profiler in profilers:
+        profiler.start.assert_called_once_with()
+        profiler.step.assert_called_once_with()
+        profiler.stop.assert_called_once_with()
+
+
+def test_torch_profiler_records_each_profile_round(tmp_path):
+    trace_paths: list[str] = []
+
+    def export_trace(prof: torch.profiler.profile) -> None:
+        # Export as each round stops instead of parsing every round at the end.
+        path = str(tmp_path / f"round_{len(trace_paths)}.json")
+        prof.export_chrome_trace(path)
+        trace_paths.append(path)
+
+    wrapper = TorchProfilerWrapper(
+        ProfilerConfig(
+            profiler="torch",
+            torch_profiler_dir=str(tmp_path),
+            torch_profiler_dump_cuda_time_total=False,
+            torch_profiler_with_stack=False,
+        ),
+        worker_name="worker",
+        local_rank=1,
+        activities=["CPU"],
+        on_trace_ready=export_trace,
+    )
+
+    for run in range(2):
+        wrapper.start()
+        with torch.profiler.record_function(f"run_{run}"):
+            pass
+        wrapper.stop()
+
+    assert len(trace_paths) == 2
+    for run, path in enumerate(trace_paths):
+        # The CPU profiler records every thread in the process, and an event
+        # name from elsewhere in a long session can hold invalid UTF-8.
+        with open(path, encoding="utf-8", errors="replace") as f:
+            events = json.load(f)["traceEvents"]
+        assert {
+            event["name"]
+            for event in events
+            if event.get("name", "").startswith("run_")
+        } == {f"run_{run}"}
+
+
+@pytest.mark.parametrize(
+    "activities", [["CPU", "CUDA"], ["CUDA"], ["CPU", "XPU"], ["XPU"]]
+)
+@pytest.mark.parametrize("dump_device_time", [True, False])
+def test_torch_profiler_device_summary(tmp_path, capsys, activities, dump_device_time):
+    """Device summaries honor the dump option on both CUDA and XPU."""
+    config = ProfilerConfig(
+        profiler="torch",
+        torch_profiler_dir=str(tmp_path),
+        torch_profiler_dump_cuda_time_total=dump_device_time,
+    )
+    with patch("vllm.profiler.wrapper.torch.profiler.profile") as profile:
+        profile.return_value.key_averages.return_value.table.return_value = (
+            "device times"
+        )
+        wrapper = TorchProfilerWrapper(
+            config, worker_name="worker", local_rank=0, activities=activities
+        )
+        wrapper.start()
+        wrapper.stop()
+
+    summary = tmp_path / "worker.profiler_out.txt"
+    assert summary.exists() == dump_device_time
+    assert ("device times" in capsys.readouterr().out) == dump_device_time
+    if dump_device_time:
+        assert summary.read_text() == "device times\n"
+
+
+def test_torch_profiler_summary_follows_output_name(tmp_path):
+    config = ProfilerConfig(
+        profiler="torch",
+        torch_profiler_dir=str(tmp_path),
+    )
+    with patch("vllm.profiler.wrapper.torch.profiler.profile") as profile:
+        table = profile.return_value.key_averages.return_value.table
+        table.side_effect = ["first run", "second run"]
+        wrapper = TorchProfilerWrapper(
+            config, worker_name="initial", local_rank=1, activities=["CUDA"]
+        )
+        for output_name in ["first_rank1", "second_rank1"]:
+            wrapper.set_output_name(output_name)
+            wrapper.start()
+            wrapper.stop()
+
+    assert (tmp_path / "first_rank1.profiler_out.txt").read_text() == "first run\n"
+    assert (tmp_path / "second_rank1.profiler_out.txt").read_text() == "second run\n"
+
+
+@pytest.mark.parametrize(
+    "activities",
+    [[], ["CPU", "CPU"], ["INVALID"]],
+)
+def test_torch_profiler_activities_reject_invalid_values(activities):
+    with pytest.raises(ValueError, match="torch_profiler_activities"):
+        ProfilerConfig(
+            profiler="torch",
+            torch_profiler_dir="/tmp/mock",
+            torch_profiler_activities=activities,
+        )
+
+
+def test_torch_profiler_activities_require_torch_profiler():
+    with pytest.raises(ValueError, match="only applicable"):
+        ProfilerConfig(torch_profiler_activities=["CPU"])
+
+
+@pytest.mark.parametrize(
+    ("profiler", "activities", "ignore_frontend", "expected"),
+    [
+        ("torch", None, False, True),
+        ("torch", ["CPU"], False, True),
+        ("torch", ["CPU", "CUDA"], False, True),
+        ("torch", ["CUDA"], False, False),
+        ("torch", ["CPU"], True, False),
+        ("cuda", None, False, False),
+    ],
+)
+def test_should_profile_frontend(
+    profiler, activities, ignore_frontend, expected, tmp_path
+):
+    config = ProfilerConfig(
+        profiler=profiler,
+        torch_profiler_dir=str(tmp_path) if profiler == "torch" else "",
+        torch_profiler_activities=activities,
+        ignore_frontend=ignore_frontend,
+    )
+
+    assert config.should_profile_frontend is expected
+
+
+@pytest.mark.parametrize(
+    ("device_type", "activities"),
+    [
+        ("cuda", ["XPU"]),
+        ("xpu", ["CUDA"]),
+        ("cpu", ["CUDA"]),
+        ("cpu", ["XPU"]),
+    ],
+)
+def test_worker_rejects_unsupported_activities_at_startup(device_type, activities):
+    config = ProfilerConfig(
+        profiler="torch",
+        torch_profiler_dir="/tmp/mock",
+        torch_profiler_activities=activities,
+    )
+
+    with (
+        patch.object(current_platform, "device_type", device_type),
+        pytest.raises(ValueError, match="Unsupported torch profiler activities"),
+    ):
+        validate_worker_profiler_config(config)
+
+
+@pytest.mark.parametrize("device_type", ["cpu", "xpu"])
+def test_worker_rejects_cuda_profiler_on_other_devices(device_type):
+    with (
+        patch.object(current_platform, "device_type", device_type),
+        pytest.raises(ValueError, match="Unsupported profiler type"),
+    ):
+        validate_worker_profiler_config(ProfilerConfig(profiler="cuda"))
+
+
+@pytest.mark.parametrize(
+    ("device_type", "activities", "expected"),
+    [
+        ("cuda", None, ("CPU", "CUDA")),
+        ("xpu", None, ("CPU", "XPU")),
+        ("cpu", None, ("CPU",)),
+        ("cuda", ["CUDA"], ("CUDA",)),
+        ("xpu", ["XPU"], ("XPU",)),
+        ("cuda", ["CPU"], ("CPU",)),
+        ("xpu", ["CPU"], ("CPU",)),
+        ("cpu", ["CPU"], ("CPU",)),
+    ],
+)
+def test_worker_creates_platform_torch_profiler(device_type, activities, expected):
+    config = ProfilerConfig(
+        profiler="torch",
+        torch_profiler_dir="/tmp/mock",
+        torch_profiler_activities=activities,
+    )
+
+    with (
+        patch.object(current_platform, "device_type", device_type),
+        patch("vllm.profiler.wrapper.TorchProfilerWrapper") as wrapper,
+    ):
+        validate_worker_profiler_config(config)
+        profiler = create_worker_profiler(
+            config,
+            worker_name="rank0",
+            local_rank=0,
+        )
+
+    assert profiler is wrapper.return_value
+    wrapper.assert_called_once_with(
+        config,
+        worker_name="rank0",
+        local_rank=0,
+        activities=expected,
+    )
+
+
+@pytest.mark.parametrize("worker_type", [Worker, XPUWorker])
+def test_worker_reuses_torch_wrapper_across_profile_rounds(worker_type):
+    worker = object.__new__(worker_type)
+    worker.rank = 0
+    worker.local_rank = 0
+    worker.profiler = None
+    worker.profiler_config = ProfilerConfig(
+        profiler="torch", torch_profiler_dir="/tmp/mock"
+    )
+
+    with (
+        patch("vllm.distributed.utils.get_worker_rank_suffix", return_value="rank0"),
+        patch("vllm.profiler.wrapper.TorchProfilerWrapper") as wrapper,
+    ):
+        worker.profile(
+            profile_prefix="first",
+            delay_iterations=5,
+            max_iterations=2,
+        )
+        worker.profile(is_start=False)
+        worker.profile(profile_prefix="second")
+
+    assert worker.profiler is wrapper.return_value
+    wrapper.assert_called_once()
+    assert wrapper.return_value.set_output_name.call_args_list == [
+        call("first_rank0"),
+        call("second_rank0"),
+    ]
+    assert wrapper.return_value.start.call_args_list == [
+        call(delay_iterations=5, max_iterations=2),
+        call(delay_iterations=None, max_iterations=None),
+    ]
+    wrapper.return_value.stop.assert_called_once_with()
+
+
+def test_executor_profile_only_forwards_supplied_override_kwargs():
+    executor = MagicMock()
+    executor.vllm_config.parallel_config.worker_cls = "vllm.v1.worker.gpu_worker.Worker"
+
+    Executor.profile(executor, True, "default")
+    Executor.profile(
+        executor,
+        True,
+        "bounded",
+        delay_iterations=5,
+        max_iterations=2,
+    )
+
+    assert executor.collective_rpc.call_args_list == [
+        call("profile", args=(True, "default"), kwargs=None),
+        call(
+            "profile",
+            args=(True, "bounded"),
+            kwargs={"delay_iterations": 5, "max_iterations": 2},
+        ),
+    ]
+
+
+class _LegacyProfileWorker:
+    def profile(self, is_start: bool = True, profile_prefix: str | None = None):
+        pass
+
+
+def test_executor_rejects_overrides_unsupported_by_worker():
+    """Out-of-tree workers with the old ``profile`` signature are rejected
+    before dispatch, so a failed collective_rpc cannot leave replies queued."""
+    executor = MagicMock()
+    executor.vllm_config.parallel_config.worker_cls = f"{__name__}._LegacyProfileWorker"
+
+    with pytest.raises(ValueError, match="max_iterations"):
+        Executor.profile(executor, True, None, max_iterations=2)
+    Executor.profile(executor, True, "legacy")
+
+    executor.collective_rpc.assert_called_once_with(
+        "profile", args=(True, "legacy"), kwargs=None
+    )
+
+
+def test_worker_rejects_invalid_profile_prefix():
+    worker = object.__new__(Worker)
+    worker.profiler = None
+    worker.profiler_config = ProfilerConfig(
+        profiler="torch", torch_profiler_dir="/tmp/mock"
+    )
+
+    with pytest.raises(ValueError, match="profile_prefix"):
+        worker.profile(profile_prefix="../trace")
+
+
 def test_immediate_start_stop(default_profiler_config):
     """Test standard start without delay."""
     profiler = ConcreteWorkerProfiler(default_profiler_config)
@@ -74,6 +403,33 @@ def test_immediate_start_stop(default_profiler_config):
     profiler.stop()
     assert profiler._running is False
     assert profiler._active is False
+    assert profiler.stop_call_count == 1
+
+
+def test_stop_waits_for_inflight_start(default_profiler_config):
+    """A stop() from another thread during a slow start() must still stop the
+    backend instead of leaving it running with the session marked inactive."""
+    profiler = ConcreteWorkerProfiler(default_profiler_config)
+    in_start = threading.Event()
+    release_start = threading.Event()
+
+    def slow_start():
+        in_start.set()
+        release_start.wait()
+
+    with patch.object(profiler, "_start", side_effect=slow_start):
+        start_thread = threading.Thread(target=profiler.start)
+        start_thread.start()
+        assert in_start.wait(timeout=5)
+        stop_thread = threading.Thread(target=profiler.stop)
+        stop_thread.start()
+        stop_thread.join(timeout=0.1)
+        release_start.set()
+        start_thread.join(timeout=5)
+        stop_thread.join(timeout=5)
+
+    assert profiler._active is False
+    assert profiler._running is False
     assert profiler.stop_call_count == 1
 
 
@@ -183,19 +539,37 @@ def test_delayed_start_and_max_iters(default_profiler_config):
     assert profiler.stop_call_count == 1
 
 
-def test_idempotency(default_profiler_config):
-    """Test that calling start/stop multiple times doesn't break logic."""
+def test_duplicate_start_is_ignored(default_profiler_config):
     profiler = ConcreteWorkerProfiler(default_profiler_config)
 
-    # Double Start
     profiler.start()
     profiler.start()
-    assert profiler.start_call_count == 1  # Should only start once
+    assert profiler.start_call_count == 1
 
-    # Double Stop
     profiler.stop()
     profiler.stop()
-    assert profiler.stop_call_count == 1  # Should only stop once
+    assert profiler.stop_call_count == 1
+
+
+def test_session_bounds_override_and_reset_to_defaults():
+    profiler = ConcreteWorkerProfiler(
+        ProfilerConfig(
+            profiler="torch",
+            torch_profiler_dir="/tmp/mock",
+            delay_iterations=3,
+            max_iterations=4,
+        )
+    )
+
+    profiler.start(delay_iterations=1, max_iterations=2)
+    assert profiler._delay_iters == 1
+    assert profiler._max_iters == 2
+    profiler.stop()
+
+    profiler.start()
+    assert profiler._delay_iters == 3
+    assert profiler._max_iters == 4
+    profiler.stop()
 
 
 def test_step_inactive(default_profiler_config):
@@ -330,13 +704,17 @@ class TestAnnotateProfile:
             "execute_5_context_1(sq4sk4sqsq16sqsk16)_generation_1(sq1sk11sqsq1sqsk11)"
         )
 
-    def test_skips_annotation_work_after_profiler_stops(self):
+    def test_skips_annotation_work_when_profiler_does_not_annotate(self):
         worker = MagicMock()
-        worker.profiler.is_running = False
+        worker.profiler.should_annotate = False
 
-        context = Worker.annotate_profile(worker, scheduler_output=None)
+        with patch(
+            "vllm.v1.worker.gpu_worker.compute_iteration_details"
+        ) as compute_iteration_details:
+            context = Worker.annotate_profile(worker, scheduler_output=None)
 
         worker.profiler.step.assert_called_once_with()
+        compute_iteration_details.assert_not_called()
         worker.profiler.annotate_context_manager.assert_not_called()
         assert isinstance(context, nullcontext)
 
@@ -346,198 +724,17 @@ def test_profiler_entered_during_capture():
     confirming it is active during the actual graph capture run."""
     runner = MagicMock()
     runner.compilation_config.cudagraph_num_of_warmups = 0
+    mock_profiler = MagicMock()
 
-    with bound_graph_capture() as profiler:
-        GPUModelRunner._warmup_and_capture(
-            runner,
-            desc=MagicMock(num_tokens=4, uniform=True),
-            cudagraph_runtime_mode=CUDAGraphMode.FULL,
-        )
-
-    profiler.__enter__.assert_called_once()
-    profiler.__exit__.assert_called_once()
-
-
-@contextmanager
-def bound_graph_capture(label_prefix=None):
-    """Enter a graph-capture binding backed by a mock profiler."""
-    profiler = MagicMock()
-    with (
-        patch.object(
-            graph_capture, "make_graph_capture_profiler", return_value=profiler
-        ),
-        graph_capture_profiler(MagicMock(), label_prefix=label_prefix),
-    ):
-        yield profiler
-
-
-class TestGraphCaptureProfiler:
-    """V2 binds one profiler per subsystem; capture loops only call
-    graph_capture_step and inherit whichever binding is active."""
-
-    @pytest.fixture
-    def annotation(self):
-        with patch.object(torch.profiler, "record_function") as record_function:
-            yield record_function
-
-    def test_step_is_noop_without_binding(self, annotation):
-        with graph_capture_step(32, "FULL"):
-            pass
-
-        annotation.assert_not_called()
-
-    @pytest.mark.parametrize(
-        "label_prefix,num_tokens,mode,expected",
-        [
-            (None, 512, "PIECEWISE", "capture_512_PIECEWISE"),
-            ("draft", 32, "FULL", "capture_32_draft_FULL"),
-            ("encoder", 1024, "default", "capture_1024_encoder_default"),
-        ],
+    GPUModelRunner._warmup_and_capture(
+        runner,
+        desc=MagicMock(num_tokens=4, uniform=True),
+        cudagraph_runtime_mode=CUDAGraphMode.FULL,
+        profiler=mock_profiler,
     )
-    def test_annotation_label(
-        self, annotation, label_prefix, num_tokens, mode, expected
-    ):
-        with (
-            bound_graph_capture(label_prefix) as profiler,
-            graph_capture_step(num_tokens, mode),
-        ):
-            pass
 
-        annotation.assert_called_once_with(expected)
-        profiler.__enter__.assert_called_once()
-        profiler.__exit__.assert_called_once()
-
-    def test_profiler_cycles_once_per_shape(self, annotation):
-        """Each shape re-enters the profiler, which is what splits capture
-        into one trace file per shape."""
-        with bound_graph_capture() as profiler:
-            for num_tokens in (32, 64, 128):
-                with graph_capture_step(num_tokens, "FULL"):
-                    pass
-
-        assert profiler.__enter__.call_count == 3
-        assert profiler.__exit__.call_count == 3
-        assert annotation.call_count == 3
-
-    def test_binding_cleared_when_capture_raises(self):
-        with pytest.raises(RuntimeError), bound_graph_capture():
-            raise RuntimeError("capture failed")
-
-        assert graph_capture._active_binding.get() is None
-
-    @pytest.mark.parametrize(
-        "subsystem,expected",
-        [
-            (None, "graph_capture_rank_0"),
-            ("encoder", "graph_capture_rank_0_encoder"),
-            ("speculator", "graph_capture_rank_0_speculator"),
-        ],
-    )
-    def test_trace_file_name_per_subsystem(self, subsystem, expected):
-        config = MagicMock(
-            profiler_config=ProfilerConfig(
-                profiler="torch",
-                torch_profiler_dir="/traces",
-                capture_torch_profiler=True,
-            ),
-            device_config=SimpleNamespace(device_type="xpu"),
-        )
-        profiler = MagicMock()
-        wrapper = MagicMock(profiler=profiler)
-
-        with (
-            patch.object(
-                graph_capture, "get_world_group", return_value=MagicMock(local_rank=0)
-            ),
-            patch.object(
-                graph_capture, "TorchProfilerWrapper", return_value=wrapper
-            ) as wrapper_cls,
-        ):
-            result = graph_capture.make_graph_capture_profiler(config, subsystem)
-
-        assert result is profiler
-        capture_config = wrapper_cls.call_args.args[0]
-        assert capture_config.torch_profiler_dir == "/traces/capture_traces"
-        assert wrapper_cls.call_args.kwargs["worker_name"] == expected
-        # Activities follow the runner device, not a hardcoded CUDA list.
-        assert wrapper_cls.call_args.kwargs["activities"] == ["CPU", "XPU"]
-        wrapper.start.assert_not_called()
-
-    def test_capture_config_overrides(self):
-        config = ProfilerConfig(
-            profiler="torch",
-            torch_profiler_dir="/traces",
-            delay_iterations=2,
-            max_iterations=3,
-            warmup_iterations=4,
-            wait_iterations=5,
-            torch_profiler_record_shapes=False,
-            torch_profiler_with_stack=False,
-            torch_profiler_with_flops=True,
-            torch_profiler_with_memory=True,
-            torch_profiler_use_gzip=False,
-            ignore_frontend=True,
-        )
-
-        capture_config = graph_capture_profiler_config(config)
-
-        assert capture_config.delay_iterations == 0
-        assert capture_config.max_iterations == 0
-        assert capture_config.warmup_iterations == 0
-        assert capture_config.wait_iterations == 0
-        assert capture_config.torch_profiler_record_shapes
-        assert capture_config.torch_profiler_with_stack
-        assert capture_config.torch_profiler_with_flops
-        assert capture_config.torch_profiler_with_memory
-        assert not capture_config.torch_profiler_use_gzip
-
-    @pytest.mark.parametrize(
-        "device_type,expected",
-        [
-            ("cuda", ["CPU", "CUDA"]),
-            ("xpu", ["CPU", "XPU"]),
-            ("cpu", ["CPU"]),
-            ("tpu", ["CPU"]),
-        ],
-    )
-    def test_activities_follow_runner_device(self, device_type, expected):
-        assert default_torch_profiler_activities(device_type) == expected
-
-    @pytest.mark.parametrize("local_rank,enabled", [(0, False), (1, True)])
-    def test_no_profiler_when_disabled_or_off_rank(self, local_rank, enabled):
-        config = MagicMock()
-        config.profiler_config.capture_torch_profiler = enabled
-
-        with patch.object(
-            graph_capture,
-            "get_world_group",
-            return_value=MagicMock(local_rank=local_rank),
-        ):
-            profiler = graph_capture.make_graph_capture_profiler(config, None)
-
-        assert isinstance(profiler, nullcontext)
-
-    def test_nested_bind_keeps_outer_prefix(self, annotation):
-        with (
-            bound_graph_capture("draft") as profiler,
-            graph_capture_profiler(MagicMock(), label_prefix="ignored"),
-            graph_capture_step(32, "FULL"),
-        ):
-            pass
-
-        annotation.assert_called_once_with("capture_32_draft_FULL")
-        profiler.__enter__.assert_called_once()
-
-    def test_skip_tracing_is_noop_even_if_capture_binds(self, annotation):
-        with (
-            skip_graph_capture_tracing(),
-            graph_capture_profiler(MagicMock(), label_prefix="encoder"),
-            graph_capture_step(32, "FULL"),
-        ):
-            pass
-
-        annotation.assert_not_called()
-        assert graph_capture._active_binding.get() is None
+    mock_profiler.__enter__.assert_called_once()
+    mock_profiler.__exit__.assert_called_once()
 
 
 def make_proton(session_id: int | None = 7):
@@ -583,6 +780,15 @@ def make_proton_wrapper(
 _requires_cuda_for_proton = pytest.mark.skipif(
     not current_platform.is_cuda(),
     reason="Proton profiling tests require an NVIDIA CUDA platform.",
+)
+
+# Proton subscribes to CUPTI itself, and a process gets one CUPTI subscriber.
+# CI's kernel-launch recorder is another, injected through CUDA_INJECTION64_PATH
+# on recording runs, and there Proton's cuptiSubscribe fails with error 39.
+_requires_no_injected_cupti_tool = pytest.mark.skipif(
+    bool(os.environ.get("CUDA_INJECTION64_PATH")),
+    reason="Another CUPTI tool is injected (CUDA_INJECTION64_PATH); "
+    "Proton has to be the only one.",
 )
 
 
@@ -1030,37 +1236,41 @@ class TestProtonProfilerWrapper:
 
 @_requires_cuda_for_proton
 def test_gpu_worker_creates_proton_profiler():
-    worker = MagicMock()
+    worker = object.__new__(Worker)
     worker.rank = 1
+    worker.local_rank = 1
     worker.profiler = None
-    worker.profiler_config.profiler = "proton"
+    worker.profiler_config = MagicMock(profiler="proton")
 
     with (
         patch(
             "vllm.distributed.utils.get_worker_rank_suffix",
             return_value="rank1",
         ),
-        patch("vllm.v1.worker.gpu_worker.ProtonProfilerWrapper") as wrapper,
+        patch("vllm.profiler.wrapper.ProtonProfilerWrapper") as wrapper,
     ):
         Worker.profile(worker)
 
     wrapper.assert_called_once_with(worker.profiler_config, worker_name="rank1")
-    worker.profiler.start.assert_called_once_with()
+    worker.profiler.start.assert_called_once_with(
+        delay_iterations=None, max_iterations=None
+    )
 
 
 @_requires_cuda_for_proton
 def test_gpu_worker_recreates_proton_profiler_for_each_run():
-    worker = MagicMock()
+    worker = object.__new__(Worker)
     worker.rank = 1
+    worker.local_rank = 1
     worker.profiler = None
-    worker.profiler_config.profiler = "proton"
+    worker.profiler_config = MagicMock(profiler="proton")
 
     with (
         patch(
             "vllm.distributed.utils.get_worker_rank_suffix",
             return_value="rank1",
         ),
-        patch("vllm.v1.worker.gpu_worker.ProtonProfilerWrapper") as wrapper,
+        patch("vllm.profiler.wrapper.ProtonProfilerWrapper") as wrapper,
     ):
         wrapper.return_value.has_cuda_graph_session = False
         Worker.profile(worker, profile_prefix="first")
@@ -1090,7 +1300,9 @@ def test_gpu_worker_reuses_cuda_graph_proton_session():
         Worker.profile(worker, is_start=False)
 
     worker.profiler.set_output_name.assert_called_once_with("first_rank1")
-    worker.profiler.start.assert_called_once_with()
+    worker.profiler.start.assert_called_once_with(
+        delay_iterations=None, max_iterations=None
+    )
     worker.profiler.stop.assert_called_once_with()
 
 
@@ -1148,6 +1360,7 @@ def test_proton_initializes_before_cuda_graph_capture():
 
 
 @_requires_cuda_for_proton
+@_requires_no_injected_cupti_tool
 @pytest.mark.parametrize("context", ["shadow", "python"])
 @pytest.mark.parametrize("output_format", ["hatchet", "hatchet_msgpack"])
 def test_proton_cuda_graph_replay_attribution_on_gpu(tmp_path, context, output_format):

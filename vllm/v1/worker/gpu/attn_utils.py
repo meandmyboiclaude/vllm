@@ -1,22 +1,25 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from contextlib import AbstractContextManager, nullcontext
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 import torch
 
+import vllm.envs as envs
 from vllm.config import (
     VllmConfig,
     get_layers_from_vllm_config,
 )
 from vllm.config.compilation import CUDAGraphMode
+from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.multimodal.inputs import MultiModalFeatureSpec
 from vllm.utils.torch_utils import async_tensor_h2d
+from vllm.platforms import current_platform
 from vllm.v1.attention.backend import (
     AttentionCGSupport,
     CommonAttentionMetadata,
@@ -24,12 +27,13 @@ from vllm.v1.attention.backend import (
 from vllm.v1.attention.backends.utils import create_fast_prefill_custom_backend
 from vllm.v1.hisparse.binding import (
     init_hisparse_kv_cache,
-    resolve_hisparse_block_size,
+    resolve_hisparse_specs,
 )
 from vllm.v1.kv_cache_interface import (
     AttentionSpec,
     KVCacheConfig,
     KVCacheSpec,
+    MambaSpec,
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.worker.gpu.model_states.interface import ModelSpecificAttnMetadata
@@ -39,8 +43,12 @@ from vllm.v1.worker.utils import (
     add_kv_sharing_layers_to_kv_cache_groups,
     allocate_kv_cache,
     bind_kv_cache_to_layers,
+    customize_attention_spec,
+    map_kv_caches_to_kernel_blocks,
     prepare_kernel_block_sizes,
 )
+
+logger = init_logger(__name__)
 
 if TYPE_CHECKING:
     from vllm.v1.worker.gpu.block_table import BlockTables
@@ -140,9 +148,12 @@ def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
         # Skip modules that don't need KV cache (eg encoder-only attention)
         if spec := attn_module.get_kv_cache_spec(vllm_config):
             if isinstance(spec, AttentionSpec):
-                spec = attn_module.get_attn_backend().customize_spec(spec)
+                spec = customize_attention_spec(attn_module.get_attn_backend(), spec)
+            if attn_module.is_draft_layer:
+                spec = replace(spec, is_draft=True)
             kv_cache_spec[layer_name] = spec
-    resolve_hisparse_block_size(vllm_config, kv_cache_spec, attn_layers)
+    if vllm_config.attention_config.hisparse_config is not None:
+        kv_cache_spec = resolve_hisparse_specs(vllm_config, kv_cache_spec, attn_layers)
     return kv_cache_spec
 
 
@@ -223,6 +234,14 @@ def init_attn_backend(
 
         for layer_name in layer_names:
             attn_backend = attn_layers[layer_name].get_attn_backend()
+            if (
+                envs.VLLM_BATCH_INVARIANT
+                and not attn_backend.supports_batch_invariance()
+            ):
+                raise RuntimeError(
+                    "VLLM batch_invariant mode is not supported for "
+                    f"{attn_backend.get_name()}."
+                )
             if layer_name in fast_prefill_eligible_layers:
                 attn_backend = create_fast_prefill_custom_backend(
                     "FastPrefill", attn_backend
@@ -251,10 +270,24 @@ def init_attn_backend(
     # by all backends within that group.
     kernel_block_sizes = prepare_kernel_block_sizes(kv_cache_config, attn_groups)
 
+    if current_platform.is_xpu():
+        for kv_cache_group_id, selected_kernel_block_size in enumerate(
+            kernel_block_sizes
+        ):
+            if selected_kernel_block_size % 64 != 0:
+                for attn_group in attn_groups[kv_cache_group_id]:
+                    logger.warning_once(
+                        "On XPU platform, current selected kernel block size is "
+                        "not fully optimized: kernel_block_size=%s, backend=%s, "
+                        "kv_cache_spec=%s",
+                        selected_kernel_block_size,
+                        attn_group.backend,
+                        repr(attn_group.kv_cache_spec),
+                    )
     # Phase 3: create metadata builders and determine cudagraph support.
     attn_backend_workspace: torch.Tensor | None = None
     for kv_cache_group_id, groups in enumerate(attn_groups):
-        kernel_block_size = None
+        kernel_block_size: int | None = None
         if kv_cache_group_id < len(kernel_block_sizes):
             kernel_block_size = kernel_block_sizes[kv_cache_group_id]
         for group in groups:
@@ -329,6 +362,40 @@ def get_query_lens_mismatch_unsupported_backend(
     return None
 
 
+def get_varlen_cudagraph_unsupported_backend(
+    attn_groups: list[list[AttentionGroup]],
+    vllm_config: VllmConfig,
+    max_query_len: int,
+    checked_layer_names: set[str] | None = None,
+) -> tuple[str, int | None] | None:
+    """Name the first backend whose FULL cudagraphs cannot replay decode batches
+    of 1 to max_query_len tokens per request, with its bound, if any.
+
+    ALWAYS builders replay any batch; the others need a bound of at least
+    max_query_len. See AttentionMetadataBuilder.get_varlen_cudagraph_max_query_len().
+    """
+    for groups in attn_groups:
+        for group in groups:
+            if checked_layer_names is not None and checked_layer_names.isdisjoint(
+                group.layer_names
+            ):
+                continue
+            builder = group.get_metadata_builder(0)
+            spec = group.kv_cache_spec
+            support = builder.get_cudagraph_support(vllm_config, spec)
+            if support == AttentionCGSupport.ALWAYS:
+                continue
+            bound = (
+                # NEVER means never, whatever an inherited override says.
+                None
+                if support == AttentionCGSupport.NEVER
+                else builder.get_varlen_cudagraph_max_query_len(vllm_config, spec)
+            )
+            if bound is None or bound < max_query_len:
+                return group.backend.__name__, bound
+    return None
+
+
 def init_kv_cache(
     forward_context: dict[str, Any],
     kv_cache_config: KVCacheConfig,
@@ -338,6 +405,7 @@ def init_kv_cache(
     kv_cache_allocation_context: AbstractContextManager | None = None,
     *,
     block_tables: "BlockTables | None" = None,
+    attn_groups: Iterable[AttentionGroup] = (),
 ) -> dict[str, Any]:
     allocation_context = kv_cache_allocation_context or nullcontext()
     with allocation_context:
@@ -363,14 +431,12 @@ def init_kv_cache(
     # Dual-attention models (e.g. LongCat-Flash) put two Attention modules per
     # decoder layer, so a layer name carries two integers (layer + module index).
     num_attn_module = (
-        2
-        if vllm_config.model_config.hf_config.model_type
-        in ("longcat_flash", "longcat_flash_ngram")
-        else 1
+        2 if vllm_config.model_config.hf_config.model_type == "longcat_flash" else 1
     )
-    bindable_caches = {
-        name: cache for name, cache in kv_caches.items() if name in forward_context
-    }
+    bindable_caches = map_kv_caches_to_kernel_blocks(
+        {name: cache for name, cache in kv_caches.items() if name in forward_context},
+        attn_groups,
+    )
     bind_kv_cache_to_layers(
         bindable_caches,
         forward_context,
@@ -429,6 +495,10 @@ def build_attn_metadata(
 
     attn_metadata: dict[str, Any] = {}
     token_to_req_indices: torch.Tensor | None = None
+    # Mamba groups with the same spec and builder differ only in their state
+    # indices, so later groups re-gather those from the first group's metadata.
+    # Also at capture, so FULL graphs share the batch-level buffers.
+    cached_metadata: dict[tuple[KVCacheSpec, type], Any] = {}
     num_kv_cache_groups = len(kv_cache_config.kv_cache_groups)
     for i in range(num_kv_cache_groups):
         if not attn_groups[i]:
@@ -481,9 +551,18 @@ def build_attn_metadata(
 
         for attn_group in attn_groups[i]:
             attn_metadata_builder = attn_group.get_metadata_builder(ubatch_idx)
-            if for_cudagraph_capture:
-                metadata = attn_metadata_builder.build_for_cudagraph_capture(
-                    common_attn_metadata
+            reuse_key = None
+            if attn_metadata_builder.supports_update_block_table and isinstance(
+                attn_group.kv_cache_spec, MambaSpec
+            ):
+                reuse_key = (attn_group.kv_cache_spec, type(attn_metadata_builder))
+            if reuse_key in cached_metadata:
+                metadata = attn_metadata_builder.update_block_table(
+                    cached_metadata[reuse_key], block_table, slot_mapping
+                )
+            elif for_cudagraph_capture:
+                metadata = attn_group.build_metadata_for_cudagraph_capture(
+                    common_attn_metadata, ubatch_idx
                 )
             else:
                 attn_metadata_extra_kwargs = (
@@ -494,11 +573,11 @@ def build_attn_metadata(
                     if model_specific_attn_metadata is not None
                     else {}
                 )
-                metadata = attn_metadata_builder.build(
-                    common_prefix_len=0,
-                    common_attn_metadata=common_attn_metadata,
-                    **attn_metadata_extra_kwargs,
+                metadata = attn_group.build_metadata(
+                    common_attn_metadata, ubatch_idx, **attn_metadata_extra_kwargs
                 )
+            if reuse_key is not None and reuse_key not in cached_metadata:
+                cached_metadata[reuse_key] = metadata
             for layer_name in attn_group.layer_names:
                 attn_metadata[layer_name] = metadata
         token_to_req_indices = common_attn_metadata._token_to_req_indices_cache
@@ -580,10 +659,9 @@ def compute_common_gdn_attn_metadata(
     else:
         spec_sequence_masks_cpu = num_decode_draft_tokens_cpu >= 0
         num_spec_decodes = spec_sequence_masks_cpu.sum().item()
-        if (
-            num_spec_decodes == 0
-            or num_decode_draft_tokens_cpu[spec_sequence_masks_cpu].sum().item() == 0
-        ):
+        # [rebase-9 X1, port of upstream #56531 0eac152707] a batch whose rows all drafted nothing still runs the
+        # speculative path: that is the only path that applies each row's accepted-token offset to the recurrent state.
+        if num_spec_decodes == 0:
             # The count must fall with the mask: GDN build() asserts decode and
             # spec-decode rows are mutually exclusive, and a stale non-zero
             # count also suppresses its FULL-graph decode staging.
@@ -635,6 +713,11 @@ def compute_common_gdn_attn_metadata(
             num_decodes = 0
             num_decode_tokens = 0
 
+        # [rebase-9 X1] the pure-spec fast path slices query_start_loc and num_accepted_tokens, which is exact only when
+        # the spec rows lead and every zero-length (padded) row trails them. Checked once on the host (a CPU bool
+        # reduction, no device work or sync); when it fails those two take the mask form. kv's gdn_attn build() carries
+        # the same check for its block-table slice (spec_rows_lead), so state indices and counts cannot disagree.
+        spec_rows_lead = bool(spec_sequence_masks_cpu[:num_spec_decodes].all())
         if num_prefills == 0 and num_decodes == 0:
             spec_token_size = min(
                 num_spec_decodes * (num_spec + 1),
@@ -650,8 +733,21 @@ def compute_common_gdn_attn_metadata(
             )
             # Padded sequences are always at the back, so the first
             # num_spec_decodes + 1 entries of query_start_loc already
-            # contain the correct cumulative token counts.
-            spec_query_start_loc = query_start_loc[: num_spec_decodes + 1]
+            # contain the correct cumulative token counts. (spec_token_indx above needs no such premise: zero-length
+            # rows own no tokens, so every token of a pure-spec batch is a spec token in order.)
+            if spec_rows_lead:
+                spec_query_start_loc = query_start_loc[: num_spec_decodes + 1]
+            else:
+                spec_query_start_loc = torch.zeros(
+                    num_spec_decodes + 1,
+                    dtype=torch.int32,
+                    device=query_start_loc.device,
+                )
+                torch.cumsum(
+                    query_lens[spec_sequence_masks_cpu],
+                    dim=0,
+                    out=spec_query_start_loc[1:],
+                )
             non_spec_query_start_loc = None
             non_spec_query_start_loc_cpu = None
         else:
@@ -696,7 +792,14 @@ def compute_common_gdn_attn_metadata(
             )
 
         assert num_accepted_tokens is not None
-        num_accepted_tokens = num_accepted_tokens[spec_sequence_masks_cpu]
+        # [rebase-9 X1, port of upstream #58763 87a4bf664f] pure spec-decode batch: padded rows trail the spec decodes,
+        # so slice instead of a host-mask gather (identical rows; no H2D copy + kernel). Upstream assumes the trailing
+        # order; spec_rows_lead (above) keeps the gather whenever a zero-length row sits before a spec row, so a batch
+        # that breaks the assumption can never get shifted counts.
+        if num_prefills == 0 and num_decodes == 0 and spec_rows_lead:
+            num_accepted_tokens = num_accepted_tokens[:num_spec_decodes]
+        else:
+            num_accepted_tokens = num_accepted_tokens[spec_sequence_masks_cpu]
         # A row can report 0 accepted tokens when its sampled tokens were
         # discarded (stale async-scheduling step) while its drafts were still
         # scheduled. Such a row has no valid spec state to resume from, and
