@@ -332,3 +332,98 @@ void dynamic_scaled_int8_quant(
         }
       });
 }
+
+
+// ---------------------------------------------------------------------------------------------
+// [C3 cuda-lane 2026-09-21] silu_and_mul + DYNAMIC per-token int8 quant, fused.
+//
+// The W4A8 Marlin path feeds down_proj with  silu(gate) * up  produced by the opaque
+// `silu_and_mul` op, then quantises it with `dynamic_scaled_int8_quant_kernel` (per-row absmax)
+// and finally multiplies a_scales by a per-layer scalar (marlin_utils.py:718).  Inductor cannot
+// fuse across the opaque op (PN447 only reaches NORM-fed GEMMs), so at 8 seats that is
+// 3 launches x 64 layers per decode step for one [M, d] activation.  This kernel does all three
+// in ONE launch, reading the [M, 2d] gate_up tensor twice (absmax pass, quant pass -- the row is
+// L2-resident on the second pass, exactly like dynamic_scaled_int8_quant_kernel) and writing
+// int8 + one fp32 scale per row.  Bit-exact w.r.t. the SERVED sequence: _C.silu_and_mul's two bf16
+// roundings, then PN447's quant (absmax floor 1e-10, clamp, round half away); the optional global_scale (the
+// per-layer act-scale factor) is folded into the STORED scale, which is what the unfused path's
+// `a_scales * input_global_scale` computes.
+// ---------------------------------------------------------------------------------------------
+namespace vllm {
+
+template <typename T> __device__ __forceinline__ float c3_served_silu_mul(const T& x, const T& y) { const T s = static_cast<T>(static_cast<float>(x) / (1.0f + expf(-static_cast<float>(x)))); return static_cast<float>(static_cast<T>(static_cast<float>(s) * static_cast<float>(y))); }  // = _C.silu_and_mul: (T)silu, then bf16*bf16
+
+template <typename scalar_t>
+__global__ void silu_and_mul_dynamic_int8_quant_kernel(
+    int8_t* __restrict__ out,            // [num_tokens, d]
+    float* __restrict__ scale_out,       // [num_tokens]
+    const scalar_t* __restrict__ input,  // [num_tokens, 2 * d]  (gate | up)
+    const float* __restrict__ global_scale,  // nullptr or one float
+    const int d) {
+  const int tid = threadIdx.x;
+  const int stride = blockDim.x;
+  const int64_t token_idx = blockIdx.x;
+  const scalar_t* __restrict__ x_ptr = input + token_idx * 2 * d;
+  const scalar_t* __restrict__ y_ptr = x_ptr + d;
+  int8_t* __restrict__ row_out = out + token_idx * d;
+
+  // pass 1: absmax of silu(x) * y over the row
+  float thread_max = 0.f;
+  for (int i = tid; i < d; i += stride) {
+    const float v = c3_served_silu_mul<scalar_t>(x_ptr[i], y_ptr[i]);
+    thread_max = fmaxf(thread_max, fabsf(v));
+  }
+  using BlockReduce = cub::BlockReduce<float, 256>;
+  __shared__ typename BlockReduce::TempStorage tmp;
+  const float block_max = BlockReduce(tmp).Reduce(thread_max, CubMaxOp{}, blockDim.x);
+  __shared__ float absmax;
+  if (tid == 0) {
+    absmax = fmaxf(block_max, 1e-10f);  // served: torch.clamp(amax, min=1e-10)
+    const float g = (global_scale == nullptr) ? 1.0f : global_scale[0];
+    scale_out[blockIdx.x] = (absmax / 127.f) * g;
+  }
+  __syncthreads();
+  const float inv_s = 127.f / absmax;
+
+  // pass 2: recompute and quantise (same arithmetic as the served _pn447_fused_int8_quant)
+  for (int i = tid; i < d; i += stride) {
+    const float v = c3_served_silu_mul<scalar_t>(x_ptr[i], y_ptr[i]);
+    const float t = fminf(fmaxf(v * inv_s, -127.f), 127.f); row_out[i] = static_cast<int8_t>(t >= 0.f ? floorf(t + 0.5f) : ceilf(t - 0.5f));  // PN447: clamp, round half away
+  }
+}
+
+}  // namespace vllm
+
+void silu_and_mul_dynamic_int8_quant(
+    torch::stable::Tensor& out,          // [..., d]  int8
+    torch::stable::Tensor const& input,  // [..., 2 * d]
+    torch::stable::Tensor& scales,       // [..., 1]  float32
+    std::optional<torch::stable::Tensor> const& global_scale) {
+  STD_TORCH_CHECK(input.is_contiguous());
+  STD_TORCH_CHECK(out.is_contiguous());
+  STD_TORCH_CHECK(scales.is_contiguous());
+  STD_TORCH_CHECK(input.size(-1) % 2 == 0, "silu_and_mul input last dim must be even");
+  STD_TORCH_CHECK(out.scalar_type() == torch::headeronly::ScalarType::Char, "out must be int8");
+  STD_TORCH_CHECK(scales.scalar_type() == torch::headeronly::ScalarType::Float, "scales must be float32");
+  const int d = input.size(-1) / 2;
+  const int64_t num_tokens = input.numel() / input.size(-1);
+  STD_TORCH_CHECK(out.numel() == num_tokens * d, "out shape mismatch");
+  STD_TORCH_CHECK(scales.numel() == num_tokens, "scales must hold one value per token");
+  const float* gptr = nullptr;
+  if (global_scale.has_value()) {
+    STD_TORCH_CHECK(global_scale->numel() == 1 &&
+                        global_scale->scalar_type() == torch::headeronly::ScalarType::Float,
+                    "global_scale must be one float32 element");
+    gptr = global_scale->const_data_ptr<float>();
+  }
+  const dim3 grid(num_tokens);
+  const dim3 block(256);   // matches cub::BlockReduce<float, 256> above
+  const torch::stable::accelerator::DeviceGuard device_guard(input.get_device_index());
+  const cudaStream_t stream = get_current_cuda_stream(input.get_device_index());
+  VLLM_STABLE_DISPATCH_FLOATING_TYPES(
+      input.scalar_type(), "silu_and_mul_dynamic_int8_quant_kernel", [&] {
+        vllm::silu_and_mul_dynamic_int8_quant_kernel<scalar_t><<<grid, block, 0, stream>>>(
+            out.mutable_data_ptr<int8_t>(), scales.mutable_data_ptr<float>(),
+            input.const_data_ptr<scalar_t>(), gptr, d);
+      });
+}
