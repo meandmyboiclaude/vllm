@@ -1037,6 +1037,14 @@ class SlidingWindowSpec(AttentionSpec):
     # Does not set AttentionSpec.non_causal (that disables prefix caching).
     non_causal_multi_token_decode: bool = False
 
+    @property
+    def num_retained_tokens(self) -> int:
+        """Tokens below a request's first scheduled position that must stay
+        readable. The worker nulls a step's block-table entries wholly below
+        that many tokens.
+        """
+        return self.sliding_window - 1 + self.extra_retained_tokens
+
     def max_admission_blocks_per_request(
         self, max_in_flight_tokens: int, max_model_len: int
     ) -> int:
