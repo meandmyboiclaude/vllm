@@ -9,7 +9,6 @@ import threading
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import AbstractContextManager, contextmanager, nullcontext, suppress
-from dataclasses import replace
 from glob import glob
 from typing import cast
 from uuid import uuid4
