@@ -114,10 +114,23 @@ def reload_weights(
         "Reloading and processing weights took %.2f seconds",
         diff_seconds,
     )
-    if model_config.quantization is None and loaded_weights is not None:
+    if loaded_weights is not None:
         weights_not_loaded = weights_to_load - loaded_weights
         if weights_not_loaded:
-            logger.warning(
-                "Following weights were not loaded from checkpoint: %s",
-                weights_not_loaded,
-            )
+            if model_config.quantization is None:
+                logger.warning(
+                    "Following weights were not loaded from checkpoint: %s",
+                    weights_not_loaded,
+                )
+            else:
+                # Fork (cherry of #34930, re-applied where upstream moved this
+                # check out of gpu_model_runner.py): quantized checkpoints are
+                # checked too, as a WARNING only, so a missing shard file is
+                # reported instead of silently leaving weights unloaded.
+                logger.warning(
+                    "Following weights were not loaded from checkpoint "
+                    "for quantized model (%s): %s. This may indicate "
+                    "missing shard files.",
+                    model_config.quantization,
+                    weights_not_loaded,
+                )
