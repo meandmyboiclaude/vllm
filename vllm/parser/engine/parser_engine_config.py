@@ -131,6 +131,13 @@ class ParserEngineConfig:
     # Delay a tool wrapper until its whitespace-only preamble reaches TOOL_NAME.
     validate_tool_preamble: bool = False
 
+    # In REASONING, hold TOOL_START and what follows it. After THINK_END the
+    # next non-whitespace item decides: an answer or another call means the
+    # span was quoted (it stays reasoning); only whitespace or special tokens
+    # up to the end of the stream mean it was the turn's call. Without
+    # THINK_END, a span that ends in a closed call is an implicit-end call.
+    defer_reasoning_tool_start: bool = False
+
     def __post_init__(self) -> None:
         if self.arg_value_extender is not None and (
             self.arg_converter is None or not self.stream_arg_deltas

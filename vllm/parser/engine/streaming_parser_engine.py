@@ -8,6 +8,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 from dataclasses import dataclass
 
+from vllm.logger import init_logger
 from vllm.parser.engine.events import EventType, SemanticEvent
 from vllm.parser.engine.incremental_lexer import (
     CONTENT_TERMINAL,
@@ -28,6 +29,26 @@ from vllm.parser.engine.token_id_scanner import (
     TextChunk,
     TokenIDScanner,
 )
+
+logger = init_logger(__name__)
+
+# Quoted tool spans kept as reasoning in this process; the guard's log line
+# carries the running count.
+_QUOTED_TOOL_SPANS = 0
+
+
+def _span_is_closed_call(span: Sequence[tuple[str, str, int]]) -> bool:
+    """True iff *span* holds a ``FUNC_END`` and its last item that is not
+    whitespace or a dropped special token is ``FUNC_END`` or ``TOOL_END``."""
+    if not any(terminal == "FUNC_END" for terminal, _, _ in span):
+        return False
+    for terminal, value, _ in reversed(span):
+        if terminal == DROP_TERMINAL or (
+            terminal == CONTENT_TERMINAL and not value.strip()
+        ):
+            continue
+        return terminal in ("FUNC_END", "TOOL_END")
+    return False
 
 
 @dataclass(slots=True)
@@ -117,6 +138,8 @@ class StreamingParserEngine:
         vocab: dict[str, int] | None = None,
     ) -> None:
         self.config = config
+        # Per request: the owning parser arms it from the prompt.
+        self.defer_reasoning_tool_start = config.defer_reasoning_tool_start
 
         resolved_token_ids: dict[int, str] = {}
         if tokenizer is not None:
@@ -218,6 +241,10 @@ class StreamingParserEngine:
         self._message_header_buffer = ""
         self._message_header_token_count = 0
         self._in_skipped_tool_span = False
+        # (terminal, value, token_count) held after a TOOL_START in REASONING,
+        # and the index of a held THINK_END in it (-1: none yet).
+        self._pending_reasoning_tool_tokens: list[tuple[str, str, int]] | None = None
+        self._pending_think_end_index = -1
         self._pending_tool_start: tuple[str, str, int] | None = None
         self._tool_preamble_buffer = ""
         self._tool_preamble_token_count = 0
@@ -238,6 +265,7 @@ class StreamingParserEngine:
             delta_text
             and not self._lexer.buffer
             and not self._scanner._deferred_terminals
+            and self._pending_reasoning_tool_tokens is None
             and self._lexer._literal_first_chars.isdisjoint(delta_text)
         ):
             has_special = False
@@ -257,7 +285,11 @@ class StreamingParserEngine:
         if len(scanner_items) == 1 and isinstance(scanner_items[0], TextChunk):
             item = scanner_items[0]
             lex_tokens = self._lexer.feed(item.text, item.token_texts, item.token_count)
-            if len(lex_tokens) == 1 and lex_tokens[0].terminal == CONTENT_TERMINAL:
+            if (
+                len(lex_tokens) == 1
+                and lex_tokens[0].terminal == CONTENT_TERMINAL
+                and self._pending_reasoning_tool_tokens is None
+            ):
                 events = self._emit_for_state(
                     lex_tokens[0].value,
                     token_count=lex_tokens[0].token_count,
@@ -298,6 +330,9 @@ class StreamingParserEngine:
         events = self._process_scanner_items(self._scanner.flush_pending())
 
         events.extend(self._process_lex_tokens(self._lexer.flush()))
+
+        if self._pending_reasoning_tool_tokens is not None:
+            events.extend(self._resolve_reasoning_tool_span_at_end())
 
         events.extend(self._confirm_tool_preamble())
 
@@ -422,6 +457,21 @@ class StreamingParserEngine:
         *,
         confirmed_tool_start: bool = False,
     ) -> list[SemanticEvent]:
+        pending = self._pending_reasoning_tool_tokens
+        if pending is not None:
+            if self._pending_think_end_index >= 0:
+                # Past the held </think>: a special token keeps waiting, any
+                # other terminal shows the span was quoted.
+                if terminal == DROP_TERMINAL:
+                    pending.append((terminal, value, token_count))
+                    return []
+                events = self._release_quoted_reasoning_tool_span()
+                events.extend(self._on_terminal(terminal, value, token_count))
+                return events
+            if terminal == "THINK_END":
+                self._pending_think_end_index = len(pending)
+            pending.append((terminal, value, token_count))
+            return []
         if self._pending_tool_start is not None:
             next_transition = self.config.transitions.get(
                 (ParserState.TOOL_PREAMBLE, terminal)
@@ -450,6 +500,15 @@ class StreamingParserEngine:
 
         if self.skip_reasoning_parsing and terminal in self._reasoning_markup_terminals:
             return self._emit_for_state(value, token_count)
+
+        if (
+            self.defer_reasoning_tool_start
+            and self.state is ParserState.REASONING
+            and terminal == "TOOL_START"
+        ):
+            self._pending_reasoning_tool_tokens = [(terminal, value, token_count)]
+            self._pending_think_end_index = -1
+            return []
 
         if (
             self.config.validate_tool_preamble
@@ -601,7 +660,79 @@ class StreamingParserEngine:
         events.extend(self._emit_for_state(text, count))
         return events
 
+    def _release_quoted_reasoning_tool_span(self) -> list[SemanticEvent]:
+        """The held span was quoted: emit it verbatim as reasoning, let a held
+        ``</think>`` end reasoning, and replay what was held after it."""
+        global _QUOTED_TOOL_SPANS
+        pending = self._pending_reasoning_tool_tokens or []
+        think_end = self._pending_think_end_index
+        self._pending_reasoning_tool_tokens = None
+        self._pending_think_end_index = -1
+        _QUOTED_TOOL_SPANS += 1
+        logger.info(
+            "[PC2] quoted tool span held as reasoning, no tool call emitted "
+            "(%d terminals held; suppressed %d so far in this process)",
+            len(pending),
+            _QUOTED_TOOL_SPANS,
+        )
+        held = pending if think_end < 0 else pending[:think_end]
+        # A dropped special token keeps only its token count, as when unheld.
+        events = [
+            SemanticEvent(
+                EventType.REASONING_CHUNK,
+                value="" if terminal == DROP_TERMINAL else value,
+                tool_index=self.tool_index,
+                token_count=token_count,
+            )
+            for terminal, value, token_count in held
+            if (value and terminal != DROP_TERMINAL) or token_count
+        ]
+        if think_end >= 0:
+            terminal, value, token_count = pending[think_end]
+            transition = self.config.transitions.get((self.state, terminal))
+            if transition is not None:
+                events.extend(self._apply_transition(transition, value, token_count))
+            else:
+                events.extend(self._emit_for_state(value, token_count))
+            events.extend(self._replay(pending[think_end + 1 :]))
+        return events
+
+    def _resolve_reasoning_tool_span_at_end(self) -> list[SemanticEvent]:
+        """The stream ended inside the held span with no answer after it: the
+        opener keeps its implicit-reasoning-end meaning (also when only
+        whitespace followed a held ``</think>``), if the span ends in a
+        closed call. A quote followed by more thinking, or a cut-off span,
+        stays reasoning."""
+        pending = self._pending_reasoning_tool_tokens or []
+        think_end = self._pending_think_end_index
+        span = pending if think_end < 0 else pending[:think_end]
+        if not _span_is_closed_call(span):
+            return self._release_quoted_reasoning_tool_span()
+        self._pending_reasoning_tool_tokens = None
+        self._pending_think_end_index = -1
+        self.state = ParserState.CONTENT
+        return self._replay(pending)
+
+    def _replay(self, items: Sequence[tuple[str, str, int]]) -> list[SemanticEvent]:
+        events: list[SemanticEvent] = []
+        for terminal, value, token_count in items:
+            if terminal == CONTENT_TERMINAL:
+                events.extend(self._on_content(value, token_count))
+            else:
+                events.extend(self._on_terminal(terminal, value, token_count))
+        return events
+
     def _on_content(self, text: str, token_count: int = 0) -> list[SemanticEvent]:
+        if self._pending_reasoning_tool_tokens is not None:
+            if self._pending_think_end_index >= 0 and text.strip():
+                # An answer follows </think>: the span was quoted.
+                events = self._release_quoted_reasoning_tool_span()
+                events.extend(self._on_content(text, token_count))
+                return events
+            self._pending_reasoning_tool_tokens.append(
+                (CONTENT_TERMINAL, text, token_count)
+            )
+            return []
         if not text:
             return []
         return self._emit_for_state(text, token_count)

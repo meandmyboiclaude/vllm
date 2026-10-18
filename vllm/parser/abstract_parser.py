@@ -890,6 +890,26 @@ class DelegatingParser(Parser):
                 delta_token_ids=delta_token_ids,
             )
             reasoning_parser = self._reasoning_parser
+            # Resolve a tool span the reasoning parser still holds on the final
+            # delta, so the reasoning-end check below sees the outcome: quoted
+            # markup stays reasoning, an implicit-end call becomes content for
+            # the tool parser (request tools, schema types).
+            has_span = getattr(reasoning_parser, "has_deferred_tool_span", None)
+            span_resolved = bool(finished and has_span is not None and has_span())
+            if span_resolved:
+                resolved = reasoning_parser.resolve_deferred_tool_span()  # type: ignore[union-attr, attr-defined]
+                if resolved is not None:
+                    if delta_message is None:
+                        delta_message = resolved
+                    else:
+                        if resolved.reasoning:
+                            delta_message.reasoning = (
+                                delta_message.reasoning or ""
+                            ) + resolved.reasoning
+                        if resolved.content:
+                            delta_message.content = (
+                                delta_message.content or ""
+                            ) + resolved.content
             if reasoning_parser is not None and reasoning_parser.engine_based_streaming:
                 should_transition = (
                     reasoning_parser.has_engine_confirmed_reasoning_end()
@@ -902,6 +922,10 @@ class DelegatingParser(Parser):
                 state.reasoning_ended = True
                 reasoning_transitioned = True
                 current_token_ids = self._extract_content_ids(delta_token_ids)
+                if span_resolved:
+                    # The replayed span's token IDs are not all in this delta,
+                    # so let the tool parser lex its text.
+                    current_token_ids = []
                 # Flush whenever the reasoning parser is engine-based (not only
                 # when _engine_based is True): it buffers the post-marker text
                 # (e.g. the "<" of "<tool_call>"), surfaced via finish_streaming().

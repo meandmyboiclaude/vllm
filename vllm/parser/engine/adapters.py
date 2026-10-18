@@ -133,6 +133,17 @@ class ParserEngineReasoningAdapter(ReasoningParser):
     def has_engine_confirmed_reasoning_end(self) -> bool:
         return self._parser_engine.reasoning_ended
 
+    def has_deferred_tool_span(self) -> bool:
+        """Whether a tool opener seen in reasoning is still held."""
+        return self._parser_engine._engine._pending_reasoning_tool_tokens is not None
+
+    def resolve_deferred_tool_span(self) -> DeltaMessage | None:
+        """Resolve a held span at the end of the stream. This adapter never
+        sees the request's tools, so an implicit-end call comes back as
+        REASONING_END plus its raw markup as content, for the tool parser."""
+        with self._skip_tool_parsing():
+            return self._parser_engine.finish_streaming()
+
     def finish_streaming(self) -> DeltaMessage | None:
         with self._skip_tool_parsing():
             return self._parser_engine.finish_streaming()
