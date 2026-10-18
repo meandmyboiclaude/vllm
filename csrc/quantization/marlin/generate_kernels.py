@@ -4,10 +4,18 @@ import glob
 import itertools
 import os
 import re  # [0047 ENGAGE-TELL]
+
 import subprocess
 import sys
 
 import jinja2
+
+# [rebase-9 MOEGATE, cuda 10-18] upstream #60721 runs this ONE generator twice: the dense Marlin pass (no argv[2]: the kernels go next to
+# this file) and the MoE pass (argv[2] = csrc/moe/marlin_moe_wna16). Every house addition below is for the dense Marlin only, so the MoE
+# pass must produce upstream's kernels byte for byte (as the served build's separate MoE generator did): tables, the _xs.h cleanup, the
+# atexit hooks and every house generate_* call are gated on _HOUSE.
+_HOUSE = os.path.abspath(sys.argv[2] if len(sys.argv) > 2 else os.path.dirname(os.path.abspath(__file__))) == \
+    os.path.dirname(os.path.abspath(__file__))
 
 ARCHS = []
 SUPPORT_FP8 = False
@@ -64,12 +72,12 @@ THREAD_CONFIGS = [(128, 128, 256), (64, 256, 256), (64, 128, 128), (128, 64, 128
 # [cuda-lane 2026-09-19] 5 and 6 added: the one-pass ceiling is 16*tmb rows, so tmb=6 serves M<=96
 # (= K=11 at 8 seats) in ONE weight pass. Measured spill/thread on sm_89 at the served config:
 # tmb=4 12/12 B, tmb=5 122/200, tmb=6 234/356, tmb=8 2502/2608 -- 7 and 8 deliberately not built.
-THREAD_M_BLOCKS = [0.5, 1, 2, 3, 4, 5, 6]
+THREAD_M_BLOCKS = [0.5, 1, 2, 3, 4] + ([5, 6] if _HOUSE else [])  # [MOEGATE] upstream's list on the MoE pass
 # ⚠ THE INT8-ACTIVATION CONFIGS BELOW DO NOT USE THE CONSTANT ABOVE -- they hardcode their own
 # list, and the SERVED W4A8 path is one of them. A first attempt patched only the constant and
 # built tmb 5/6 for sm_80 (51+51) and NONE for sm_89, i.e. a wheel that could not answer the
 # question it was built for. Same one-change-N-consumers shape as the c_tmp sizing.
-THREAD_M_BLOCKS_A8 = [1, 2, 3, 4, 5, 6]
+THREAD_M_BLOCKS_A8 = [1, 2, 3, 4] + ([5, 6] if _HOUSE else [])  # [MOEGATE]
 
 QUANT_CONFIGS = [
     # AWQ-INT4
@@ -197,6 +205,9 @@ XS_TWINS = [
 # bytes) and entries appended to kernel_selector_xs.h. Kept OUT of XS_TWINS: XSOPR_TWINS = [*XS_TWINS, ...] must stay OPR twins.
 KU3S_XS_TWINS = [("kS8", "kU3S", "kBFloat16", 128, m, 4, 8, g) for g in (2, 4, 8) for m in (2, 3, 4)]  # [0055 KU3S-5] + g32
 
+if not _HOUSE:  # [MOEGATE] the house kU3S config is dense-only (the MoE template has no kU3S dequant path)
+    QUANT_CONFIGS = [c for c in QUANT_CONFIGS if c.get("b_type") != "kU3S"]
+
 # Kernels are written next to the kernel.h / marlin_template.h they include.
 OUTPUT_DIR = sys.argv[2] if len(sys.argv) > 2 else os.path.dirname(__file__)
 
@@ -208,8 +219,9 @@ def remove_old_kernels():
     filename = OUTPUT_DIR + "/kernel_selector.h"
     subprocess.call(["rm", "-f", filename])
 
-    filename = os.path.dirname(__file__) + "/kernel_selector_xs.h"
-    subprocess.call(["rm", "-f", filename])
+    if _HOUSE:  # [MOEGATE] the house XS selector lives next to this file: never touch it from the MoE pass
+        filename = os.path.dirname(__file__) + "/kernel_selector_xs.h"
+        subprocess.call(["rm", "-f", filename])
 
 
 def generate_new_kernels():
@@ -352,7 +364,8 @@ def generate_new_kernels():
     with open(os.path.join(OUTPUT_DIR, "kernel_selector.h"), "w") as f:
         f.write(kernel_selector_str)
 
-    generate_xs_twins(result_dict)
+    if _HOUSE:  # [MOEGATE]
+        generate_xs_twins(result_dict)
 
 
 def generate_xs_twins(result_dict):
@@ -1994,6 +2007,9 @@ def split_pin80(here):
 
 if __name__ == "__main__":
     remove_old_kernels()
+    if not _HOUSE:  # [MOEGATE] the MoE pass: upstream's generation only -- no house twins, no atexit hooks on the dense dir
+        generate_new_kernels()
+        sys.exit(0)
     import atexit  # [0047 ENGAGE-TELL] after every generate_* call below, including ones a later patch appends
     atexit.register(_engage_at_exit, os.path.dirname(os.path.abspath(__file__)))
     atexit.register(_pin80_at_exit, os.path.dirname(os.path.abspath(__file__)))  # [0100 PIN80 v4] LIFO: runs before 0047's
